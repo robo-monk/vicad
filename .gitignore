@@ -1,0 +1,13 @@
+# Build outputs
+build/
+nob
+nob.old
+
+# Bun / Node
+node_modules/
+bun.lock
+
+# Logs / temp
+*.log
+*.tmp
+.DS_Store

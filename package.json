@@ -1,0 +1,8 @@
+{
+  "name": "vicad",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "manifold-3d": "^3.3.2"
+  }
+}
