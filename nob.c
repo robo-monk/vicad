@@ -29,6 +29,7 @@ static const char *app_sources[] = {
     "src/face_detection.cpp",
     "src/op_decoder.cpp",
     "src/script_worker_client.cpp",
+    "src/sketch_dimensions.cpp",
 };
 static const char *font_baker_tool_source = "tools/font_baker.c";
 static const char *freetype_baker_sources[] = {

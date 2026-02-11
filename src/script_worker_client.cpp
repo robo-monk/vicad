@@ -381,6 +381,13 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector
     obj.objectId = rec.object_id_hash;
     obj.name.assign((const char *)(names_ptr + name_off), (size_t)rec.name_len);
     obj.kind = ScriptSceneObjectKind::Unknown;
+    obj.rootKind = rec.root_kind;
+    obj.rootId = rec.root_id;
+
+    std::string trace_error;
+    if (!BuildOperationTraceForRoot(tables, rec.root_kind, rec.root_id, &obj.opTrace, &trace_error)) {
+      return set_err(error, trace_error);
+    }
 
     if (rec.root_kind == (uint32_t)NodeKind::Manifold) {
       manifold::Manifold m;
@@ -396,6 +403,13 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector
       if (!ResolveReplayCrossSection(tables, rec.root_kind, rec.root_id, &cs, error)) return false;
       obj.kind = ScriptSceneObjectKind::CrossSection;
       obj.mesh.numProp = 3;
+      SketchDimensionModel dims;
+      std::string dim_error;
+      if (BuildSketchDimensionModelForRoot(tables, rec.root_id, &dims, &dim_error)) {
+        obj.sketchDims = std::move(dims);
+      } else {
+        obj.sketchDims.reset();
+      }
       manifold::Polygons polys = cs.ToPolygons();
       obj.sketchContours.reserve(polys.size());
       for (const manifold::SimplePolygon &poly : polys) {

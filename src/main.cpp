@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <array>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -76,6 +78,14 @@ struct CameraBasis {
     Vec3 up;
 };
 
+struct DimensionRenderContext {
+    Vec3 eye;
+    CameraBasis camera;
+    float fovDegrees;
+    int viewportHeight;
+    float arrowPixels;
+};
+
 struct ClayUiState {
     Clay_Arena arena;
     Clay_Context *ctx;
@@ -83,7 +93,8 @@ struct ClayUiState {
     bool panelCollapsed;
     Clay_ElementData panelData;
     Clay_ElementData headerData;
-    std::array<std::string, 16> textSlots;
+    Clay_ElementData infoPanelData;
+    std::array<std::string, 128> textSlots;
 };
 
 static ClayUiState g_ui = {};
@@ -120,11 +131,10 @@ struct BakedFontState {
 };
 
 static BakedFontState g_baked_font = {};
-static constexpr float kDimensionLabelScale = 2.25f;
 static constexpr float kHudBaseScale = 0.75f;
 static constexpr float kHudLegacyScale = 1.5f;
 static constexpr int kRequestedMsaaSamples = 4;
-static constexpr float kTextShadowAlphaScale = 0.42f;
+static constexpr float kTextShadowAlphaScale = 0.18f;
 
 static const VicadBakedGlyph *glyph_for_char(unsigned char ch) {
     if (ch < VICAD_BAKED_FIRST_CHAR || ch > VICAD_BAKED_LAST_CHAR) ch = '?';
@@ -753,6 +763,26 @@ static bool selected_scene_object_bounds(const std::vector<vicad::ScriptSceneObj
     return true;
 }
 
+static const char *scene_object_kind_name(vicad::ScriptSceneObjectKind kind) {
+    switch (kind) {
+        case vicad::ScriptSceneObjectKind::Manifold: return "Manifold";
+        case vicad::ScriptSceneObjectKind::CrossSection: return "CrossSection";
+        case vicad::ScriptSceneObjectKind::Unknown:
+        default: return "Unknown";
+    }
+}
+
+static std::string format_op_trace_entry(const vicad::OpTraceEntry &entry) {
+    std::ostringstream ss;
+    ss << entry.name << "(";
+    for (size_t i = 0; i < entry.args.size(); ++i) {
+        if (i > 0) ss << ", ";
+        ss << entry.args[i];
+    }
+    ss << ")";
+    return ss.str();
+}
+
 static void focus_camera_on_bounds(const Vec3 &bmin, const Vec3 &bmax,
                                    float fov_degrees,
                                    float *inout_distance,
@@ -972,6 +1002,58 @@ static bool classify_circle_like(const std::vector<Vec2> &pts,
     return true;
 }
 
+static bool classify_rounded_rectangle_like(const std::vector<Vec2> &pts,
+                                            float *out_w, float *out_h) {
+    const size_t n = pts.size();
+    if (n < 8) return false;
+
+    Vec2 bmin = {0.0f, 0.0f};
+    Vec2 bmax = {0.0f, 0.0f};
+    contour_bbox(pts, &bmin, &bmax);
+    const float bw = bmax.x - bmin.x;
+    const float bh = bmax.y - bmin.y;
+    if (bw <= 1e-5f || bh <= 1e-5f) return false;
+
+    const float max_dim = (bw > bh) ? bw : bh;
+    const float side_tol = max_dim * 0.02f + 1e-4f;
+
+    bool touch_left = false;
+    bool touch_right = false;
+    bool touch_bottom = false;
+    bool touch_top = false;
+    for (const Vec2 &p : pts) {
+        if (std::fabs(p.x - bmin.x) <= side_tol) touch_left = true;
+        if (std::fabs(p.x - bmax.x) <= side_tol) touch_right = true;
+        if (std::fabs(p.y - bmin.y) <= side_tol) touch_bottom = true;
+        if (std::fabs(p.y - bmax.y) <= side_tol) touch_top = true;
+    }
+    if (!touch_left || !touch_right || !touch_bottom || !touch_top) return false;
+
+    // Rounded rectangles keep a meaningful amount of axis-aligned edge length.
+    double total_len = 0.0;
+    double axis_len = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const Vec2 &a = pts[i];
+        const Vec2 &b = pts[(i + 1) % n];
+        const Vec2 e = sub2v(b, a);
+        const float len = length2(e);
+        if (len <= 1e-6f) continue;
+        total_len += (double)len;
+        const Vec2 dir = {e.x / len, e.y / len};
+        const float axis_score = std::fmax(std::fabs(dir.x), std::fabs(dir.y));
+        if (axis_score >= 0.9659f) {  // ~15 degrees from axis
+            axis_len += (double)len;
+        }
+    }
+    if (total_len <= 1e-8) return false;
+    const double axis_ratio = axis_len / total_len;
+    if (axis_ratio < 0.18) return false;
+
+    *out_w = bw;
+    *out_h = bh;
+    return true;
+}
+
 static bool classify_regular_polygon_like(const std::vector<Vec2> &pts,
                                           Vec2 *out_center,
                                           float *out_radius,
@@ -1083,7 +1165,7 @@ static void draw_dimension_label_world(const Vec3 &anchor,
                                        float r, float g, float b, float a,
                                        bool center_x) {
     if (!text || !text[0]) return;
-    const float label_world_scale = world_scale * kDimensionLabelScale * 0.25f;
+    const float label_world_scale = world_scale;
     Vec3 origin = anchor;
     if (center_x) {
         origin = add(origin, mul(axis_right, -0.5f * text_width_world(text, label_world_scale)));
@@ -1125,9 +1207,30 @@ static void draw_dimension_arrowheads_world(const Vec3 &a,
     glEnd();
 }
 
+static float world_per_pixel_at_anchor(const DimensionRenderContext &ctx, const Vec3 &anchor) {
+    const float vh = (float)(ctx.viewportHeight > 0 ? ctx.viewportHeight : 1);
+    const float half_fov = (ctx.fovDegrees * 3.1415926535f / 180.0f) * 0.5f;
+    float depth = dot(sub(anchor, ctx.eye), ctx.camera.forward);
+    if (depth < 1e-4f) depth = 1e-4f;
+    return (2.0f * depth * std::tan(half_fov)) / vh;
+}
+
+static float arrow_world_size_at_anchor(const DimensionRenderContext &ctx,
+                                        const Vec3 &a,
+                                        const Vec3 &b,
+                                        const Vec3 &anchor) {
+    const float world_per_px = world_per_pixel_at_anchor(ctx, anchor);
+    const float target = ctx.arrowPixels * world_per_px;
+    const float len = std::sqrt(dot(sub(b, a), sub(b, a)));
+    const float max_size = len * 0.30f;
+    if (max_size <= 1e-8f) return 0.0f;
+    float min_size = world_per_px * 1.0f;
+    if (min_size > max_size) min_size = max_size;
+    return clampf(target, min_size, max_size);
+}
+
 static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
-                                    const Vec3 &eye,
-                                    const CameraBasis &camera,
+                                    const DimensionRenderContext &ctx,
                                     float alpha) {
     if (contour.points.size() < 2) return;
     std::vector<Vec2> pts2;
@@ -1143,12 +1246,10 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
     const float bh = bmax.y - bmin.y;
     const float bdiag = std::sqrt(bw * bw + bh * bh);
     const Vec3 centroid3 = vec3_from_2d(centroid, z);
-    const Vec3 eye_to_centroid = sub(centroid3, eye);
-    const float eye_dist = std::sqrt(dot(eye_to_centroid, eye_to_centroid));
-    const float base_scale = (bdiag > 1e-5f) ? (bdiag * 0.018f) : 0.008f;
-    const float distance_scale = clampf(std::sqrt(std::fmax(eye_dist, 1e-4f)) * 0.035f, 0.70f, 1.25f);
-    float world_scale = base_scale * distance_scale;
-    world_scale = clampf(world_scale, 0.0008f, 0.03f);
+    const float world_per_px = world_per_pixel_at_anchor(ctx, centroid3);
+    float world_scale = (world_per_px * 9.0f) / (float)VICAD_BAKED_PIXEL_SIZE;
+    world_scale = clampf(world_scale, world_per_px * 6.0f / (float)VICAD_BAKED_PIXEL_SIZE,
+                         world_per_px * 18.0f / (float)VICAD_BAKED_PIXEL_SIZE);
     Vec3 text_right = {1.0f, 0.0f, 0.0f};
     Vec3 text_up = {0.0f, 1.0f, 0.0f};
     Vec3 plane_normal = {0.0f, 0.0f, 1.0f};
@@ -1156,10 +1257,10 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
     Vec3 facing_right = text_right;
     Vec3 facing_up = text_up;
     Vec3 facing_normal = plane_normal;
-    orient_label_axes_for_camera(eye, camera, centroid3, plane_normal, text_right,
+    orient_label_axes_for_camera(ctx.eye, ctx.camera, centroid3, plane_normal, text_right,
                                  &facing_right, &facing_up, &facing_normal);
-    const Vec3 label_lift = add(mul(facing_up, world_scale * 8.0f),
-                                mul(facing_normal, world_scale * 1.5f));
+    const Vec3 label_lift = add(mul(facing_up, world_per_px * 10.0f),
+                                mul(facing_normal, world_per_px * 2.0f));
 
     SketchDimShapeKind kind = SketchDimShapeKind::Polygon;
     float rect_w = 0.0f, rect_h = 0.0f;
@@ -1169,7 +1270,8 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
     float rp_radius = 0.0f;
     float rp_side = 0.0f;
 
-    if (classify_rectangle_like(pts2, &rect_w, &rect_h)) {
+    if (classify_rectangle_like(pts2, &rect_w, &rect_h) ||
+        classify_rounded_rectangle_like(pts2, &rect_w, &rect_h)) {
         const float maxv = rect_w > rect_h ? rect_w : rect_h;
         const float minv = rect_w > rect_h ? rect_h : rect_w;
         if (maxv > 1e-6f && std::fabs(maxv - minv) / maxv < 0.02f) {
@@ -1198,8 +1300,9 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const Vec3 a3 = vec3_from_2d(a2, z);
         const Vec3 b3 = vec3_from_2d(b2, z);
         draw_world_line(a3, b3);
-        draw_dimension_arrowheads_world(a3, b3, facing_normal, world_scale * 3.0f);
         const Vec3 mid = mul(add(a3, b3), 0.5f);
+        draw_dimension_arrowheads_world(a3, b3, facing_normal,
+                                        arrow_world_size_at_anchor(ctx, a3, b3, mid));
         if (kind == SketchDimShapeKind::Point) {
             std::snprintf(text, sizeof(text), "P(%.3g, %.3g)", (double)c_center.x, (double)c_center.y);
         } else {
@@ -1247,8 +1350,10 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
 
         draw_world_line(w03, w13);
         draw_world_line(h03, h13);
-        draw_dimension_arrowheads_world(w03, w13, facing_normal, world_scale * 3.0f);
-        draw_dimension_arrowheads_world(h03, h13, facing_normal, world_scale * 3.0f);
+        draw_dimension_arrowheads_world(w03, w13, facing_normal,
+                                        arrow_world_size_at_anchor(ctx, w03, w13, mul(add(w03, w13), 0.5f)));
+        draw_dimension_arrowheads_world(h03, h13, facing_normal,
+                                        arrow_world_size_at_anchor(ctx, h03, h13, mul(add(h03, h13), 0.5f)));
         draw_world_line(p03, w03);
         draw_world_line(p13, w13);
         draw_world_line(p13, h03);
@@ -1307,10 +1412,69 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
     }
 }
 
+static void draw_sketch_dimension_model(const vicad::SketchDimensionModel &model,
+                                        float z,
+                                        const DimensionRenderContext &ctx,
+                                        float alpha) {
+    if (model.entities.empty()) return;
+    std::vector<Vec2> pts2;
+    pts2.reserve(model.logicalVertices.size());
+    for (const manifold::vec2 &p : model.logicalVertices) {
+        pts2.push_back({(float)p.x, (float)p.y});
+    }
+
+    Vec2 bmin = {0.0f, 0.0f};
+    Vec2 bmax = {0.0f, 0.0f};
+    if (!pts2.empty()) {
+        contour_bbox(pts2, &bmin, &bmax);
+    } else {
+        bmin = {(float)model.anchor.x, (float)model.anchor.y};
+        bmax = bmin;
+    }
+    const float bw = bmax.x - bmin.x;
+    const float bh = bmax.y - bmin.y;
+    Vec2 centroid = {(float)model.anchor.x, (float)model.anchor.y};
+    if (!pts2.empty()) {
+        centroid = contour_centroid_mean(pts2);
+    }
+    const Vec3 centroid3 = vec3_from_2d(centroid, z);
+    const float world_per_px = world_per_pixel_at_anchor(ctx, centroid3);
+    float world_scale = (world_per_px * 9.0f) / (float)VICAD_BAKED_PIXEL_SIZE;
+    world_scale = clampf(world_scale, world_per_px * 6.0f / (float)VICAD_BAKED_PIXEL_SIZE,
+                         world_per_px * 18.0f / (float)VICAD_BAKED_PIXEL_SIZE);
+
+    Vec3 facing_right = {1.0f, 0.0f, 0.0f};
+    Vec3 facing_up = {0.0f, 1.0f, 0.0f};
+    Vec3 facing_normal = {0.0f, 0.0f, 1.0f};
+    orient_label_axes_for_camera(ctx.eye, ctx.camera, centroid3, facing_normal, facing_right,
+                                 &facing_right, &facing_up, &facing_normal);
+    const Vec3 label_lift = add(mul(facing_up, world_per_px * 10.0f),
+                                mul(facing_normal, world_per_px * 2.0f));
+
+    char text[128];
+    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    for (const vicad::SketchDimensionEntity &entity : model.entities) {
+        if (entity.kind != vicad::SketchDimensionEntity::Kind::LineDim) continue;
+        const Vec3 a3 = vec3_from_2d({(float)entity.line.a.x, (float)entity.line.a.y}, z);
+        const Vec3 b3 = vec3_from_2d({(float)entity.line.b.x, (float)entity.line.b.y}, z);
+        draw_world_line(a3, b3);
+        const Vec3 mid = mul(add(a3, b3), 0.5f);
+        const float arrow_size = arrow_world_size_at_anchor(ctx, a3, b3, mid);
+        draw_dimension_arrowheads_world(a3, b3, facing_normal, arrow_size);
+        format_dim(text, sizeof(text), "", (float)entity.line.value);
+        Vec3 dim_dir = normalize(sub(b3, a3));
+        if (dot(dim_dir, facing_right) < 0.0f) dim_dir = mul(dim_dir, -1.0f);
+        const Vec3 dim_up = normalize(cross(facing_normal, dim_dir));
+        draw_dimension_label_world(add(mid, label_lift), dim_dir, dim_up, world_scale, text,
+                                   1.0f, 1.0f, 1.0f, alpha, true);
+    }
+}
+
 static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneObject> &scene,
                                           int selected_object_index,
-                                          const Vec3 &eye,
-                                          const CameraBasis &camera) {
+                                          const DimensionRenderContext &ctx,
+                                          bool show_dimensions) {
+    if (!show_dimensions) return;
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND);
@@ -1323,7 +1487,7 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
         if (!scene_object_is_sketch(obj)) continue;
         if (obj.sketchContours.empty()) continue;
         const bool selected = ((int)scene_index == selected_object_index);
-        const float alpha = selected ? 1.0f : 0.60f;
+        const float alpha = selected ? 1.0f : 0.30f;
         glColor4f(1.0f, 1.0f, 1.0f, alpha);
 
         size_t largest_idx = 0;
@@ -1340,7 +1504,15 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
                 largest_idx = i;
             }
         }
-        draw_contour_dimensions(obj.sketchContours[largest_idx], eye, camera, alpha);
+        if (obj.sketchDims.has_value()) {
+            float z = 0.0f;
+            if (!obj.sketchContours.empty() && !obj.sketchContours.front().points.empty()) {
+                z = obj.sketchContours.front().points.front().z;
+            }
+            draw_sketch_dimension_model(*obj.sketchDims, z, ctx, alpha);
+        } else {
+            draw_contour_dimensions(obj.sketchContours[largest_idx], ctx, alpha);
+        }
     }
 
     glLineWidth(1.0f);
@@ -1859,6 +2031,8 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                                              int hovered_object_index,
                                              uint64_t selected_object_id,
                                              uint64_t hovered_object_id,
+                                             bool show_sketch_dimensions,
+                                             const vicad::ScriptSceneObject *info_object,
                                              float hud_scale,
                                              const FaceSelectState &face_select,
                                              const EdgeSelectState &edge_select) {
@@ -1874,6 +2048,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     const int title_font = (int)std::lround(17.0f * hud);
     const int body_font = (int)std::lround(15.0f * hud);
     const int small_font = (int)std::lround(14.0f * hud);
+    const int stack_gap = (int)std::lround(8.0f * hud);
 
     clay_init(width, height);
     Clay_SetCurrentContext(g_ui.ctx);
@@ -1893,6 +2068,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     char face_region_line[96];
     char face_hover_line[96];
     char face_type_line[128];
+    char dims_toggle_line[64];
     std::snprintf(mesh_line, sizeof(mesh_line), "MESH: %zu TRI  %zu VERT", tri_count, vert_count);
     std::snprintf(selected_line, sizeof(selected_line), "SELECTED: %s", selected ? "ON" : "OFF");
     std::snprintf(object_count_line, sizeof(object_count_line), "SCENE OBJECTS: %zu", scene_object_count);
@@ -1932,29 +2108,77 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     std::snprintf(face_type_line, sizeof(face_type_line), "TYPE H/S: %s / %s",
                   vicad::FacePrimitiveTypeName(hover_type),
                   vicad::FacePrimitiveTypeName(sel_type));
+    std::snprintf(dims_toggle_line, sizeof(dims_toggle_line), "SKETCH DIMS: %s [D]",
+                  show_sketch_dimensions ? "ON" : "OFF");
 
     const std::string one_line_error = script_error.empty() ? "NO ERROR TEXT" :
         script_error.substr(0, script_error.find('\n'));
 
-    Clay_String mesh_line_s = ui_text_slot(0, mesh_line);
-    Clay_String selected_line_s = ui_text_slot(1, selected_line);
-    Clay_String object_count_line_s = ui_text_slot(2, object_count_line);
-    Clay_String sketch_count_line_s = ui_text_slot(3, sketch_count_line);
-    Clay_String object_pick_line_s = ui_text_slot(4, object_pick_line);
-    Clay_String sel_mode_line_s = ui_text_slot(5, sel_mode_line);
-    Clay_String edge_mode_line_s = ui_text_slot(6, edge_mode_line);
-    Clay_String edge_count_line_s = ui_text_slot(7, edge_count_line);
-    Clay_String edge_hover_line_s = ui_text_slot(8, edge_hover_line);
-    Clay_String face_mode_line_s = ui_text_slot(9, face_mode_line);
-    Clay_String face_region_line_s = ui_text_slot(10, face_region_line);
-    Clay_String face_hover_line_s = ui_text_slot(11, face_hover_line);
-    Clay_String face_type_line_s = ui_text_slot(12, face_type_line);
-    Clay_String err_line_s = ui_text_slot(13, one_line_error);
+    size_t slot = 0;
+    Clay_String mesh_line_s = ui_text_slot(slot++, mesh_line);
+    Clay_String selected_line_s = ui_text_slot(slot++, selected_line);
+    Clay_String object_count_line_s = ui_text_slot(slot++, object_count_line);
+    Clay_String sketch_count_line_s = ui_text_slot(slot++, sketch_count_line);
+    Clay_String object_pick_line_s = ui_text_slot(slot++, object_pick_line);
+    Clay_String sel_mode_line_s = ui_text_slot(slot++, sel_mode_line);
+    Clay_String edge_mode_line_s = ui_text_slot(slot++, edge_mode_line);
+    Clay_String edge_count_line_s = ui_text_slot(slot++, edge_count_line);
+    Clay_String edge_hover_line_s = ui_text_slot(slot++, edge_hover_line);
+    Clay_String face_mode_line_s = ui_text_slot(slot++, face_mode_line);
+    Clay_String face_region_line_s = ui_text_slot(slot++, face_region_line);
+    Clay_String face_hover_line_s = ui_text_slot(slot++, face_hover_line);
+    Clay_String face_type_line_s = ui_text_slot(slot++, face_type_line);
+    Clay_String dims_toggle_line_s = ui_text_slot(slot++, dims_toggle_line);
+    Clay_String err_line_s = ui_text_slot(slot++, one_line_error);
+
+    std::vector<std::string> info_lines;
+    info_lines.reserve(24);
+    if (!info_object) {
+        info_lines.push_back("No selection");
+    } else {
+        char tmp[256];
+        std::snprintf(tmp, sizeof(tmp), "Name: %s", info_object->name.c_str());
+        info_lines.push_back(tmp);
+        std::snprintf(tmp, sizeof(tmp), "Kind: %s", scene_object_kind_name(info_object->kind));
+        info_lines.push_back(tmp);
+        std::snprintf(tmp, sizeof(tmp), "Object ID: %llx", (unsigned long long)info_object->objectId);
+        info_lines.push_back(tmp);
+        std::snprintf(tmp, sizeof(tmp), "Root kind/id: %u / %u", info_object->rootKind, info_object->rootId);
+        info_lines.push_back(tmp);
+        if (info_object->sketchDims.has_value()) {
+            const vicad::SketchDimensionModel &dims = *info_object->sketchDims;
+            std::snprintf(tmp, sizeof(tmp), "Sketch primitive: %s", vicad::SketchPrimitiveKindName(dims.primitive));
+            info_lines.push_back(tmp);
+            if (dims.hasRectSize) {
+                std::snprintf(tmp, sizeof(tmp), "Rect W/H: %.4g / %.4g", dims.rectWidth, dims.rectHeight);
+                info_lines.push_back(tmp);
+            }
+            if (dims.polygonSides > 0) {
+                std::snprintf(tmp, sizeof(tmp), "Polygon edges: %u", dims.polygonSides);
+                info_lines.push_back(tmp);
+            }
+            if (dims.hasFillet) {
+                std::snprintf(tmp, sizeof(tmp), "Fillet radius: %.4g", dims.filletRadius);
+                info_lines.push_back(tmp);
+            }
+        }
+        info_lines.push_back("Ops:");
+        if (info_object->opTrace.empty()) {
+            info_lines.push_back("  (none)");
+        } else {
+            for (size_t i = 0; i < info_object->opTrace.size(); ++i) {
+                std::snprintf(tmp, sizeof(tmp), "  %zu. %s", i + 1, format_op_trace_entry(info_object->opTrace[i]).c_str());
+                info_lines.push_back(tmp);
+            }
+        }
+    }
 
     CLAY(CLAY_ID("StatusRoot"), {
         .layout = {
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
             .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)},
             .padding = CLAY_PADDING_ALL((uint16_t)root_pad),
+            .childGap = (uint16_t)stack_gap,
             .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_TOP},
         }
     }) {
@@ -1997,6 +2221,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                     CLAY_TEXT(sketch_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {150, 224, 255, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(object_pick_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {198, 218, 246, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sel_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {170, 210, 255, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(dims_toggle_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 236, 255, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(edge_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = edge_select.enabled ? (Clay_Color){138, 196, 255, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     if (edge_select.enabled) {
                         CLAY_TEXT(edge_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
@@ -2025,11 +2250,46 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                 }
             }
         }
+
+        CLAY(CLAY_ID("InfoPanel"), {
+            .layout = {
+                .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                .sizing = {.width = CLAY_SIZING_FIXED((float)panel_w), .height = CLAY_SIZING_FIT(0)},
+            },
+            .backgroundColor = {20, 25, 33, 235},
+            .border = {.color = {90, 100, 118, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY(CLAY_ID("InfoHeader"), {
+                .layout = {
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                    .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad * 3 / 4), (uint16_t)(header_pad * 3 / 4)},
+                    .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
+                },
+                .backgroundColor = {36, 44, 54, 250},
+            }) {
+                CLAY_TEXT(CLAY_STRING("INFO"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)title_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+            }
+            CLAY(CLAY_ID_LOCAL("InfoBody"), {
+                .layout = {
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIT(0)},
+                    .padding = CLAY_PADDING_ALL((uint16_t)body_pad),
+                    .childGap = (uint16_t)body_gap,
+                }
+            }) {
+                for (size_t i = 0; i < info_lines.size(); ++i) {
+                    Clay_String s = ui_text_slot(slot++, info_lines[i]);
+                    CLAY_TEXT(s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                }
+            }
+        }
     }
 
     Clay_RenderCommandArray cmds = Clay_EndLayout();
     g_ui.panelData = Clay_GetElementData(CLAY_ID("StatusPanel"));
     g_ui.headerData = Clay_GetElementData(CLAY_ID("StatusHeader"));
+    g_ui.infoPanelData = Clay_GetElementData(CLAY_ID("InfoPanel"));
     return cmds;
 }
 
@@ -2125,6 +2385,7 @@ int main() {
     float yaw_deg = 45.0f;
     float pitch_deg = 24.0f;
     float distance = 80.0f;
+    bool show_sketch_dimensions = true;
     bool object_selected = false;
     int selected_object_index = -1;
     int hovered_object_index = -1;
@@ -2315,6 +2576,8 @@ int main() {
                     }
                 } else if (key == RGFW_p) {
                     pick_debug_overlay = !pick_debug_overlay;
+                } else if (key == RGFW_d) {
+                    show_sketch_dimensions = !show_sketch_dimensions;
                 }
             }
             if (event.type == RGFW_mouseScroll) {
@@ -2384,6 +2647,12 @@ int main() {
                                       (int)g_ui.panelData.boundingBox.x, (int)g_ui.panelData.boundingBox.y,
                                       (int)g_ui.panelData.boundingBox.width, (int)g_ui.panelData.boundingBox.height)) {
                         // Click on panel body should not affect 3D selection.
+                        continue;
+                    }
+                    if (g_ui.infoPanelData.found &&
+                        point_in_rect(mouse_ui_x, mouse_ui_y,
+                                      (int)g_ui.infoPanelData.boundingBox.x, (int)g_ui.infoPanelData.boundingBox.y,
+                                      (int)g_ui.infoPanelData.boundingBox.width, (int)g_ui.infoPanelData.boundingBox.height)) {
                         continue;
                     }
 
@@ -2556,6 +2825,11 @@ int main() {
         }
 
         const size_t scene_sketch_count = count_scene_sketches(script_scene);
+        const vicad::ScriptSceneObject *info_object = nullptr;
+        if (selected_object_index >= 0 &&
+            (size_t)selected_object_index < script_scene.size()) {
+            info_object = &script_scene[(size_t)selected_object_index];
+        }
         Clay_RenderCommandArray ui_cmds = build_clay_ui(
             ui_width, ui_height, script_error.empty(), script_error,
             mesh.NumTri(), mesh.NumVert(), object_selected,
@@ -2567,6 +2841,8 @@ int main() {
             hovered_object_index >= 0 && (size_t)hovered_object_index < script_scene.size()
                 ? script_scene[(size_t)hovered_object_index].objectId
                 : 0ull,
+            show_sketch_dimensions,
+            info_object,
             hud_scale,
             face_select, edge_select);
 
@@ -2619,13 +2895,24 @@ int main() {
                 draw_mesh_selection_overlay(mesh, 0.22f, 0.52f, 0.98f, 0.28f);
             }
         }
-        draw_script_sketch_dimensions(script_scene, selected_object_index, eye, basis);
+        DimensionRenderContext dim_ctx = {};
+        dim_ctx.eye = eye;
+        dim_ctx.camera = basis;
+        dim_ctx.fovDegrees = fov_degrees;
+        dim_ctx.viewportHeight = height;
+        dim_ctx.arrowPixels = 4.0f;
+        draw_script_sketch_dimensions(script_scene, selected_object_index, dim_ctx, show_sketch_dimensions);
         if (pick_debug_overlay) {
             draw_pick_debug_overlay(width, height, window_w, window_h,
                                     mouse_x, mouse_y, mouse_px_x, mouse_px_y);
         }
-        const int top_right_offset =
-            (g_ui.panelData.found ? (int)std::lround(g_ui.panelData.boundingBox.height) : 0) + 8;
+        const int status_bottom = g_ui.panelData.found
+            ? (int)std::lround(g_ui.panelData.boundingBox.y + g_ui.panelData.boundingBox.height)
+            : 0;
+        const int info_bottom = g_ui.infoPanelData.found
+            ? (int)std::lround(g_ui.infoPanelData.boundingBox.y + g_ui.infoPanelData.boundingBox.height)
+            : 0;
+        const int top_right_offset = (status_bottom > info_bottom ? status_bottom : info_bottom) + 8;
         draw_orientation_cube(basis, width, height, top_right_offset, hud_scale);
         clay_render_commands(ui_cmds, width, height, ui_scale);
 

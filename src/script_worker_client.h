@@ -2,10 +2,12 @@
 #define VICAD_SCRIPT_WORKER_CLIENT_H_
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "manifold/manifold.h"
+#include "sketch_dimensions.h"
 
 namespace vicad {
 
@@ -29,9 +31,13 @@ struct ScriptSceneObject {
   uint64_t objectId = 0;
   std::string name;
   ScriptSceneObjectKind kind = ScriptSceneObjectKind::Unknown;
+  uint32_t rootKind = 0;
+  uint32_t rootId = 0;
   manifold::Manifold manifold;
   manifold::MeshGL mesh;
   std::vector<ScriptSketchContour> sketchContours;
+  std::optional<SketchDimensionModel> sketchDims;
+  std::vector<OpTraceEntry> opTrace;
   SceneVec3 bmin = {0.0f, 0.0f, 0.0f};
   SceneVec3 bmax = {0.0f, 0.0f, 0.0f};
 };
