@@ -25,6 +25,7 @@ static const char *manifold_sources[] = {
 static const char *manifold_cross_section_source = "manifold/src/cross_section/cross_section.cpp";
 static const char *app_sources[] = {
     "src/main.cpp",
+    "src/edge_detection.cpp",
     "src/face_detection.cpp",
     "src/op_decoder.cpp",
     "src/script_worker_client.cpp",

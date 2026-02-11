@@ -3,10 +3,26 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "manifold/manifold.h"
 
 namespace vicad {
+
+struct SceneVec3 {
+  float x;
+  float y;
+  float z;
+};
+
+struct ScriptSceneObject {
+  uint64_t objectId;
+  std::string name;
+  manifold::Manifold manifold;
+  manifold::MeshGL mesh;
+  SceneVec3 bmin;
+  SceneVec3 bmax;
+};
 
 class ScriptWorkerClient {
  public:
@@ -17,6 +33,7 @@ class ScriptWorkerClient {
   ScriptWorkerClient &operator=(const ScriptWorkerClient &) = delete;
 
   bool ExecuteScript(const char *script_path, manifold::MeshGL *mesh, std::string *error);
+  bool ExecuteScriptScene(const char *script_path, std::vector<ScriptSceneObject> *objects, std::string *error);
   bool started() const { return started_; }
   void Shutdown();
 

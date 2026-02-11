@@ -70,18 +70,19 @@ bool check_status(const manifold::Manifold &m, const char *ctx, std::string *err
 
 }  // namespace
 
-bool ReplayOpsToMesh(const ReplayInput &in, manifold::MeshGL *mesh, std::string *error) {
-  if (in.root_kind != (uint32_t)NodeKind::Manifold) {
-    *error = "Replay failed: root node is not a manifold.";
-    return false;
-  }
+bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_count,
+                       ReplayTables *tables, std::string *error) {
+  tables->manifold_nodes.clear();
+  tables->has_manifold.clear();
+  tables->cross_nodes.clear();
+  tables->has_cross.clear();
 
-  std::vector<manifold::Manifold> m_nodes;
-  std::vector<bool> has_m;
-  std::vector<manifold::CrossSection> c_nodes;
-  std::vector<bool> has_c;
+  std::vector<manifold::Manifold> &m_nodes = tables->manifold_nodes;
+  std::vector<bool> &has_m = tables->has_manifold;
+  std::vector<manifold::CrossSection> &c_nodes = tables->cross_nodes;
+  std::vector<bool> &has_c = tables->has_cross;
 
-  Reader ops = {in.records, in.records_size, 0};
+  Reader ops = {records, records_size, 0};
   uint32_t parsed = 0;
   while (ops.off < ops.len) {
     OpRecordHeader hdr = {};
@@ -307,17 +308,34 @@ bool ReplayOpsToMesh(const ReplayInput &in, manifold::MeshGL *mesh, std::string 
     }
   }
 
-  if (parsed != in.op_count) {
+  if (parsed != op_count) {
     *error = "Replay failed: op count mismatch.";
     return false;
   }
-  if ((size_t)in.root_id >= m_nodes.size() || !has_m[in.root_id]) {
+  return true;
+}
+
+bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                           manifold::Manifold *out, std::string *error) {
+  if (root_kind != (uint32_t)NodeKind::Manifold) {
+    *error = "Replay failed: root node is not a manifold.";
+    return false;
+  }
+  if ((size_t)root_id >= tables.manifold_nodes.size() || !tables.has_manifold[root_id]) {
     *error = "Replay failed: root manifold node missing.";
     return false;
   }
+  manifold::Manifold m = tables.manifold_nodes[root_id];
+  if (!check_status(m, "final", error)) return false;
+  *out = std::move(m);
+  return true;
+}
 
-  manifold::Manifold out = m_nodes[in.root_id];
-  if (!check_status(out, "final", error)) return false;
+bool ReplayOpsToMesh(const ReplayInput &in, manifold::MeshGL *mesh, std::string *error) {
+  ReplayTables tables;
+  if (!ReplayOpsToTables(in.records, in.records_size, in.op_count, &tables, error)) return false;
+  manifold::Manifold out;
+  if (!ResolveReplayManifold(tables, in.root_kind, in.root_id, &out, error)) return false;
   *mesh = out.GetMeshGL();
   return true;
 }

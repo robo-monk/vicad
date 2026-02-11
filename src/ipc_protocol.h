@@ -7,7 +7,7 @@
 namespace vicad {
 
 static constexpr const char kIpcMagic[8] = {'V', 'C', 'A', 'D', 'I', 'P', 'C', '1'};
-static constexpr uint32_t kIpcVersion = 1;
+static constexpr uint32_t kIpcVersion = 2;
 static constexpr size_t kDefaultShmSize = 100u * 1024u * 1024u;
 static constexpr uint32_t kDefaultRequestOffset = 4096u;
 static constexpr uint32_t kDefaultResponseOffset = 1024u * 1024u;
@@ -86,6 +86,23 @@ struct ResponsePayloadOk {
   uint32_t op_count;
   uint32_t records_size;
   uint32_t diagnostics_len;
+};
+
+struct SceneObjectRecord {
+  uint64_t object_id_hash;
+  uint32_t root_kind;
+  uint32_t root_id;
+  uint32_t name_len;
+  uint32_t reserved;
+};
+
+struct ResponsePayloadScene {
+  uint32_t version;
+  uint32_t object_count;
+  uint32_t op_count;
+  uint32_t records_size;
+  uint32_t diagnostics_len;
+  uint32_t object_table_size;
 };
 
 struct ResponsePayloadError {

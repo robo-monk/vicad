@@ -15,6 +15,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cmath>
+#include <limits>
+#include <vector>
 
 #include "ipc_protocol.h"
 #include "op_decoder.h"
@@ -26,6 +29,35 @@ namespace {
 bool set_err(std::string *error, const std::string &msg) {
   if (error) *error = msg;
   return false;
+}
+
+bool compute_bounds(const manifold::MeshGL &mesh, SceneVec3 *out_min, SceneVec3 *out_max) {
+  if (mesh.numProp < 3 || mesh.vertProperties.empty()) return false;
+  const size_t count = mesh.vertProperties.size() / mesh.numProp;
+  if (count == 0) return false;
+  double minx = std::numeric_limits<double>::infinity();
+  double miny = std::numeric_limits<double>::infinity();
+  double minz = std::numeric_limits<double>::infinity();
+  double maxx = -std::numeric_limits<double>::infinity();
+  double maxy = -std::numeric_limits<double>::infinity();
+  double maxz = -std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < count; ++i) {
+    const size_t b = i * mesh.numProp;
+    const double x = mesh.vertProperties[b + 0];
+    const double y = mesh.vertProperties[b + 1];
+    const double z = mesh.vertProperties[b + 2];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+    minx = std::min(minx, x);
+    miny = std::min(miny, y);
+    minz = std::min(minz, z);
+    maxx = std::max(maxx, x);
+    maxy = std::max(maxy, y);
+    maxz = std::max(maxz, z);
+  }
+  if (!std::isfinite(minx) || !std::isfinite(maxx)) return false;
+  *out_min = {(float)minx, (float)miny, (float)minz};
+  *out_max = {(float)maxx, (float)maxy, (float)maxz};
+  return true;
 }
 
 bool write_all(int fd, const void *buf, size_t len) {
@@ -209,8 +241,25 @@ bool ScriptWorkerClient::ReadLineWithTimeout(int timeout_ms, std::string *out, s
 }
 
 bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL *mesh, std::string *error) {
+  std::vector<ScriptSceneObject> scene_objects;
+  if (!ExecuteScriptScene(script_path, &scene_objects, error)) return false;
+  if (scene_objects.empty()) return set_err(error, "Worker returned no scene objects.");
+  std::vector<manifold::Manifold> parts;
+  parts.reserve(scene_objects.size());
+  for (const ScriptSceneObject &obj : scene_objects) parts.push_back(obj.manifold);
+  manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
+  if (merged.Status() != manifold::Manifold::Error::NoError) {
+    return set_err(error, "Failed to merge scene objects for legacy mesh output.");
+  }
+  *mesh = merged.GetMeshGL();
+  return true;
+}
+
+bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector<ScriptSceneObject> *objects,
+                                            std::string *error) {
   if (!Start(error)) return false;
-  if (!script_path || !mesh) return set_err(error, "Invalid execute arguments.");
+  if (!script_path || !objects) return set_err(error, "Invalid execute arguments.");
+  objects->clear();
 
   SharedHeader *hdr = (SharedHeader *)shm_ptr_;
   if (std::memcmp(hdr->magic, kIpcMagic, sizeof(kIpcMagic)) != 0 || hdr->version != kIpcVersion) {
@@ -256,27 +305,56 @@ bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL
 
   if (hdr->state != (uint32_t)IpcState::ResponseReady) return set_err(error, "Worker state is not ResponseReady.");
   if (hdr->response_seq != seq) return set_err(error, "Worker sequence mismatch.");
-  if (hdr->response_length < sizeof(ResponsePayloadOk)) return set_err(error, "Worker response payload is too small.");
+  if (hdr->response_length < sizeof(ResponsePayloadScene)) return set_err(error, "Worker response payload is too small.");
   if ((size_t)hdr->response_offset + hdr->response_length > (size_t)hdr->capacity_bytes) {
     return set_err(error, "Worker response payload is out of bounds.");
   }
 
   const uint8_t *resp_ptr = base + hdr->response_offset;
-  ResponsePayloadOk ok = {};
+  ResponsePayloadScene ok = {};
   std::memcpy(&ok, resp_ptr, sizeof(ok));
-  if (ok.version != kIpcVersion) return set_err(error, "Worker response version mismatch.");
+  if (ok.version != kIpcVersion) {
+    return set_err(error, "Worker response version mismatch. Check worker/client protocol compatibility.");
+  }
 
   const size_t payload_need =
-      sizeof(ResponsePayloadOk) + (size_t)ok.records_size + (size_t)ok.diagnostics_len;
+      sizeof(ResponsePayloadScene) + (size_t)ok.records_size + (size_t)ok.object_table_size + (size_t)ok.diagnostics_len;
   if (payload_need > hdr->response_length) return set_err(error, "Worker response payload is truncated.");
 
-  ReplayInput replay = {};
-  replay.records = resp_ptr + sizeof(ResponsePayloadOk);
-  replay.records_size = ok.records_size;
-  replay.op_count = ok.op_count;
-  replay.root_kind = ok.root_kind;
-  replay.root_id = ok.root_id;
-  if (!ReplayOpsToMesh(replay, mesh, error)) return false;
+  const uint8_t *records_ptr = resp_ptr + sizeof(ResponsePayloadScene);
+  const uint8_t *object_table_ptr = records_ptr + ok.records_size;
+  const uint8_t *names_ptr = object_table_ptr + ok.object_table_size;
+  const size_t name_blob_size = (size_t)ok.diagnostics_len;
+  const size_t expected_table_size = (size_t)ok.object_count * sizeof(SceneObjectRecord);
+  if (ok.object_count == 0) return set_err(error, "Worker returned zero scene objects.");
+  if (ok.object_table_size != expected_table_size) {
+    return set_err(error, "Worker scene object table size mismatch.");
+  }
+
+  ReplayTables tables;
+  if (!ReplayOpsToTables(records_ptr, ok.records_size, ok.op_count, &tables, error)) return false;
+
+  size_t name_off = 0;
+  objects->reserve(ok.object_count);
+  for (uint32_t i = 0; i < ok.object_count; ++i) {
+    SceneObjectRecord rec = {};
+    std::memcpy(&rec, object_table_ptr + i * sizeof(SceneObjectRecord), sizeof(SceneObjectRecord));
+    if (name_off + rec.name_len > name_blob_size) {
+      return set_err(error, "Worker scene name blob is truncated.");
+    }
+    manifold::Manifold m;
+    if (!ResolveReplayManifold(tables, rec.root_kind, rec.root_id, &m, error)) return false;
+    ScriptSceneObject obj;
+    obj.objectId = rec.object_id_hash;
+    obj.name.assign((const char *)(names_ptr + name_off), (size_t)rec.name_len);
+    obj.manifold = std::move(m);
+    obj.mesh = obj.manifold.GetMeshGL();
+    if (!compute_bounds(obj.mesh, &obj.bmin, &obj.bmax)) {
+      return set_err(error, "Failed to compute bounds for scene object " + std::to_string(i));
+    }
+    name_off += rec.name_len;
+    objects->push_back(std::move(obj));
+  }
 
   return true;
 }

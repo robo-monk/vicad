@@ -13,6 +13,7 @@
 #define RGFW_OPENGL
 #define RGFW_IMPLEMENTATION
 #include "../RGFW.h"
+#include "edge_detection.h"
 #include "face_detection.h"
 #include "script_worker_client.h"
 #include "manifold/manifold.h"
@@ -72,6 +73,19 @@ struct FaceSelectState {
     int hoveredRegion;
     int selectedRegion;
     vicad::FaceDetectionResult faces;
+};
+
+struct EdgeSelectState {
+    bool enabled;
+    bool dirtyTopology;
+    bool dirtySilhouette;
+    float sharpAngleDeg;
+    int hoveredEdge;
+    int selectedEdge;
+    int hoveredChain;
+    int selectedChain;
+    vicad::EdgeDetectionResult edges;
+    vicad::SilhouetteResult silhouette;
 };
 
 struct CameraBasis {
@@ -547,47 +561,127 @@ static void draw_mesh(const manifold::MeshGL &mesh) {
     glEnd();
 }
 
-static void draw_mesh_edge_strokes(const manifold::MeshGL &mesh) {
+static Vec3 mesh_vertex(const manifold::MeshGL &mesh, uint32_t idx) {
+    return {
+        mesh.vertProperties[(size_t)idx * mesh.numProp + 0],
+        mesh.vertProperties[(size_t)idx * mesh.numProp + 1],
+        mesh.vertProperties[(size_t)idx * mesh.numProp + 2],
+    };
+}
+
+static void draw_edge_indices(const manifold::MeshGL &mesh,
+                              const vicad::EdgeDetectionResult &edge_result,
+                              const std::vector<int> &indices) {
+    glBegin(GL_LINES);
+    for (const int idx : indices) {
+        if (idx < 0 || (size_t)idx >= edge_result.edges.size()) continue;
+        const vicad::EdgeRecord &e = edge_result.edges[(size_t)idx];
+        const Vec3 p0 = mesh_vertex(mesh, e.v0);
+        const Vec3 p1 = mesh_vertex(mesh, e.v1);
+        glVertex3f(p0.x, p0.y, p0.z);
+        glVertex3f(p1.x, p1.y, p1.z);
+    }
+    glEnd();
+}
+
+static void draw_feature_edges(const manifold::MeshGL &mesh,
+                               const vicad::EdgeDetectionResult &edge_result) {
     glDisable(GL_LIGHTING);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glDepthMask(GL_FALSE);
-    glEnable(GL_POLYGON_OFFSET_LINE);
-    glPolygonOffset(-1.0f, -1.0f);
-    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-    glLineWidth(1.1f);
-    glColor4f(0.12f, 0.16f, 0.20f, 0.42f);
 
-    glBegin(GL_TRIANGLES);
-    for (size_t tri = 0; tri < mesh.NumTri(); ++tri) {
-        const size_t i0 = mesh.triVerts[tri * 3 + 0];
-        const size_t i1 = mesh.triVerts[tri * 3 + 1];
-        const size_t i2 = mesh.triVerts[tri * 3 + 2];
+    glLineWidth(2.0f);
+    glColor4f(0.06f, 0.11f, 0.16f, 0.90f);
+    draw_edge_indices(mesh, edge_result, edge_result.sharpEdgeIndices);
 
-        const Vec3 p0 = {
-            mesh.vertProperties[i0 * mesh.numProp + 0],
-            mesh.vertProperties[i0 * mesh.numProp + 1],
-            mesh.vertProperties[i0 * mesh.numProp + 2],
-        };
-        const Vec3 p1 = {
-            mesh.vertProperties[i1 * mesh.numProp + 0],
-            mesh.vertProperties[i1 * mesh.numProp + 1],
-            mesh.vertProperties[i1 * mesh.numProp + 2],
-        };
-        const Vec3 p2 = {
-            mesh.vertProperties[i2 * mesh.numProp + 0],
-            mesh.vertProperties[i2 * mesh.numProp + 1],
-            mesh.vertProperties[i2 * mesh.numProp + 2],
-        };
-        glVertex3f(p0.x, p0.y, p0.z);
-        glVertex3f(p1.x, p1.y, p1.z);
-        glVertex3f(p2.x, p2.y, p2.z);
-    }
-    glEnd();
+    glLineWidth(2.4f);
+    glColor4f(0.05f, 0.13f, 0.20f, 0.96f);
+    draw_edge_indices(mesh, edge_result, edge_result.boundaryEdgeIndices);
+
+    glLineWidth(2.8f);
+    glColor4f(0.98f, 0.38f, 0.30f, 0.98f);
+    draw_edge_indices(mesh, edge_result, edge_result.nonManifoldEdgeIndices);
 
     glLineWidth(1.0f);
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-    glDisable(GL_POLYGON_OFFSET_LINE);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+static void draw_silhouette_edges(const manifold::MeshGL &mesh,
+                                  const vicad::EdgeDetectionResult &edge_result,
+                                  const vicad::SilhouetteResult &silhouette) {
+    if (silhouette.silhouetteEdgeIndices.empty()) return;
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glLineWidth(2.6f);
+    glColor4f(0.04f, 0.08f, 0.12f, 0.98f);
+    draw_edge_indices(mesh, edge_result, silhouette.silhouetteEdgeIndices);
+    glLineWidth(1.0f);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+static void draw_selected_edge(const manifold::MeshGL &mesh,
+                               const vicad::EdgeDetectionResult &edge_result,
+                               int edge_index) {
+    if (edge_index < 0 || (size_t)edge_index >= edge_result.edges.size()) return;
+    const vicad::EdgeRecord &e = edge_result.edges[(size_t)edge_index];
+    const Vec3 p0 = mesh_vertex(mesh, e.v0);
+    const Vec3 p1 = mesh_vertex(mesh, e.v1);
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glLineWidth(4.8f);
+    glColor4f(1.0f, 0.90f, 0.16f, 1.0f);
+    glBegin(GL_LINES);
+    glVertex3f(p0.x, p0.y, p0.z);
+    glVertex3f(p1.x, p1.y, p1.z);
+    glEnd();
+    glLineWidth(1.0f);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+static void draw_hovered_edge(const manifold::MeshGL &mesh,
+                              const vicad::EdgeDetectionResult &edge_result,
+                              int edge_index) {
+    if (edge_index < 0 || (size_t)edge_index >= edge_result.edges.size()) return;
+    const vicad::EdgeRecord &e = edge_result.edges[(size_t)edge_index];
+    const Vec3 p0 = mesh_vertex(mesh, e.v0);
+    const Vec3 p1 = mesh_vertex(mesh, e.v1);
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glLineWidth(3.6f);
+    glColor4f(0.38f, 0.73f, 1.0f, 0.96f);
+    glBegin(GL_LINES);
+    glVertex3f(p0.x, p0.y, p0.z);
+    glVertex3f(p1.x, p1.y, p1.z);
+    glEnd();
+    glLineWidth(1.0f);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+}
+
+static void draw_chain_overlay(const manifold::MeshGL &mesh,
+                               const vicad::EdgeDetectionResult &edge_result,
+                               int chain_index,
+                               float line_width,
+                               float r, float g, float b, float a) {
+    if (chain_index < 0 || (size_t)chain_index >= edge_result.featureChains.size()) return;
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glLineWidth(line_width);
+    glColor4f(r, g, b, a);
+    draw_edge_indices(mesh, edge_result, edge_result.featureChains[(size_t)chain_index]);
+    glLineWidth(1.0f);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
 }
@@ -641,14 +735,18 @@ static void draw_face_region_overlay(const manifold::MeshGL &mesh,
     glDisable(GL_BLEND);
 }
 
-static void draw_selected_outline(const manifold::MeshGL &mesh) {
-    glDisable(GL_LIGHTING);
-    glColor3f(1.0f, 0.92f, 0.18f);
-    glLineWidth(3.0f);
-    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+static void draw_mesh_selection_overlay(const manifold::MeshGL &mesh,
+                                        float r, float g, float b, float a) {
+    if (mesh.NumTri() == 0) return;
 
-    glPushMatrix();
-    glScalef(1.01f, 1.01f, 1.01f);
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.0f, -1.0f);
+    glColor4f(r, g, b, a);
+
     glBegin(GL_TRIANGLES);
     for (size_t tri = 0; tri < mesh.NumTri(); ++tri) {
         const size_t i0 = mesh.triVerts[tri * 3 + 0];
@@ -675,9 +773,10 @@ static void draw_selected_outline(const manifold::MeshGL &mesh) {
         glVertex3f(p2.x, p2.y, p2.z);
     }
     glEnd();
-    glPopMatrix();
 
-    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
 }
 
 static Vec3 light_anchor(const Vec3 &eye, const CameraBasis &basis,
@@ -732,15 +831,77 @@ static void window_mouse_to_pixel(i32 mouse_x, i32 mouse_y,
                                   i32 window_w, i32 window_h,
                                   i32 pixel_w, i32 pixel_h,
                                   i32 *out_x, i32 *out_y) {
-    if (window_w <= 0 || window_h <= 0) {
-        *out_x = mouse_x;
-        *out_y = mouse_y;
-        return;
+    i32 x = mouse_x;
+    i32 y = mouse_y;
+    if (window_w > 0 && window_h > 0 && pixel_w > 0 && pixel_h > 0) {
+        const float sx = (float)pixel_w / (float)window_w;
+        const float sy = (float)pixel_h / (float)window_h;
+        x = (i32)std::floor(((float)mouse_x + 0.5f) * sx);
+        y = (i32)std::floor(((float)mouse_y + 0.5f) * sy);
     }
-    const float sx = (float)pixel_w / (float)window_w;
-    const float sy = (float)pixel_h / (float)window_h;
-    *out_x = (i32)std::lround((float)mouse_x * sx);
-    *out_y = (i32)std::lround((float)mouse_y * sy);
+    if (pixel_w > 0) {
+        if (x < 0) x = 0;
+        if (x >= pixel_w) x = pixel_w - 1;
+    }
+    if (pixel_h > 0) {
+        if (y < 0) y = 0;
+        if (y >= pixel_h) y = pixel_h - 1;
+    }
+    *out_x = x;
+    *out_y = y;
+}
+
+static void draw_pick_debug_overlay(i32 pixel_w, i32 pixel_h,
+                                    i32 window_w, i32 window_h,
+                                    i32 raw_mouse_x, i32 raw_mouse_y,
+                                    i32 pick_mouse_x, i32 pick_mouse_y) {
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    glOrtho(0.0, (double)pixel_w, (double)pixel_h, 0.0, -1.0, 1.0);
+
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    auto draw_cross = [](float x, float y, float half, float r, float g, float b, float a) {
+        glColor4f(r, g, b, a);
+        glBegin(GL_LINES);
+        glVertex2f(x - half, y);
+        glVertex2f(x + half, y);
+        glVertex2f(x, y - half);
+        glVertex2f(x, y + half);
+        glEnd();
+    };
+
+    float raw_px_x = (float)raw_mouse_x;
+    float raw_px_y = (float)raw_mouse_y;
+    if (window_w > 0 && window_h > 0 && pixel_w > 0 && pixel_h > 0) {
+        const float sx = (float)pixel_w / (float)window_w;
+        const float sy = (float)pixel_h / (float)window_h;
+        raw_px_x = ((float)raw_mouse_x + 0.5f) * sx;
+        raw_px_y = ((float)raw_mouse_y + 0.5f) * sy;
+    }
+
+    // Magenta: raw window-space coords drawn directly in pixel space (shows HiDPI scale mismatch).
+    draw_cross((float)raw_mouse_x, (float)raw_mouse_y, 7.0f, 0.95f, 0.20f, 0.95f, 0.75f);
+    // Red: raw mouse converted to pixel space.
+    draw_cross(raw_px_x, raw_px_y, 10.0f, 1.0f, 0.25f, 0.25f, 0.95f);
+    // Cyan: coordinate actually used for ray picking (should match red).
+    draw_cross((float)pick_mouse_x, (float)pick_mouse_y, 12.0f, 0.22f, 0.92f, 1.0f, 0.95f);
+
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+
+    glPopMatrix();
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
 }
 
 static float ui_scale_for_window(i32 pixel_w, i32 pixel_h, i32 window_w, i32 window_h) {
@@ -781,6 +942,134 @@ static bool ray_hits_aabb(const Vec3 &ray_origin, const Vec3 &ray_dir,
     }
 
     return tmax >= 0.0f;
+}
+
+static bool ray_intersect_triangle(const Vec3 &orig, const Vec3 &dir,
+                                   const Vec3 &p0, const Vec3 &p1, const Vec3 &p2,
+                                   float *out_t) {
+    const Vec3 e1 = sub(p1, p0);
+    const Vec3 e2 = sub(p2, p0);
+    const Vec3 p = cross(dir, e2);
+    const float det = dot(e1, p);
+    if (std::fabs(det) < 1e-7f) return false;
+    const float inv_det = 1.0f / det;
+
+    const Vec3 tvec = sub(orig, p0);
+    const float u = dot(tvec, p) * inv_det;
+    if (u < 0.0f || u > 1.0f) return false;
+
+    const Vec3 q = cross(tvec, e1);
+    const float v = dot(dir, q) * inv_det;
+    if (v < 0.0f || u + v > 1.0f) return false;
+
+    const float t = dot(e2, q) * inv_det;
+    if (t <= 1e-5f) return false;
+    if (out_t) *out_t = t;
+    return true;
+}
+
+static bool ray_mesh_hit_t(const manifold::MeshGL &mesh,
+                           const Vec3 &ray_origin, const Vec3 &ray_dir,
+                           float *out_t) {
+    const size_t tri_count = mesh.NumTri();
+    if (tri_count == 0) return false;
+
+    bool hit = false;
+    float best_t = 1e30f;
+    for (size_t tri = 0; tri < tri_count; ++tri) {
+        const size_t i0 = mesh.triVerts[tri * 3 + 0];
+        const size_t i1 = mesh.triVerts[tri * 3 + 1];
+        const size_t i2 = mesh.triVerts[tri * 3 + 2];
+        const Vec3 p0 = {
+            mesh.vertProperties[i0 * mesh.numProp + 0],
+            mesh.vertProperties[i0 * mesh.numProp + 1],
+            mesh.vertProperties[i0 * mesh.numProp + 2],
+        };
+        const Vec3 p1 = {
+            mesh.vertProperties[i1 * mesh.numProp + 0],
+            mesh.vertProperties[i1 * mesh.numProp + 1],
+            mesh.vertProperties[i1 * mesh.numProp + 2],
+        };
+        const Vec3 p2 = {
+            mesh.vertProperties[i2 * mesh.numProp + 0],
+            mesh.vertProperties[i2 * mesh.numProp + 1],
+            mesh.vertProperties[i2 * mesh.numProp + 2],
+        };
+
+        float t = 0.0f;
+        if (!ray_intersect_triangle(ray_origin, ray_dir, p0, p1, p2, &t)) continue;
+        if (t >= best_t) continue;
+        best_t = t;
+        hit = true;
+    }
+
+    if (hit && out_t) *out_t = best_t;
+    return hit;
+}
+
+static bool ray_hits_mesh(const manifold::MeshGL &mesh,
+                          const Vec3 &ray_origin, const Vec3 &ray_dir) {
+    return ray_mesh_hit_t(mesh, ray_origin, ray_dir, nullptr);
+}
+
+static bool ray_aabb_hit_t(const Vec3 &ray_origin, const Vec3 &ray_dir,
+                           const Vec3 &bmin, const Vec3 &bmax, float *out_t) {
+    float tmin = 0.0f;
+    float tmax = 1e30f;
+
+    const float ro[3] = {ray_origin.x, ray_origin.y, ray_origin.z};
+    const float rd[3] = {ray_dir.x, ray_dir.y, ray_dir.z};
+    const float mn[3] = {bmin.x, bmin.y, bmin.z};
+    const float mx[3] = {bmax.x, bmax.y, bmax.z};
+
+    for (int i = 0; i < 3; ++i) {
+        if (std::fabs(rd[i]) < 1e-6f) {
+            if (ro[i] < mn[i] || ro[i] > mx[i]) return false;
+            continue;
+        }
+        const float inv = 1.0f / rd[i];
+        float t0 = (mn[i] - ro[i]) * inv;
+        float t1 = (mx[i] - ro[i]) * inv;
+        if (t0 > t1) {
+            const float tmp = t0;
+            t0 = t1;
+            t1 = tmp;
+        }
+        if (t0 > tmin) tmin = t0;
+        if (t1 < tmax) tmax = t1;
+        if (tmax < tmin) return false;
+    }
+    if (tmax < 0.0f) return false;
+    if (out_t) *out_t = tmin >= 0.0f ? tmin : tmax;
+    return true;
+}
+
+static Vec3 scene_vec3_to_vec3(const vicad::SceneVec3 &v) {
+    return {v.x, v.y, v.z};
+}
+
+static int pick_scene_object_by_ray(const std::vector<vicad::ScriptSceneObject> &scene,
+                                    const Vec3 &eye, const Vec3 &ray_dir) {
+    float best_t = 1e30f;
+    int best = -1;
+    for (size_t i = 0; i < scene.size(); ++i) {
+        float broad_t = 0.0f;
+        if (!ray_aabb_hit_t(eye, ray_dir,
+                            scene_vec3_to_vec3(scene[i].bmin),
+                            scene_vec3_to_vec3(scene[i].bmax),
+                            &broad_t)) {
+            continue;
+        }
+        float hit_t = 0.0f;
+        if (!ray_mesh_hit_t(scene[i].mesh, eye, ray_dir, &hit_t)) {
+            continue;
+        }
+        if (hit_t < best_t) {
+            best_t = hit_t;
+            best = (int)i;
+        }
+    }
+    return best;
 }
 
 static void draw_orientation_cube(const CameraBasis &basis, i32 width, i32 height, int top_offset_px) {
@@ -1286,9 +1575,15 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                                              const std::string &script_error,
                                              size_t tri_count, size_t vert_count,
                                              bool selected,
+                                             size_t scene_object_count,
+                                             int selected_object_index,
+                                             int hovered_object_index,
+                                             uint64_t selected_object_id,
+                                             uint64_t hovered_object_id,
                                              const SketchState &sketch,
                                              size_t sketch_feature_count,
-                                             const FaceSelectState &face_select) {
+                                             const FaceSelectState &face_select,
+                                             const EdgeSelectState &edge_select) {
     const float hud = 2.0f;
     const int root_pad = (int)std::lround(16.0f * hud);
     int panel_w = (int)std::lround(320.0f * hud);
@@ -1309,18 +1604,29 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
 
     char mesh_line[96];
     char selected_line[96];
+    char object_count_line[96];
+    char object_pick_line[160];
     char sketch_mode_line[96];
     char sketch_plane_line[96];
     char sketch_profile_line[96];
     char sketch_depth_line[96];
     char sketch_snap_line[96];
     char sketch_feature_line[96];
+    char sel_mode_line[96];
+    char edge_mode_line[96];
+    char edge_count_line[128];
+    char edge_hover_line[96];
     char face_mode_line[96];
     char face_region_line[96];
     char face_hover_line[96];
     char face_type_line[128];
     std::snprintf(mesh_line, sizeof(mesh_line), "MESH: %zu TRI  %zu VERT", tri_count, vert_count);
     std::snprintf(selected_line, sizeof(selected_line), "SELECTED: %s", selected ? "ON" : "OFF");
+    std::snprintf(object_count_line, sizeof(object_count_line), "SCENE OBJECTS: %zu", scene_object_count);
+    std::snprintf(object_pick_line, sizeof(object_pick_line), "OBJ H/S IDX: %d / %d  ID: %llx / %llx",
+                  hovered_object_index, selected_object_index,
+                  (unsigned long long)hovered_object_id,
+                  (unsigned long long)selected_object_id);
     std::snprintf(sketch_mode_line, sizeof(sketch_mode_line), "SKETCH: %s [S]", sketch.active ? "ON" : "OFF");
     std::snprintf(sketch_plane_line, sizeof(sketch_plane_line), "PLANE: %s [1/2/3]", sketch_plane_name(sketch.plane));
     std::snprintf(sketch_profile_line, sizeof(sketch_profile_line), "PROFILE: %s  %zu PT",
@@ -1329,6 +1635,19 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     std::snprintf(sketch_snap_line, sizeof(sketch_snap_line), "SNAP: %s  %.2f [G]",
                   sketch.snapEnabled ? "ON" : "OFF", sketch.snapStep);
     std::snprintf(sketch_feature_line, sizeof(sketch_feature_line), "FEATURES: %zu", sketch_feature_count);
+    const char *mode_name = edge_select.enabled ? "EDGE" : (face_select.enabled ? "FACE" : "OBJECT");
+    std::snprintf(sel_mode_line, sizeof(sel_mode_line), "SEL MODE: %s [E/F]", mode_name);
+    std::snprintf(edge_mode_line, sizeof(edge_mode_line), "EDGE SEL: %s [E]", edge_select.enabled ? "ON" : "OFF");
+    std::snprintf(edge_count_line, sizeof(edge_count_line),
+                  "EDGES S/B/NM/SIL: %zu/%zu/%zu/%zu  ANGLE: %.1f",
+                  edge_select.edges.sharpEdgeIndices.size(),
+                  edge_select.edges.boundaryEdgeIndices.size(),
+                  edge_select.edges.nonManifoldEdgeIndices.size(),
+                  edge_select.silhouette.silhouetteEdgeIndices.size(),
+                  edge_select.sharpAngleDeg);
+    std::snprintf(edge_hover_line, sizeof(edge_hover_line), "H/S EDGE: %d/%d  CHAIN: %d/%d",
+                  edge_select.hoveredEdge, edge_select.selectedEdge,
+                  edge_select.hoveredChain, edge_select.selectedChain);
     std::snprintf(face_mode_line, sizeof(face_mode_line), "FACE SEL: %s [F]", face_select.enabled ? "ON" : "OFF");
     std::snprintf(face_region_line, sizeof(face_region_line), "FACE REGIONS: %zu  ANGLE: %.1f",
                   face_select.faces.regions.size(), face_select.angleThresholdDeg);
@@ -1355,12 +1674,18 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
 
     Clay_String mesh_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(mesh_line), .chars = mesh_line};
     Clay_String selected_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(selected_line), .chars = selected_line};
+    Clay_String object_count_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(object_count_line), .chars = object_count_line};
+    Clay_String object_pick_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(object_pick_line), .chars = object_pick_line};
     Clay_String sketch_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_mode_line), .chars = sketch_mode_line};
     Clay_String sketch_plane_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_plane_line), .chars = sketch_plane_line};
     Clay_String sketch_profile_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_profile_line), .chars = sketch_profile_line};
     Clay_String sketch_depth_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_depth_line), .chars = sketch_depth_line};
     Clay_String sketch_snap_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_snap_line), .chars = sketch_snap_line};
     Clay_String sketch_feature_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_feature_line), .chars = sketch_feature_line};
+    Clay_String sel_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sel_mode_line), .chars = sel_mode_line};
+    Clay_String edge_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(edge_mode_line), .chars = edge_mode_line};
+    Clay_String edge_count_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(edge_count_line), .chars = edge_count_line};
+    Clay_String edge_hover_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(edge_hover_line), .chars = edge_hover_line};
     Clay_String face_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_mode_line), .chars = face_mode_line};
     Clay_String face_region_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_region_line), .chars = face_region_line};
     Clay_String face_hover_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_hover_line), .chars = face_hover_line};
@@ -1410,12 +1735,24 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                               CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = script_ok ? (Clay_Color){130, 230, 130, 255} : (Clay_Color){255, 130, 120, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(mesh_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {214, 224, 237, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(selected_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = selected ? (Clay_Color){255, 230, 70, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(object_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {184, 212, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(object_pick_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {180, 205, 240, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = sketch.active ? (Clay_Color){120, 220, 255, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_plane_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_profile_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = sketch.closed ? (Clay_Color){130, 230, 130, 255} : (Clay_Color){255, 210, 120, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_depth_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_snap_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = sketch.snapEnabled ? (Clay_Color){176, 235, 176, 255} : (Clay_Color){205, 190, 175, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_feature_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {214, 224, 237, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(sel_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {170, 210, 255, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(edge_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = edge_select.enabled ? (Clay_Color){138, 196, 255, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    if (edge_select.enabled) {
+                        CLAY_TEXT(edge_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(edge_hover_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(CLAY_STRING("LCLICK PICK EDGE"),
+                                  CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {205, 214, 230, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(CLAY_STRING("+/- ADJUST SHARP ANGLE"),
+                                  CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {205, 214, 230, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    }
                     CLAY_TEXT(face_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = face_select.enabled ? (Clay_Color){138, 196, 255, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     if (face_select.enabled) {
                         CLAY_TEXT(face_region_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
@@ -1452,6 +1789,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
 }
 
 int main() {
+    const bool feature_detection_enabled = false;
     manifold::Manifold fallback = manifold::Manifold::Cube(manifold::vec3(1.0), true);
     manifold::MeshGL base_mesh = fallback.GetMeshGL();
     manifold::MeshGL mesh = base_mesh;
@@ -1464,9 +1802,11 @@ int main() {
     const char *script_log_path = "build/script_error.log";
     const char *script_mode_env = std::getenv("VCAD_SCRIPT_MODE");
     const bool force_legacy = (script_mode_env != nullptr && std::strcmp(script_mode_env, "legacy") == 0);
+    const bool use_multi_scene_mode = true;
     bool use_ipc_mode = !force_legacy;
     vicad::ScriptWorkerClient worker_client;
     bool ipc_start_failed = false;
+    std::vector<vicad::ScriptSceneObject> script_scene;
 
     long long last_script_mtime = -1;
     std::string script_error;
@@ -1496,7 +1836,6 @@ int main() {
 
     RGFW_window_setExitKey(win, RGFW_escape);
     RGFW_window_makeCurrentContext_OpenGL(win);
-
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
@@ -1557,6 +1896,8 @@ int main() {
     float pitch_deg = 24.0f;
     float distance = 80.0f;
     bool object_selected = false;
+    int selected_object_index = -1;
+    int hovered_object_index = -1;
     FaceSelectState face_select = {
         false,  // enabled
         true,   // dirty
@@ -1565,11 +1906,24 @@ int main() {
         -1,     // selectedRegion
         {},     // faces
     };
+    EdgeSelectState edge_select = {
+        false,  // enabled
+        true,   // dirtyTopology
+        true,   // dirtySilhouette
+        30.0f,  // sharpAngleDeg
+        -1,     // hoveredEdge
+        -1,     // selectedEdge
+        -1,     // hoveredChain
+        -1,     // selectedChain
+        {},     // edges
+        {},     // silhouette
+    };
     float ui_scroll_x = 0.0f;
     float ui_scroll_y = 0.0f;
     i32 last_mouse_x = 0;
     i32 last_mouse_y = 0;
     bool have_last_mouse = false;
+    bool pick_debug_overlay = true;
 
     while (!RGFW_window_shouldClose(win)) {
         const long long mt = file_mtime_ns(script_path);
@@ -1582,19 +1936,39 @@ int main() {
 
             bool loaded = false;
             if (use_ipc_mode) {
-                loaded = worker_client.ExecuteScript(script_path, &next_mesh, &err);
+                if (use_multi_scene_mode) {
+                    std::vector<vicad::ScriptSceneObject> next_scene;
+                    loaded = worker_client.ExecuteScriptScene(script_path, &next_scene, &err);
+                    if (loaded) {
+                        script_scene = std::move(next_scene);
+                        std::vector<manifold::Manifold> parts;
+                        parts.reserve(script_scene.size());
+                        for (const vicad::ScriptSceneObject &obj : script_scene) {
+                            parts.push_back(obj.manifold);
+                        }
+                        manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
+                        if (merged.Status() != manifold::Manifold::Error::NoError) {
+                            loaded = false;
+                            err = std::string("Scene merge failed: ") + manifold_error_string(merged.Status());
+                        } else {
+                            next_mesh = merged.GetMeshGL();
+                        }
+                    }
+                } else {
+                    loaded = worker_client.ExecuteScript(script_path, &next_mesh, &err);
+                }
                 if (!loaded && !worker_client.started()) {
                     ipc_start_failed = true;
-                    use_ipc_mode = false;
-                    std::fprintf(stderr, "[vicad] IPC worker startup failed, falling back to legacy mode: %s\n",
-                                 err.c_str());
-                    err.clear();
+                    std::fprintf(stderr, "[vicad] IPC worker startup failed: %s\n", err.c_str());
                 }
             }
 
-            if (!loaded) {
+            if (!loaded && !use_ipc_mode) {
                 loaded = run_script_and_load_mesh(script_path, script_out_path, script_log_path,
                                                   &next_mesh, &next_bmin, &next_bmax, &err);
+                if (loaded) {
+                    script_scene.clear();
+                }
             }
 
             if (loaded) {
@@ -1607,15 +1981,23 @@ int main() {
                     sketch.lastError = compose_err;
                 }
                 object_selected = false;
+                selected_object_index = -1;
+                hovered_object_index = -1;
                 face_select.dirty = true;
                 face_select.hoveredRegion = -1;
                 face_select.selectedRegion = -1;
+                edge_select.dirtyTopology = true;
+                edge_select.dirtySilhouette = true;
+                edge_select.hoveredEdge = -1;
+                edge_select.selectedEdge = -1;
+                edge_select.hoveredChain = -1;
+                edge_select.selectedChain = -1;
                 script_error.clear();
                 std::fprintf(stderr, "[vicad] script loaded: %s (%s)\n", script_path,
                              use_ipc_mode ? "ipc" : "legacy");
             } else {
                 if (ipc_start_failed && err.empty()) {
-                    err = "IPC startup failed and legacy execution also failed.";
+                    err = "IPC startup failed.";
                 }
                 script_error = err;
                 std::fprintf(stderr, "[vicad] script error:\n%s\n", script_error.c_str());
@@ -1640,14 +2022,45 @@ int main() {
                     sketch.lastError.clear();
                     object_selected = false;
                     face_select.hoveredRegion = -1;
-                } else if (key == RGFW_f) {
+                    edge_select.hoveredEdge = -1;
+                    edge_select.hoveredChain = -1;
+                } else if (feature_detection_enabled && key == RGFW_e) {
+                    edge_select.enabled = !edge_select.enabled;
+                    if (edge_select.enabled) {
+                        face_select.enabled = false;
+                        face_select.hoveredRegion = -1;
+                        face_select.selectedRegion = -1;
+                        edge_select.dirtyTopology = true;
+                        edge_select.dirtySilhouette = true;
+                    } else {
+                        edge_select.hoveredEdge = -1;
+                        edge_select.selectedEdge = -1;
+                        edge_select.hoveredChain = -1;
+                        edge_select.selectedChain = -1;
+                    }
+                } else if (feature_detection_enabled && key == RGFW_f) {
                     face_select.enabled = !face_select.enabled;
                     if (face_select.enabled) {
+                        edge_select.enabled = false;
+                        edge_select.hoveredEdge = -1;
+                        edge_select.hoveredChain = -1;
                         face_select.dirty = true;
                     } else {
                         face_select.hoveredRegion = -1;
                         face_select.selectedRegion = -1;
                     }
+                } else if (edge_select.enabled && !sketch.active &&
+                           (key == RGFW_equal || key == RGFW_kpPlus)) {
+                    edge_select.sharpAngleDeg = clampf(edge_select.sharpAngleDeg + 1.0f, 1.0f, 89.0f);
+                    edge_select.dirtyTopology = true;
+                    edge_select.selectedEdge = -1;
+                    edge_select.selectedChain = -1;
+                } else if (edge_select.enabled && !sketch.active &&
+                           (key == RGFW_minus || key == RGFW_kpMinus)) {
+                    edge_select.sharpAngleDeg = clampf(edge_select.sharpAngleDeg - 1.0f, 1.0f, 89.0f);
+                    edge_select.dirtyTopology = true;
+                    edge_select.selectedEdge = -1;
+                    edge_select.selectedChain = -1;
                 } else if (face_select.enabled && !sketch.active &&
                            (key == RGFW_equal || key == RGFW_kpPlus)) {
                     face_select.angleThresholdDeg = clampf(face_select.angleThresholdDeg + 1.0f, 1.0f, 85.0f);
@@ -1695,6 +2108,8 @@ int main() {
                     sketch.closed = false;
                     sketch.hasHover = false;
                     sketch.lastError.clear();
+                } else if (key == RGFW_p) {
+                    pick_debug_overlay = !pick_debug_overlay;
                 } else if (sketch.active && (key == RGFW_equal || key == RGFW_kpPlus)) {
                     sketch.extrudeDepth = clampf(sketch.extrudeDepth + 1.0f, 0.1f, 5000.0f);
                 } else if (sketch.active && (key == RGFW_minus || key == RGFW_kpMinus)) {
@@ -1727,6 +2142,12 @@ int main() {
                             face_select.dirty = true;
                             face_select.hoveredRegion = -1;
                             face_select.selectedRegion = -1;
+                            edge_select.dirtyTopology = true;
+                            edge_select.dirtySilhouette = true;
+                            edge_select.hoveredEdge = -1;
+                            edge_select.selectedEdge = -1;
+                            edge_select.hoveredChain = -1;
+                            edge_select.selectedChain = -1;
                         } else {
                             sketch_features.pop_back();
                             sketch.lastError = compose_err;
@@ -1841,7 +2262,38 @@ int main() {
                     const CameraBasis basis = camera_basis(eye, target);
                     const Vec3 ray_dir =
                         camera_ray_direction(mouse_px_x, mouse_px_y, width, height, fov_degrees, basis);
-                    if (face_select.enabled) {
+                    if (edge_select.enabled) {
+                        if (edge_select.dirtyTopology) {
+                            edge_select.edges = vicad::BuildEdgeTopology(mesh, edge_select.sharpAngleDeg);
+                            edge_select.dirtyTopology = false;
+                            edge_select.dirtySilhouette = true;
+                            if ((size_t)edge_select.selectedEdge >= edge_select.edges.edges.size()) {
+                                edge_select.selectedEdge = -1;
+                                edge_select.selectedChain = -1;
+                            }
+                        }
+                        if (edge_select.dirtySilhouette) {
+                            edge_select.silhouette = vicad::ComputeSilhouetteEdges(
+                                mesh, edge_select.edges, (double)eye.x, (double)eye.y, (double)eye.z);
+                            edge_select.dirtySilhouette = false;
+                        }
+                        const Vec3 diag = sub(mesh_bmax, mesh_bmin);
+                        const double bboxDiag = std::sqrt((double)dot(diag, diag));
+                        const double pickRadius = std::max(1e-4, bboxDiag * 0.012);
+                        const int edge = vicad::PickEdgeByRay(
+                            mesh, edge_select.edges, edge_select.silhouette,
+                            (double)eye.x, (double)eye.y, (double)eye.z,
+                            (double)ray_dir.x, (double)ray_dir.y, (double)ray_dir.z,
+                            pickRadius,
+                            nullptr);
+                        edge_select.selectedEdge = edge;
+                        edge_select.selectedChain = -1;
+                        if (edge >= 0 &&
+                            (size_t)edge < edge_select.edges.edgeFeatureChain.size()) {
+                            edge_select.selectedChain = edge_select.edges.edgeFeatureChain[(size_t)edge];
+                        }
+                        object_selected = edge >= 0;
+                    } else if (face_select.enabled) {
                         if (face_select.dirty) {
                             face_select.faces = vicad::DetectMeshFaces(mesh, face_select.angleThresholdDeg);
                             face_select.dirty = false;
@@ -1854,7 +2306,12 @@ int main() {
                         face_select.selectedRegion = region;
                         object_selected = region >= 0;
                     } else {
-                        object_selected = ray_hits_aabb(eye, ray_dir, mesh_bmin, mesh_bmax);
+                        if (use_multi_scene_mode && !script_scene.empty()) {
+                            selected_object_index = pick_scene_object_by_ray(script_scene, eye, ray_dir);
+                            object_selected = selected_object_index >= 0;
+                        } else {
+                            object_selected = ray_hits_mesh(mesh, eye, ray_dir);
+                        }
                     }
                 }
             }
@@ -1922,7 +2379,38 @@ int main() {
             sketch.hasHover = false;
         }
 
-        if (face_select.enabled && !sketch.active) {
+        if (edge_select.enabled && !sketch.active) {
+            if (edge_select.dirtyTopology) {
+                edge_select.edges = vicad::BuildEdgeTopology(mesh, edge_select.sharpAngleDeg);
+                edge_select.dirtyTopology = false;
+                edge_select.dirtySilhouette = true;
+                if ((size_t)edge_select.selectedEdge >= edge_select.edges.edges.size()) {
+                    edge_select.selectedEdge = -1;
+                    edge_select.selectedChain = -1;
+                }
+            }
+            edge_select.silhouette = vicad::ComputeSilhouetteEdges(
+                mesh, edge_select.edges, (double)eye.x, (double)eye.y, (double)eye.z);
+            edge_select.dirtySilhouette = false;
+            const Vec3 ray_dir =
+                camera_ray_direction(mouse_px_x, mouse_px_y, width, height, fov_degrees, basis);
+            const Vec3 diag = sub(mesh_bmax, mesh_bmin);
+            const double bboxDiag = std::sqrt((double)dot(diag, diag));
+            const double pickRadius = std::max(1e-4, bboxDiag * 0.012);
+            edge_select.hoveredEdge = vicad::PickEdgeByRay(
+                mesh, edge_select.edges, edge_select.silhouette,
+                (double)eye.x, (double)eye.y, (double)eye.z,
+                (double)ray_dir.x, (double)ray_dir.y, (double)ray_dir.z,
+                pickRadius,
+                nullptr);
+            edge_select.hoveredChain = -1;
+            if (edge_select.hoveredEdge >= 0 &&
+                (size_t)edge_select.hoveredEdge < edge_select.edges.edgeFeatureChain.size()) {
+                edge_select.hoveredChain = edge_select.edges.edgeFeatureChain[(size_t)edge_select.hoveredEdge];
+            }
+            face_select.hoveredRegion = -1;
+            object_selected = edge_select.selectedEdge >= 0 || edge_select.hoveredEdge >= 0;
+        } else if (face_select.enabled && !sketch.active) {
             if (face_select.dirty) {
                 face_select.faces = vicad::DetectMeshFaces(mesh, face_select.angleThresholdDeg);
                 face_select.dirty = false;
@@ -1937,19 +2425,59 @@ int main() {
                 (double)eye.x, (double)eye.y, (double)eye.z,
                 (double)ray_dir.x, (double)ray_dir.y, (double)ray_dir.z,
                 nullptr);
+            edge_select.hoveredEdge = -1;
+            edge_select.hoveredChain = -1;
+            hovered_object_index = -1;
         } else {
+            edge_select.hoveredEdge = -1;
+            edge_select.hoveredChain = -1;
             face_select.hoveredRegion = -1;
+            if (use_multi_scene_mode && !script_scene.empty() && !sketch.active) {
+                const Vec3 ray_dir =
+                    camera_ray_direction(mouse_px_x, mouse_px_y, width, height, fov_degrees, basis);
+                hovered_object_index = pick_scene_object_by_ray(script_scene, eye, ray_dir);
+                object_selected = (selected_object_index >= 0 || hovered_object_index >= 0);
+            } else {
+                hovered_object_index = -1;
+            }
         }
 
         Clay_RenderCommandArray ui_cmds = build_clay_ui(
             ui_width, ui_height, script_error.empty(), script_error,
-            mesh.NumTri(), mesh.NumVert(), object_selected, sketch, sketch_features.size(), face_select);
+            mesh.NumTri(), mesh.NumVert(), object_selected,
+            script_scene.size(),
+            selected_object_index, hovered_object_index,
+            selected_object_index >= 0 && (size_t)selected_object_index < script_scene.size()
+                ? script_scene[(size_t)selected_object_index].objectId
+                : 0ull,
+            hovered_object_index >= 0 && (size_t)hovered_object_index < script_scene.size()
+                ? script_scene[(size_t)hovered_object_index].objectId
+                : 0ull,
+            sketch, sketch_features.size(),
+            face_select, edge_select);
 
         draw_grid();
         draw_sketch_plane_grid(sketch);
         draw_mesh(mesh);
-        draw_mesh_edge_strokes(mesh);
-        if (face_select.enabled) {
+        if (feature_detection_enabled && edge_select.enabled) {
+            draw_feature_edges(mesh, edge_select.edges);
+            draw_silhouette_edges(mesh, edge_select.edges, edge_select.silhouette);
+            if (edge_select.hoveredChain >= 0 &&
+                edge_select.hoveredChain != edge_select.selectedChain) {
+                draw_chain_overlay(mesh, edge_select.edges, edge_select.hoveredChain,
+                                   4.0f, 0.38f, 0.73f, 1.0f, 0.96f);
+            } else if (edge_select.hoveredEdge >= 0 &&
+                       edge_select.hoveredEdge != edge_select.selectedEdge) {
+                draw_hovered_edge(mesh, edge_select.edges, edge_select.hoveredEdge);
+            }
+            if (edge_select.selectedChain >= 0) {
+                draw_chain_overlay(mesh, edge_select.edges, edge_select.selectedChain,
+                                   5.2f, 1.0f, 0.90f, 0.16f, 1.0f);
+            } else if (edge_select.selectedEdge >= 0) {
+                draw_selected_edge(mesh, edge_select.edges, edge_select.selectedEdge);
+            }
+        }
+        if (feature_detection_enabled && face_select.enabled) {
             if (face_select.hoveredRegion >= 0 &&
                 face_select.hoveredRegion != face_select.selectedRegion) {
                 draw_face_region_overlay(mesh, face_select.faces, face_select.hoveredRegion,
@@ -1960,7 +2488,25 @@ int main() {
                                          0.22f, 0.52f, 0.98f, 0.32f);
             }
         }
-        if (object_selected && !face_select.enabled) draw_selected_outline(mesh);
+        if (object_selected && !face_select.enabled && !edge_select.enabled) {
+            if (use_multi_scene_mode &&
+                selected_object_index >= 0 &&
+                (size_t)selected_object_index < script_scene.size()) {
+                draw_mesh_selection_overlay(script_scene[(size_t)selected_object_index].mesh,
+                                            0.22f, 0.52f, 0.98f, 0.28f);
+            } else if (use_multi_scene_mode &&
+                       hovered_object_index >= 0 &&
+                       (size_t)hovered_object_index < script_scene.size()) {
+                draw_mesh_selection_overlay(script_scene[(size_t)hovered_object_index].mesh,
+                                            0.34f, 0.66f, 1.00f, 0.16f);
+            } else {
+                draw_mesh_selection_overlay(mesh, 0.22f, 0.52f, 0.98f, 0.28f);
+            }
+        }
+        if (pick_debug_overlay) {
+            draw_pick_debug_overlay(width, height, window_w, window_h,
+                                    mouse_x, mouse_y, mouse_px_x, mouse_px_y);
+        }
         draw_sketch_profile(sketch);
         const int top_right_offset =
             (g_ui.panelData.found ? (int)std::lround(g_ui.panelData.boundingBox.height) : 0) + 8;

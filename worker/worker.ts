@@ -2,8 +2,16 @@ import { dlopen, FFIType, toArrayBuffer } from "bun:ffi";
 import { basename, dirname, resolve } from "node:path";
 import { createConnection } from "node:net";
 
-import { HEADER_OFFSETS, HEADER_SIZE, IPC_ERROR, IPC_MAGIC, IPC_STATE, IPC_VERSION } from "./ipc_protocol";
-import { __vicadBeginRun, __vicadEncodeDefault } from "./proxy-manifold";
+import {
+  HEADER_OFFSETS,
+  HEADER_SIZE,
+  IPC_ERROR,
+  IPC_MAGIC,
+  IPC_STATE,
+  IPC_VERSION,
+  RESPONSE_OFFSETS,
+} from "./ipc_protocol";
+import { __vicadBeginRun, __vicadEncodeDefault, __vicadEncodeScene } from "./proxy-manifold";
 import { enforceScriptSandbox, rewriteManifoldImports } from "./sandbox";
 
 const args = Bun.argv.slice(2);
@@ -89,19 +97,31 @@ function writeErrorResponse(code: number, message: string) {
   setU32(HEADER_OFFSETS.state, IPC_STATE.RESP_ERROR);
 }
 
-function writeSuccessResponse(rootKind: number, rootId: number, opCount: number, records: Uint8Array) {
+function writeSuccessResponseScene(
+  objectCount: number,
+  opCount: number,
+  records: Uint8Array,
+  objectTable: Uint8Array,
+  namesBlob: Uint8Array,
+) {
   const responseOffset = getU32(HEADER_OFFSETS.responseOffset);
   const capacity = getU32(HEADER_OFFSETS.capacityBytes);
-  const headLen = 24;
-  const total = headLen + records.byteLength;
+  const headLen = RESPONSE_OFFSETS.sceneHeaderSize;
+  const total = headLen + records.byteLength + objectTable.byteLength + namesBlob.byteLength;
   if (responseOffset + total > capacity) throw new Error("Success response exceeds shared memory size.");
-  view.setUint32(responseOffset + 0, IPC_VERSION, true);
-  view.setUint32(responseOffset + 4, rootKind >>> 0, true);
-  view.setUint32(responseOffset + 8, rootId >>> 0, true);
-  view.setUint32(responseOffset + 12, opCount >>> 0, true);
-  view.setUint32(responseOffset + 16, records.byteLength >>> 0, true);
-  view.setUint32(responseOffset + 20, 0, true);
-  shared.set(records, responseOffset + headLen);
+  view.setUint32(responseOffset + RESPONSE_OFFSETS.sceneVersion, IPC_VERSION, true);
+  view.setUint32(responseOffset + RESPONSE_OFFSETS.sceneObjectCount, objectCount >>> 0, true);
+  view.setUint32(responseOffset + RESPONSE_OFFSETS.sceneOpCount, opCount >>> 0, true);
+  view.setUint32(responseOffset + RESPONSE_OFFSETS.sceneRecordsSize, records.byteLength >>> 0, true);
+  view.setUint32(responseOffset + RESPONSE_OFFSETS.sceneDiagnosticsLen, namesBlob.byteLength >>> 0, true);
+  view.setUint32(responseOffset + RESPONSE_OFFSETS.sceneObjectTableSize, objectTable.byteLength >>> 0, true);
+
+  let off = responseOffset + headLen;
+  shared.set(records, off);
+  off += records.byteLength;
+  shared.set(objectTable, off);
+  off += objectTable.byteLength;
+  shared.set(namesBlob, off);
   setU32(HEADER_OFFSETS.responseLength, total);
   setU32(HEADER_OFFSETS.errorCode, IPC_ERROR.NONE);
   setU32(HEADER_OFFSETS.state, IPC_STATE.RESP_READY);
@@ -120,6 +140,8 @@ function requestScriptPath() {
 }
 
 async function executeScript(scriptPath: string) {
+  const sceneMode = (Bun.env.VCAD_SCRIPT_SCENE_MODE ?? "multi").toLowerCase();
+  const multiMode = sceneMode === "multi";
   const abs = resolve(scriptPath);
   const src = await Bun.file(abs).text();
   enforceScriptSandbox(src);
@@ -129,7 +151,16 @@ async function executeScript(scriptPath: string) {
   await Bun.write(tempPath, rewritten);
   try {
     const loaded = await import(`file://${tempPath}?t=${Date.now()}`);
-    return __vicadEncodeDefault(loaded.default);
+    if (multiMode) {
+      if (loaded.default !== undefined) {
+        throw new Error("SceneRegistrationError: IPC scene mode requires vicad.addToScene(...); default export is disabled.");
+      }
+      return { kind: "scene" as const, value: __vicadEncodeScene() };
+    }
+    if (loaded.default === undefined) {
+      throw new Error("ScriptFailure: single mode requires a default export.");
+    }
+    return { kind: "single" as const, value: __vicadEncodeDefault(loaded.default) };
   } finally {
     try {
       await Bun.file(tempPath).delete();
@@ -180,7 +211,41 @@ sock.on("data", async (chunk: Buffer) => {
     try {
       const path = requestScriptPath();
       const result = await executeScript(path);
-      writeSuccessResponse(result.rootKind, result.rootId, result.opCount, result.records);
+      if (result.kind === "single") {
+        const singleEntryTable = new Uint8Array(RESPONSE_OFFSETS.objectRecordSize);
+        const singleView = new DataView(singleEntryTable.buffer);
+        singleView.setBigUint64(0, 1n, true);
+        singleView.setUint32(8, result.value.rootKind >>> 0, true);
+        singleView.setUint32(12, result.value.rootId >>> 0, true);
+        singleView.setUint32(16, 0, true);
+        singleView.setUint32(20, 0, true);
+        writeSuccessResponseScene(1, result.value.opCount, result.value.records, singleEntryTable, new Uint8Array(0));
+      } else {
+        const entries = result.value.sceneEntries;
+        const objectTable = new Uint8Array(entries.length * RESPONSE_OFFSETS.objectRecordSize);
+        const tableView = new DataView(objectTable.buffer);
+        const nameBytes: Uint8Array[] = [];
+        let nameTotal = 0;
+        for (let i = 0; i < entries.length; i++) {
+          const e = entries[i];
+          const recOff = i * RESPONSE_OFFSETS.objectRecordSize;
+          const encodedName = new TextEncoder().encode(e.name ?? "");
+          nameBytes.push(encodedName);
+          nameTotal += encodedName.byteLength;
+          tableView.setBigUint64(recOff + 0, BigInt(e.objectIdHash), true);
+          tableView.setUint32(recOff + 8, e.rootKind >>> 0, true);
+          tableView.setUint32(recOff + 12, e.rootId >>> 0, true);
+          tableView.setUint32(recOff + 16, encodedName.byteLength >>> 0, true);
+          tableView.setUint32(recOff + 20, 0, true);
+        }
+        const namesBlob = new Uint8Array(nameTotal);
+        let nOff = 0;
+        for (const nb of nameBytes) {
+          namesBlob.set(nb, nOff);
+          nOff += nb.byteLength;
+        }
+        writeSuccessResponseScene(entries.length, result.value.opCount, result.value.records, objectTable, namesBlob);
+      }
       setU64(HEADER_OFFSETS.responseSeq, seq);
       sock.write(`DONE ${seq}\n`);
     } catch (error) {

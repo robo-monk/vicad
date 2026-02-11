@@ -41,7 +41,7 @@ export function rewriteManifoldImports(src: string, proxyModulePath: string, scr
   );
 
   out =
-    `import { Manifold, CrossSection, GLTFNode, Mesh } from "file://${proxyAbs}";\n` +
+    `import { Manifold, CrossSection, GLTFNode, Mesh, vicad } from "file://${proxyAbs}";\n` +
     `const __vicad_original_dir = ${JSON.stringify(originalDir)};\n` +
     out;
   return out;

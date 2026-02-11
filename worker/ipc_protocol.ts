@@ -1,4 +1,4 @@
-export const IPC_VERSION = 1;
+export const IPC_VERSION = 2;
 export const IPC_MAGIC = "VCADIPC1";
 
 export const HEADER_OFFSETS = {
@@ -64,3 +64,14 @@ export const OP = {
 } as const;
 
 export type OpCode = (typeof OP)[keyof typeof OP];
+
+export const RESPONSE_OFFSETS = {
+  sceneVersion: 0,
+  sceneObjectCount: 4,
+  sceneOpCount: 8,
+  sceneRecordsSize: 12,
+  sceneDiagnosticsLen: 16,
+  sceneObjectTableSize: 20,
+  sceneHeaderSize: 24,
+  objectRecordSize: 24,
+} as const;
