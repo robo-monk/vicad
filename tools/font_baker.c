@@ -6,13 +6,14 @@
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_SYNTHESIS_H
 
 #define FIRST_CHAR 32
 #define LAST_CHAR 126
 #define GLYPH_COUNT (LAST_CHAR - FIRST_CHAR + 1)
 
-#define PACK_ATLAS_W 512
-#define PACK_ATLAS_H 512
+#define PACK_ATLAS_W 1024
+#define PACK_ATLAS_H 1024
 #define PACK_PAD 1
 
 typedef struct {
@@ -88,6 +89,7 @@ int main(int argc, char **argv) {
         }
 
         FT_GlyphSlot slot = face->glyph;
+        FT_GlyphSlot_Embolden(slot);
         const int w = (int)slot->bitmap.width;
         const int h = (int)slot->bitmap.rows;
 

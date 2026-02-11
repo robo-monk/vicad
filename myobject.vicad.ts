@@ -26,7 +26,7 @@ const $2D = CrossSection;
 
 // export default result;
 const circle = $2D.circle(8, 500)
-const square = $2D.rectangle(15, 15)
+const square = $2D.rectangle(15, 15).fillet(20);
 // const tri = $2D.polygon([
 //     [0, 0], [3, 0], [1.5, 2],
 //   ]);
@@ -35,6 +35,9 @@ const square = $2D.rectangle(15, 15)
 
 // vicad.addSketch(circle);
 vicad.addSketch(square);
+vicad.addSketch(circle);
+
+vicad.addToScene(extrude(circle, 0.00000001).intersect(extrude(square, 0.00000001)));
 // vicad.addSketch(tri);
 // vicad.addToScene(extrude(tri, 10));
 

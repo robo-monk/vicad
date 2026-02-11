@@ -36,6 +36,7 @@ static const char *freetype_baker_sources[] = {
     "freetype/src/base/ftinit.c",
     "freetype/src/base/ftbase.c",
     "freetype/src/base/ftbitmap.c",
+    "freetype/src/base/ftsynth.c",
     "freetype/src/base/ftmm.c",
     "freetype/src/base/ftdebug.c",
     "freetype/src/sfnt/sfnt.c",
@@ -213,7 +214,7 @@ static bool bake_funnel_sans_header(const char *baker_bin_path, const char *head
     if (!nob_mkdir_if_not_exists("build/generated")) return false;
 
     Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, baker_bin_path, font_path, header_path, "48");
+    nob_cmd_append(&cmd, baker_bin_path, font_path, header_path, "64");
     return nob_cmd_run(&cmd);
 }
 

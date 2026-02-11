@@ -305,6 +305,18 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         c_nodes[out_id] = in_c.Rotate(deg);
         has_c[out_id] = true;
       } break;
+      case OpCode::CrossFillet: {
+        uint32_t in_id = 0;
+        double radius = 0.0;
+        if (!read_u32(&payload, &in_id) || !read_f64(&payload, &radius)) {
+          *error = "Replay failed: invalid cross fillet payload.";
+          return false;
+        }
+        manifold::CrossSection in_c;
+        if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
+        c_nodes[out_id] = in_c.Offset(radius, manifold::CrossSection::JoinType::Round);
+        has_c[out_id] = true;
+      } break;
       case OpCode::Extrude: {
         uint32_t cs_id = 0;
         double h = 0.0, twist = 0.0;

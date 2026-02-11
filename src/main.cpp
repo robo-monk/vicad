@@ -29,6 +29,9 @@
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+#ifndef GL_MULTISAMPLE
+#define GL_MULTISAMPLE 0x809D
+#endif
 
 #define CLAY_IMPLEMENTATION
 #include "../clay.h"
@@ -117,9 +120,11 @@ struct BakedFontState {
 };
 
 static BakedFontState g_baked_font = {};
-static constexpr float kDimensionLabelScale = 2.0f;
+static constexpr float kDimensionLabelScale = 2.25f;
 static constexpr float kHudBaseScale = 0.75f;
 static constexpr float kHudLegacyScale = 1.5f;
+static constexpr int kRequestedMsaaSamples = 4;
+static constexpr float kTextShadowAlphaScale = 0.42f;
 
 static const VicadBakedGlyph *glyph_for_char(unsigned char ch) {
     if (ch < VICAD_BAKED_FIRST_CHAR || ch > VICAD_BAKED_LAST_CHAR) ch = '?';
@@ -736,6 +741,35 @@ static bool compute_scene_bounds(const std::vector<vicad::ScriptSceneObject> &sc
     return true;
 }
 
+static bool selected_scene_object_bounds(const std::vector<vicad::ScriptSceneObject> &scene,
+                                         int selected_object_index,
+                                         Vec3 *out_min, Vec3 *out_max) {
+    if (selected_object_index < 0) return false;
+    const size_t idx = (size_t)selected_object_index;
+    if (idx >= scene.size()) return false;
+    const vicad::ScriptSceneObject &obj = scene[idx];
+    *out_min = {obj.bmin.x, obj.bmin.y, obj.bmin.z};
+    *out_max = {obj.bmax.x, obj.bmax.y, obj.bmax.z};
+    return true;
+}
+
+static void focus_camera_on_bounds(const Vec3 &bmin, const Vec3 &bmax,
+                                   float fov_degrees,
+                                   float *inout_distance,
+                                   Vec3 *inout_target) {
+    if (!inout_distance || !inout_target) return;
+    const Vec3 center = mul(add(bmin, bmax), 0.5f);
+    const Vec3 diag = sub(bmax, bmin);
+    float radius = 0.5f * std::sqrt(dot(diag, diag));
+    if (radius < 1e-3f) radius = 1e-3f;
+    const float half_fov = (fov_degrees * 3.1415926535f / 180.0f) * 0.5f;
+    float fit_distance = radius / std::tan(half_fov);
+    fit_distance *= 1.35f;
+    fit_distance = clampf(fit_distance, 0.25f, 2000.0f);
+    *inout_target = center;
+    *inout_distance = fit_distance;
+}
+
 static void draw_script_sketch_object(const vicad::ScriptSceneObject &obj,
                                       float line_width,
                                       float r, float g, float b, float a) {
@@ -997,6 +1031,45 @@ static void format_dim(char *buf, size_t cap, const char *prefix, float v) {
     std::snprintf(buf, cap, "%s%.3g", prefix ? prefix : "", (double)v);
 }
 
+static Vec3 project_onto_plane(const Vec3 &v, const Vec3 &plane_normal) {
+    return sub(v, mul(plane_normal, dot(v, plane_normal)));
+}
+
+static void orient_label_axes_for_camera(const Vec3 &eye,
+                                         const CameraBasis &camera,
+                                         const Vec3 &anchor,
+                                         const Vec3 &plane_normal,
+                                         const Vec3 &fallback_right,
+                                         Vec3 *out_right,
+                                         Vec3 *out_up,
+                                         Vec3 *out_facing_normal) {
+    Vec3 facing_normal = normalize(plane_normal);
+    const Vec3 to_eye = normalize(sub(eye, anchor));
+    if (dot(facing_normal, to_eye) < 0.0f) {
+        facing_normal = mul(facing_normal, -1.0f);
+    }
+
+    Vec3 right = project_onto_plane(camera.right, facing_normal);
+    if (dot(right, right) <= 1e-8f) {
+        right = project_onto_plane(fallback_right, facing_normal);
+    }
+    if (dot(right, right) <= 1e-8f) {
+        right = project_onto_plane(camera.up, facing_normal);
+    }
+    if (dot(right, right) <= 1e-8f) {
+        right = {1.0f, 0.0f, 0.0f};
+    }
+    right = normalize(right);
+    Vec3 up = normalize(cross(facing_normal, right));
+    if (dot(up, camera.up) < 0.0f) {
+        right = mul(right, -1.0f);
+        up = mul(up, -1.0f);
+    }
+    if (out_right) *out_right = right;
+    if (out_up) *out_up = up;
+    if (out_facing_normal) *out_facing_normal = facing_normal;
+}
+
 static float text_width_world(const char *text, float world_scale) {
     const float font_px = (float)VICAD_BAKED_PIXEL_SIZE * world_scale;
     return text_width_for_cstr(text, font_px);
@@ -1018,8 +1091,35 @@ static void draw_dimension_label_world(const Vec3 &anchor,
     draw_text_baked_world(origin, axis_right, axis_up, label_world_scale, text, r, g, b, a);
 }
 
+static void draw_dimension_arrowheads_world(const Vec3 &a,
+                                            const Vec3 &b,
+                                            const Vec3 &plane_normal,
+                                            float size) {
+    const Vec3 dim = sub(b, a);
+    const float len2 = dot(dim, dim);
+    if (len2 <= 1e-10f || size <= 0.0f) return;
+    const float len = std::sqrt(len2);
+    Vec3 dir = mul(dim, 1.0f / len);
+    Vec3 side = normalize(cross(plane_normal, dir));
+    if (dot(side, side) <= 1e-8f) {
+        side = normalize(cross({0.0f, 1.0f, 0.0f}, dir));
+    }
+    if (dot(side, side) <= 1e-8f) {
+        side = {1.0f, 0.0f, 0.0f};
+    }
+    const float arrow_len = clampf(size, len * 0.08f, len * 0.30f);
+    const float arrow_half_w = arrow_len * 0.52f;
+    const Vec3 tail_a = add(a, mul(dir, arrow_len));
+    const Vec3 tail_b = add(b, mul(dir, -arrow_len));
+    draw_world_line(a, add(tail_a, mul(side, arrow_half_w)));
+    draw_world_line(a, add(tail_a, mul(side, -arrow_half_w)));
+    draw_world_line(b, add(tail_b, mul(side, arrow_half_w)));
+    draw_world_line(b, add(tail_b, mul(side, -arrow_half_w)));
+}
+
 static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
                                     const Vec3 &eye,
+                                    const CameraBasis &camera,
                                     float alpha) {
     if (contour.points.size() < 2) return;
     std::vector<Vec2> pts2;
@@ -1037,15 +1137,21 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
     const Vec3 centroid3 = vec3_from_2d(centroid, z);
     const Vec3 eye_to_centroid = sub(centroid3, eye);
     const float eye_dist = std::sqrt(dot(eye_to_centroid, eye_to_centroid));
-    float world_scale = eye_dist * 0.00012f;
-    if (world_scale < 0.0025f) world_scale = 0.0025f;
-    if (world_scale > 0.03f) world_scale = 0.03f;
+    const float base_scale = (bdiag > 1e-5f) ? (bdiag * 0.018f) : 0.008f;
+    const float distance_scale = clampf(std::sqrt(std::fmax(eye_dist, 1e-4f)) * 0.035f, 0.70f, 1.25f);
+    float world_scale = base_scale * distance_scale;
+    world_scale = clampf(world_scale, 0.0008f, 0.03f);
     Vec3 text_right = {1.0f, 0.0f, 0.0f};
     Vec3 text_up = {0.0f, 1.0f, 0.0f};
     Vec3 plane_normal = {0.0f, 0.0f, 1.0f};
     contour_plane_axes(contour, &text_right, &text_up, &plane_normal);
-    const Vec3 label_lift = add(mul(text_up, world_scale * 8.0f),
-                                mul(plane_normal, world_scale * 1.5f));
+    Vec3 facing_right = text_right;
+    Vec3 facing_up = text_up;
+    Vec3 facing_normal = plane_normal;
+    orient_label_axes_for_camera(eye, camera, centroid3, plane_normal, text_right,
+                                 &facing_right, &facing_up, &facing_normal);
+    const Vec3 label_lift = add(mul(facing_up, world_scale * 8.0f),
+                                mul(facing_normal, world_scale * 1.5f));
 
     SketchDimShapeKind kind = SketchDimShapeKind::Polygon;
     float rect_w = 0.0f, rect_h = 0.0f;
@@ -1084,13 +1190,17 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const Vec3 a3 = vec3_from_2d(a2, z);
         const Vec3 b3 = vec3_from_2d(b2, z);
         draw_world_line(a3, b3);
+        draw_dimension_arrowheads_world(a3, b3, facing_normal, world_scale * 6.0f);
         const Vec3 mid = mul(add(a3, b3), 0.5f);
         if (kind == SketchDimShapeKind::Point) {
             std::snprintf(text, sizeof(text), "P(%.3g, %.3g)", (double)c_center.x, (double)c_center.y);
         } else {
-            std::snprintf(text, sizeof(text), "D=%.3g  R=%.3g", (double)(c_radius * 2.0f), (double)c_radius);
+            format_dim(text, sizeof(text), "", c_radius * 2.0f);
         }
-        draw_dimension_label_world(add(mid, label_lift), text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+        Vec3 dim_dir = normalize(sub(b3, a3));
+        if (dot(dim_dir, facing_right) < 0.0f) dim_dir = mul(dim_dir, -1.0f);
+        const Vec3 dim_up = normalize(cross(facing_normal, dim_dir));
+        draw_dimension_label_world(add(mid, label_lift), dim_dir, dim_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
         if (kind == SketchDimShapeKind::Point) {
             const float arm = (bdiag > 0.0f ? bdiag : 1.0f) * 0.06f + 0.04f;
             draw_world_line(vec3_from_2d({c_center.x - arm, c_center.y}, z),
@@ -1129,21 +1239,25 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
 
         draw_world_line(w03, w13);
         draw_world_line(h03, h13);
+        draw_dimension_arrowheads_world(w03, w13, facing_normal, world_scale * 6.0f);
+        draw_dimension_arrowheads_world(h03, h13, facing_normal, world_scale * 6.0f);
         draw_world_line(p03, w03);
         draw_world_line(p13, w13);
         draw_world_line(p13, h03);
         draw_world_line(p23, h13);
 
-        format_dim(text, sizeof(text), "W=", rect_w);
+        format_dim(text, sizeof(text), "", rect_w);
+        Vec3 w_dir = normalize(sub(w13, w03));
+        if (dot(w_dir, facing_right) < 0.0f) w_dir = mul(w_dir, -1.0f);
+        const Vec3 w_up = normalize(cross(facing_normal, w_dir));
         draw_dimension_label_world(add(mul(add(w03, w13), 0.5f), label_lift),
-                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
-        if (kind == SketchDimShapeKind::Square) {
-            format_dim(text, sizeof(text), "S=", rect_h);
-        } else {
-            format_dim(text, sizeof(text), "H=", rect_h);
-        }
+                                   w_dir, w_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+        format_dim(text, sizeof(text), "", rect_h);
+        Vec3 h_dir = normalize(sub(h13, h03));
+        if (dot(h_dir, facing_right) < 0.0f) h_dir = mul(h_dir, -1.0f);
+        const Vec3 h_up = normalize(cross(facing_normal, h_dir));
         draw_dimension_label_world(add(mul(add(h03, h13), 0.5f), label_lift),
-                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+                                   h_dir, h_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
         return;
     }
 
@@ -1153,7 +1267,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const float across_flats = 2.0f * rp_radius * std::cos(3.1415926535f / (float)n);
         std::snprintf(text, sizeof(text), "N=%zu  S=%.3g  AF=%.3g", n, (double)rp_side, (double)across_flats);
         draw_dimension_label_world(add(vec3_from_2d(rp_center, z), label_lift),
-                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+                                   facing_right, facing_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
         return;
     }
 
@@ -1167,7 +1281,10 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
             const Vec3 wb = vec3_from_2d(b, z);
             const Vec3 mid = mul(add(wa, wb), 0.5f);
             format_dim(text, sizeof(text), "", e);
-            draw_dimension_label_world(add(mid, label_lift), text_right, text_up, world_scale, text,
+            Vec3 e_dir = normalize(sub(wb, wa));
+            if (dot(e_dir, facing_right) < 0.0f) e_dir = mul(e_dir, -1.0f);
+            const Vec3 e_up = normalize(cross(facing_normal, e_dir));
+            draw_dimension_label_world(add(mid, label_lift), e_dir, e_up, world_scale, text,
                                        1.0f, 1.0f, 1.0f, alpha, true);
         }
     } else {
@@ -1178,13 +1295,14 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const float area = std::fabs(contour_signed_area(pts2));
         std::snprintf(text, sizeof(text), "N=%zu  P=%.3g  A=%.3g", n, (double)perimeter, (double)area);
         draw_dimension_label_world(add(vec3_from_2d(centroid, z), label_lift),
-                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+                                   facing_right, facing_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
     }
 }
 
 static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneObject> &scene,
                                           int selected_object_index,
-                                          const Vec3 &eye) {
+                                          const Vec3 &eye,
+                                          const CameraBasis &camera) {
     glDisable(GL_LIGHTING);
     glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND);
@@ -1214,7 +1332,7 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
                 largest_idx = i;
             }
         }
-        draw_contour_dimensions(obj.sketchContours[largest_idx], eye, alpha);
+        draw_contour_dimensions(obj.sketchContours[largest_idx], eye, camera, alpha);
     }
 
     glLineWidth(1.0f);
@@ -1542,41 +1660,47 @@ static void draw_text_baked_rgba(float x, float y, float font_px, const char *te
 
     const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
     const float line_height = (float)VICAD_BAKED_LINE_HEIGHT * scale;
-    float pen_x = x;
-    float baseline = y + (float)VICAD_BAKED_ASCENDER * scale;
+    const float shadow_px = clampf(font_px * 0.055f, 1.0f, 2.0f);
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, g_baked_font.texture);
-    glColor4f(r, g, b, a);
-    glBegin(GL_QUADS);
-    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
-        if (*p == '\n') {
-            pen_x = x;
-            baseline += line_height;
-            continue;
-        }
+    auto draw_pass = [&](float x_off, float y_off, float cr, float cg, float cb, float ca) {
+        float pen_x = x + x_off;
+        float baseline = y + y_off + (float)VICAD_BAKED_ASCENDER * scale;
+        glColor4f(cr, cg, cb, ca);
+        glBegin(GL_QUADS);
+        for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+            if (*p == '\n') {
+                pen_x = x + x_off;
+                baseline += line_height;
+                continue;
+            }
 
-        const VicadBakedGlyph *glyph = glyph_for_char(*p);
-        if (glyph->w > 0 && glyph->h > 0) {
-            const float x0 = pen_x + (float)glyph->bearing_x * scale;
-            const float y0 = baseline - (float)glyph->bearing_y * scale;
-            const float x1 = x0 + (float)glyph->w * scale;
-            const float y1 = y0 + (float)glyph->h * scale;
-            const float u0 = (float)glyph->x / (float)VICAD_BAKED_ATLAS_WIDTH;
-            const float v0 = (float)glyph->y / (float)VICAD_BAKED_ATLAS_HEIGHT;
-            const float u1 = (float)(glyph->x + glyph->w) / (float)VICAD_BAKED_ATLAS_WIDTH;
-            const float v1 = (float)(glyph->y + glyph->h) / (float)VICAD_BAKED_ATLAS_HEIGHT;
+            const VicadBakedGlyph *glyph = glyph_for_char(*p);
+            if (glyph->w > 0 && glyph->h > 0) {
+                const float x0 = pen_x + (float)glyph->bearing_x * scale;
+                const float y0 = baseline - (float)glyph->bearing_y * scale;
+                const float x1 = x0 + (float)glyph->w * scale;
+                const float y1 = y0 + (float)glyph->h * scale;
+                const float u0 = (float)glyph->x / (float)VICAD_BAKED_ATLAS_WIDTH;
+                const float v0 = (float)glyph->y / (float)VICAD_BAKED_ATLAS_HEIGHT;
+                const float u1 = (float)(glyph->x + glyph->w) / (float)VICAD_BAKED_ATLAS_WIDTH;
+                const float v1 = (float)(glyph->y + glyph->h) / (float)VICAD_BAKED_ATLAS_HEIGHT;
 
-            glTexCoord2f(u0, v0); glVertex2f(x0, y0);
-            glTexCoord2f(u1, v0); glVertex2f(x1, y0);
-            glTexCoord2f(u1, v1); glVertex2f(x1, y1);
-            glTexCoord2f(u0, v1); glVertex2f(x0, y1);
+                glTexCoord2f(u0, v0); glVertex2f(x0, y0);
+                glTexCoord2f(u1, v0); glVertex2f(x1, y0);
+                glTexCoord2f(u1, v1); glVertex2f(x1, y1);
+                glTexCoord2f(u0, v1); glVertex2f(x0, y1);
+            }
+            pen_x += (float)glyph->advance * scale;
         }
-        pen_x += (float)glyph->advance * scale;
-    }
-    glEnd();
+        glEnd();
+    };
+
+    draw_pass(shadow_px, shadow_px, 0.02f, 0.03f, 0.04f, a * kTextShadowAlphaScale);
+    draw_pass(0.0f, 0.0f, r, g, b, a);
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
 }
@@ -1591,47 +1715,54 @@ static void draw_text_baked_world(const Vec3 &origin,
     if (!ensure_baked_font_texture()) return;
 
     const float line_height = (float)VICAD_BAKED_LINE_HEIGHT * world_scale;
-    float pen_x = 0.0f;
-    float baseline = (float)VICAD_BAKED_ASCENDER * world_scale;
     const Vec3 down = mul(axis_up, -1.0f);
+    const float shadow_world = world_scale * 1.35f;
+    const Vec3 shadow_origin = add(origin, add(mul(axis_right, shadow_world), mul(down, shadow_world)));
 
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, g_baked_font.texture);
-    glColor4f(r, g, b, a);
-    glBegin(GL_QUADS);
-    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
-        if (*p == '\n') {
-            pen_x = 0.0f;
-            baseline += line_height;
-            continue;
+    auto draw_pass = [&](const Vec3 &pass_origin, float cr, float cg, float cb, float ca) {
+        float pen_x = 0.0f;
+        float baseline = (float)VICAD_BAKED_ASCENDER * world_scale;
+        glColor4f(cr, cg, cb, ca);
+        glBegin(GL_QUADS);
+        for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+            if (*p == '\n') {
+                pen_x = 0.0f;
+                baseline += line_height;
+                continue;
+            }
+
+            const VicadBakedGlyph *glyph = glyph_for_char(*p);
+            if (glyph->w > 0 && glyph->h > 0) {
+                const float x0 = pen_x + (float)glyph->bearing_x * world_scale;
+                const float y0 = baseline - (float)glyph->bearing_y * world_scale;
+                const float x1 = x0 + (float)glyph->w * world_scale;
+                const float y1 = y0 + (float)glyph->h * world_scale;
+                const float u0 = (float)glyph->x / (float)VICAD_BAKED_ATLAS_WIDTH;
+                const float v0 = (float)glyph->y / (float)VICAD_BAKED_ATLAS_HEIGHT;
+                const float u1 = (float)(glyph->x + glyph->w) / (float)VICAD_BAKED_ATLAS_WIDTH;
+                const float v1 = (float)(glyph->y + glyph->h) / (float)VICAD_BAKED_ATLAS_HEIGHT;
+
+                const Vec3 p00 = add(add(pass_origin, mul(axis_right, x0)), mul(down, y0));
+                const Vec3 p10 = add(add(pass_origin, mul(axis_right, x1)), mul(down, y0));
+                const Vec3 p11 = add(add(pass_origin, mul(axis_right, x1)), mul(down, y1));
+                const Vec3 p01 = add(add(pass_origin, mul(axis_right, x0)), mul(down, y1));
+
+                glTexCoord2f(u0, v0); glVertex3f(p00.x, p00.y, p00.z);
+                glTexCoord2f(u1, v0); glVertex3f(p10.x, p10.y, p10.z);
+                glTexCoord2f(u1, v1); glVertex3f(p11.x, p11.y, p11.z);
+                glTexCoord2f(u0, v1); glVertex3f(p01.x, p01.y, p01.z);
+            }
+            pen_x += (float)glyph->advance * world_scale;
         }
+        glEnd();
+    };
 
-        const VicadBakedGlyph *glyph = glyph_for_char(*p);
-        if (glyph->w > 0 && glyph->h > 0) {
-            const float x0 = pen_x + (float)glyph->bearing_x * world_scale;
-            const float y0 = baseline - (float)glyph->bearing_y * world_scale;
-            const float x1 = x0 + (float)glyph->w * world_scale;
-            const float y1 = y0 + (float)glyph->h * world_scale;
-            const float u0 = (float)glyph->x / (float)VICAD_BAKED_ATLAS_WIDTH;
-            const float v0 = (float)glyph->y / (float)VICAD_BAKED_ATLAS_HEIGHT;
-            const float u1 = (float)(glyph->x + glyph->w) / (float)VICAD_BAKED_ATLAS_WIDTH;
-            const float v1 = (float)(glyph->y + glyph->h) / (float)VICAD_BAKED_ATLAS_HEIGHT;
-
-            const Vec3 p00 = add(add(origin, mul(axis_right, x0)), mul(down, y0));
-            const Vec3 p10 = add(add(origin, mul(axis_right, x1)), mul(down, y0));
-            const Vec3 p11 = add(add(origin, mul(axis_right, x1)), mul(down, y1));
-            const Vec3 p01 = add(add(origin, mul(axis_right, x0)), mul(down, y1));
-
-            glTexCoord2f(u0, v0); glVertex3f(p00.x, p00.y, p00.z);
-            glTexCoord2f(u1, v0); glVertex3f(p10.x, p10.y, p10.z);
-            glTexCoord2f(u1, v1); glVertex3f(p11.x, p11.y, p11.z);
-            glTexCoord2f(u0, v1); glVertex3f(p01.x, p01.y, p01.z);
-        }
-        pen_x += (float)glyph->advance * world_scale;
-    }
-    glEnd();
+    draw_pass(shadow_origin, 0.02f, 0.03f, 0.04f, a * kTextShadowAlphaScale);
+    draw_pass(origin, r, g, b, a);
     glDisable(GL_TEXTURE_2D);
     glDisable(GL_BLEND);
 }
@@ -1732,9 +1863,9 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     const int header_pad = (int)std::lround(8.0f * hud);
     const int body_pad = (int)std::lround(10.0f * hud);
     const int body_gap = (int)std::lround(6.0f * hud);
-    const int title_font = (int)std::lround(16.0f * hud);
-    const int body_font = (int)std::lround(14.0f * hud);
-    const int small_font = (int)std::lround(13.0f * hud);
+    const int title_font = (int)std::lround(17.0f * hud);
+    const int body_font = (int)std::lround(15.0f * hud);
+    const int small_font = (int)std::lround(14.0f * hud);
 
     clay_init(width, height);
     Clay_SetCurrentContext(g_ui.ctx);
@@ -1852,16 +1983,16 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                 }) {
                     CLAY_TEXT(script_ok ? CLAY_STRING("SCRIPT: OK") : CLAY_STRING("SCRIPT: ERROR"),
                               CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = script_ok ? (Clay_Color){130, 230, 130, 255} : (Clay_Color){255, 130, 120, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                    CLAY_TEXT(mesh_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {214, 224, 237, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(mesh_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {230, 238, 248, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(selected_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = selected ? (Clay_Color){255, 230, 70, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(object_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {184, 212, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sketch_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {150, 224, 255, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                    CLAY_TEXT(object_pick_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {180, 205, 240, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(object_pick_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {198, 218, 246, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(sel_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {170, 210, 255, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     CLAY_TEXT(edge_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = edge_select.enabled ? (Clay_Color){138, 196, 255, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     if (edge_select.enabled) {
-                        CLAY_TEXT(edge_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                        CLAY_TEXT(edge_hover_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(edge_count_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(edge_hover_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                         CLAY_TEXT(CLAY_STRING("LCLICK PICK EDGE"),
                                   CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {205, 214, 230, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                         CLAY_TEXT(CLAY_STRING("+/- ADJUST SHARP ANGLE"),
@@ -1869,9 +2000,9 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                     }
                     CLAY_TEXT(face_mode_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = face_select.enabled ? (Clay_Color){138, 196, 255, 255} : (Clay_Color){190, 200, 212, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     if (face_select.enabled) {
-                        CLAY_TEXT(face_region_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                        CLAY_TEXT(face_hover_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                        CLAY_TEXT(face_type_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {196, 209, 226, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(face_region_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(face_hover_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(face_type_line_s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                         CLAY_TEXT(CLAY_STRING("LCLICK PICK DETECTED FACE"),
                                   CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {205, 214, 230, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                         CLAY_TEXT(CLAY_STRING("+/- ADJUST FACE ANGLE"),
@@ -1895,6 +2026,10 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
 }
 
 int main() {
+    static RGFW_glHints gl_hints = RGFW_DEFAULT_GL_HINTS;
+    gl_hints.samples = kRequestedMsaaSamples;
+    RGFW_setGlobalHints_OpenGL(&gl_hints);
+
     const bool feature_detection_enabled = false;
     manifold::Manifold fallback = manifold::Manifold::Cube(manifold::vec3(1.0), true);
     manifold::MeshGL base_mesh = fallback.GetMeshGL();
@@ -1922,6 +2057,7 @@ int main() {
 
     RGFW_window_setExitKey(win, RGFW_escape);
     RGFW_window_makeCurrentContext_OpenGL(win);
+    glEnable(GL_MULTISAMPLE);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
@@ -2126,7 +2262,9 @@ int main() {
                         edge_select.hoveredChain = -1;
                         edge_select.selectedChain = -1;
                     }
-                } else if (feature_detection_enabled && key == RGFW_f) {
+                } else if (feature_detection_enabled && key == RGFW_f &&
+                           (RGFW_window_isKeyDown(win, RGFW_shiftL) ||
+                            RGFW_window_isKeyDown(win, RGFW_shiftR))) {
                     face_select.enabled = !face_select.enabled;
                     if (face_select.enabled) {
                         edge_select.enabled = false;
@@ -2159,6 +2297,14 @@ int main() {
                     face_select.angleThresholdDeg = clampf(face_select.angleThresholdDeg - 1.0f, 1.0f, 85.0f);
                     face_select.dirty = true;
                     face_select.selectedRegion = -1;
+                } else if (key == RGFW_f) {
+                    Vec3 obmin = {0.0f, 0.0f, 0.0f};
+                    Vec3 obmax = {0.0f, 0.0f, 0.0f};
+                    if (selected_scene_object_bounds(script_scene, selected_object_index, &obmin, &obmax)) {
+                        focus_camera_on_bounds(obmin, obmax, fov_degrees, &distance, &target);
+                    } else if (object_selected) {
+                        focus_camera_on_bounds(mesh_bmin, mesh_bmax, fov_degrees, &distance, &target);
+                    }
                 } else if (key == RGFW_p) {
                     pick_debug_overlay = !pick_debug_overlay;
                 }
@@ -2189,8 +2335,8 @@ int main() {
                                         (alt_down && RGFW_window_isMouseDown(win, RGFW_mouseLeft));
 
                 if (orbit_down && !shift_down) {
-                    yaw_deg += (float)dx * 0.35f;
-                    pitch_deg -= (float)dy * 0.35f;
+                    yaw_deg -= (float)dx * 0.35f;
+                    pitch_deg += (float)dy * 0.35f;
                     pitch_deg = clampf(pitch_deg, -89.0f, 89.0f);
                 } else if (RGFW_window_isMouseDown(win, RGFW_mouseMiddle) && shift_down) {
                     const Vec3 eye = camera_position(target, yaw_deg, pitch_deg, distance);
@@ -2465,7 +2611,7 @@ int main() {
                 draw_mesh_selection_overlay(mesh, 0.22f, 0.52f, 0.98f, 0.28f);
             }
         }
-        draw_script_sketch_dimensions(script_scene, selected_object_index, eye);
+        draw_script_sketch_dimensions(script_scene, selected_object_index, eye, basis);
         if (pick_debug_overlay) {
             draw_pick_debug_overlay(width, height, window_w, window_h,
                                     mouse_x, mouse_y, mouse_px_x, mouse_px_y);

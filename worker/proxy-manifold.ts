@@ -335,6 +335,20 @@ export class CrossSection {
     return new CrossSection(out);
   }
 
+  fillet(radius: number) {
+    const r = Number(radius);
+    if (!Number.isFinite(r) || r < 0) {
+      throw new Error("CrossSection.fillet requires a finite radius >= 0.");
+    }
+    const out = reg.allocNodeId();
+    reg.push(OP.CROSS_FILLET, makePayload([
+      { t: "u32", v: out },
+      { t: "u32", v: this.nodeId },
+      { t: "f64", v: r },
+    ]));
+    return new CrossSection(out);
+  }
+
   scale(): never {
     return unsupported("CrossSection.scale");
   }
