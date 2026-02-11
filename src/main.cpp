@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <array>
+#include <cstdint>
+#include <ctime>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -21,6 +23,8 @@
 #include "script_worker_client.h"
 #include "manifold/manifold.h"
 #include "manifold/cross_section.h"
+#include "manifold/meshIO.h"
+#include "lod_policy.h"
 
 #if defined(__APPLE__)
 #include <OpenGL/gl.h>
@@ -94,6 +98,8 @@ struct ClayUiState {
     Clay_ElementData panelData;
     Clay_ElementData headerData;
     Clay_ElementData infoPanelData;
+    Clay_ElementData exportPanelData;
+    Clay_ElementData exportButtonData;
     std::array<std::string, 128> textSlots;
 };
 
@@ -2021,6 +2027,68 @@ static const char *manifold_error_string(manifold::Manifold::Error error) {
     }
 }
 
+static bool export_mesh_to_3mf_native(const char *out_path, const manifold::MeshGL &mesh, std::string *error) {
+    if (!out_path || out_path[0] == '\0') {
+        if (error) *error = "Output path is empty.";
+        return false;
+    }
+    if (mesh.numProp < 3 || mesh.vertProperties.empty() || mesh.triVerts.empty()) {
+        if (error) *error = "Mesh is empty; nothing to export.";
+        return false;
+    }
+    try {
+        manifold::ExportMesh(out_path, mesh, manifold::ExportOptions{});
+    } catch (const std::exception &e) {
+        if (error) *error = std::string("3MF export failed: ") + e.what();
+        return false;
+    } catch (...) {
+        if (error) *error = "3MF export failed with unknown exception.";
+        return false;
+    }
+    return true;
+}
+
+static std::string make_export_3mf_filename(void) {
+    std::time_t now = std::time(nullptr);
+    std::tm tmv = {};
+#if defined(_WIN32)
+    localtime_s(&tmv, &now);
+#else
+    localtime_r(&now, &tmv);
+#endif
+    char buf[128];
+    std::snprintf(buf, sizeof(buf),
+                  "vicad-export-%04d%02d%02d-%02d%02d%02d.3mf",
+                  tmv.tm_year + 1900,
+                  tmv.tm_mon + 1,
+                  tmv.tm_mday,
+                  tmv.tm_hour,
+                  tmv.tm_min,
+                  tmv.tm_sec);
+    return std::string(buf);
+}
+
+static bool export_script_scene_3mf(vicad::ScriptWorkerClient *worker_client,
+                                    const char *script_path,
+                                    const char *out_path,
+                                    std::string *error) {
+    if (!worker_client) {
+        if (error) *error = "Invalid worker client.";
+        return false;
+    }
+    if (!script_path || script_path[0] == '\0') {
+        if (error) *error = "Script path is empty.";
+        return false;
+    }
+    manifold::MeshGL export_mesh;
+    vicad::ReplayLodPolicy lod_policy = {};
+    lod_policy.profile = vicad::LodProfile::Export3MF;
+    if (!worker_client->ExecuteScript(script_path, &export_mesh, error, lod_policy)) {
+        return false;
+    }
+    return export_mesh_to_3mf_native(out_path, export_mesh, error);
+}
+
 static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_ok,
                                              const std::string &script_error,
                                              size_t tri_count, size_t vert_count,
@@ -2035,7 +2103,9 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                                              const vicad::ScriptSceneObject *info_object,
                                              float hud_scale,
                                              const FaceSelectState &face_select,
-                                             const EdgeSelectState &edge_select) {
+                                             const EdgeSelectState &edge_select,
+                                             const std::string &export_status_line,
+                                             bool export_status_ok) {
     const float hud = clampf(hud_scale, 0.75f, 3.0f);
     const int root_pad = (int)std::lround(16.0f * hud);
     int panel_w = (int)std::lround(320.0f * hud);
@@ -2130,6 +2200,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     Clay_String face_type_line_s = ui_text_slot(slot++, face_type_line);
     Clay_String dims_toggle_line_s = ui_text_slot(slot++, dims_toggle_line);
     Clay_String err_line_s = ui_text_slot(slot++, one_line_error);
+    Clay_String export_status_line_s = ui_text_slot(slot++, export_status_line);
 
     std::vector<std::string> info_lines;
     info_lines.reserve(24);
@@ -2284,12 +2355,61 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                 }
             }
         }
+
+        CLAY(CLAY_ID("ExportPanel"), {
+            .layout = {
+                .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                .sizing = {.width = CLAY_SIZING_FIXED((float)panel_w), .height = CLAY_SIZING_FIT(0)},
+            },
+            .backgroundColor = {20, 25, 33, 235},
+            .border = {.color = {90, 100, 118, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY(CLAY_ID("ExportHeader"), {
+                .layout = {
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                    .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad * 3 / 4), (uint16_t)(header_pad * 3 / 4)},
+                    .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
+                },
+                .backgroundColor = {36, 44, 54, 250},
+            }) {
+                CLAY_TEXT(CLAY_STRING("EXPORT"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)title_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+            }
+            CLAY(CLAY_ID_LOCAL("ExportBody"), {
+                .layout = {
+                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIT(0)},
+                    .padding = CLAY_PADDING_ALL((uint16_t)body_pad),
+                    .childGap = (uint16_t)body_gap,
+                }
+            }) {
+                CLAY(CLAY_ID("Export3mfButton"), {
+                    .layout = {
+                        .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                        .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                        .padding = CLAY_PADDING_ALL((uint16_t)header_pad),
+                        .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+                    },
+                    .backgroundColor = {52, 84, 132, 255},
+                    .border = {.color = {120, 158, 214, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+                }) {
+                    CLAY_TEXT(CLAY_STRING("Export .3mf"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                }
+                CLAY_TEXT(export_status_line_s,
+                          CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font,
+                                            .textColor = export_status_ok ? (Clay_Color){130, 230, 130, 255}
+                                                                          : (Clay_Color){255, 168, 140, 255},
+                                            .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+            }
+        }
     }
 
     Clay_RenderCommandArray cmds = Clay_EndLayout();
     g_ui.panelData = Clay_GetElementData(CLAY_ID("StatusPanel"));
     g_ui.headerData = Clay_GetElementData(CLAY_ID("StatusHeader"));
     g_ui.infoPanelData = Clay_GetElementData(CLAY_ID("InfoPanel"));
+    g_ui.exportPanelData = Clay_GetElementData(CLAY_ID("ExportPanel"));
+    g_ui.exportButtonData = Clay_GetElementData(CLAY_ID("Export3mfButton"));
     return cmds;
 }
 
@@ -2415,6 +2535,8 @@ int main() {
     i32 last_mouse_y = 0;
     bool have_last_mouse = false;
     bool pick_debug_overlay = true;
+    std::string export_status_line = "Ready (uses Export3MF LOD profile)";
+    bool export_status_ok = true;
 
     while (!RGFW_window_shouldClose(win)) {
         const long long mt = file_mtime_ns(script_path);
@@ -2427,7 +2549,10 @@ int main() {
 
             bool loaded = false;
             std::vector<vicad::ScriptSceneObject> next_scene;
-            loaded = worker_client.ExecuteScriptScene(script_path, &next_scene, &err);
+            vicad::ReplayLodPolicy lod_policy = {};
+            lod_policy.profile = vicad::LodProfile::Model;
+            loaded = worker_client.ExecuteScriptScene(script_path, &next_scene,
+                                                      &err, lod_policy);
             if (loaded) {
                 script_scene = std::move(next_scene);
                 std::vector<manifold::Manifold> parts;
@@ -2642,6 +2767,23 @@ int main() {
                         g_ui.panelCollapsed = !g_ui.panelCollapsed;
                         continue;
                     }
+                    if (g_ui.exportButtonData.found &&
+                        point_in_rect(mouse_ui_x, mouse_ui_y,
+                                      (int)g_ui.exportButtonData.boundingBox.x, (int)g_ui.exportButtonData.boundingBox.y,
+                                      (int)g_ui.exportButtonData.boundingBox.width, (int)g_ui.exportButtonData.boundingBox.height)) {
+                        const std::string out_name = make_export_3mf_filename();
+                        std::string export_error;
+                        if (export_script_scene_3mf(&worker_client, script_path, out_name.c_str(), &export_error)) {
+                            export_status_ok = true;
+                            export_status_line = std::string("Saved: ") + out_name;
+                            std::fprintf(stderr, "[vicad] exported 3mf: %s\n", out_name.c_str());
+                        } else {
+                            export_status_ok = false;
+                            export_status_line = export_error.empty() ? "Export failed." : export_error;
+                            std::fprintf(stderr, "[vicad] export error: %s\n", export_status_line.c_str());
+                        }
+                        continue;
+                    }
                     if (g_ui.panelData.found &&
                         point_in_rect(mouse_ui_x, mouse_ui_y,
                                       (int)g_ui.panelData.boundingBox.x, (int)g_ui.panelData.boundingBox.y,
@@ -2653,6 +2795,12 @@ int main() {
                         point_in_rect(mouse_ui_x, mouse_ui_y,
                                       (int)g_ui.infoPanelData.boundingBox.x, (int)g_ui.infoPanelData.boundingBox.y,
                                       (int)g_ui.infoPanelData.boundingBox.width, (int)g_ui.infoPanelData.boundingBox.height)) {
+                        continue;
+                    }
+                    if (g_ui.exportPanelData.found &&
+                        point_in_rect(mouse_ui_x, mouse_ui_y,
+                                      (int)g_ui.exportPanelData.boundingBox.x, (int)g_ui.exportPanelData.boundingBox.y,
+                                      (int)g_ui.exportPanelData.boundingBox.width, (int)g_ui.exportPanelData.boundingBox.height)) {
                         continue;
                     }
 
@@ -2844,7 +2992,8 @@ int main() {
             show_sketch_dimensions,
             info_object,
             hud_scale,
-            face_select, edge_select);
+            face_select, edge_select,
+            export_status_line, export_status_ok);
 
         draw_grid();
         draw_mesh(mesh);
@@ -2912,7 +3061,12 @@ int main() {
         const int info_bottom = g_ui.infoPanelData.found
             ? (int)std::lround(g_ui.infoPanelData.boundingBox.y + g_ui.infoPanelData.boundingBox.height)
             : 0;
-        const int top_right_offset = (status_bottom > info_bottom ? status_bottom : info_bottom) + 8;
+        const int export_bottom = g_ui.exportPanelData.found
+            ? (int)std::lround(g_ui.exportPanelData.boundingBox.y + g_ui.exportPanelData.boundingBox.height)
+            : 0;
+        int top_right_offset = status_bottom > info_bottom ? status_bottom : info_bottom;
+        if (export_bottom > top_right_offset) top_right_offset = export_bottom;
+        top_right_offset += 8;
         draw_orientation_cube(basis, width, height, top_right_offset, hud_scale);
         clay_render_commands(ui_cmds, width, height, ui_scale);
 

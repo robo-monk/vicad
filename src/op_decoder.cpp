@@ -74,6 +74,26 @@ bool check_status(const manifold::Manifold &m, const char *ctx, std::string *err
   return false;
 }
 
+double revolve_effective_radius(const manifold::Polygons &cross_section) {
+  double radius = 0.0;
+  for (const manifold::SimplePolygon &poly : cross_section) {
+    size_t i = 0;
+    while (i < poly.size() && poly[i].x < 0.0) {
+      ++i;
+    }
+    if (i == poly.size()) continue;
+    const size_t start = i;
+    do {
+      if (poly[i].x >= 0.0) {
+        radius = std::max(radius, poly[i].x);
+      }
+      const size_t next = i + 1 == poly.size() ? 0 : i + 1;
+      i = next;
+    } while (i != start);
+  }
+  return radius;
+}
+
 const char *op_name(uint16_t opcode) {
   switch ((OpCode)opcode) {
     case OpCode::Sphere: return "Sphere";
@@ -383,6 +403,7 @@ void collect_trace_postorder(const ReplayTables &tables,
 }  // namespace
 
 bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_count,
+                       const ReplayLodPolicy &lod_policy,
                        ReplayTables *tables, std::string *error) {
   tables->manifold_nodes.clear();
   tables->has_manifold.clear();
@@ -432,6 +453,9 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
           *error = "Replay failed: invalid sphere payload.";
           return false;
         }
+        if (seg <= 2) {
+          seg = (uint32_t)AutoCircularSegments(radius, lod_policy.profile);
+        }
         manifold::Manifold m = manifold::Manifold::Sphere(radius, (int)seg);
         if (!check_status(m, "sphere", error)) return false;
         m_nodes[out_id] = std::move(m);
@@ -461,6 +485,10 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
             !read_u32(&payload, &seg) || !read_u32(&payload, &center)) {
           *error = "Replay failed: invalid cylinder payload.";
           return false;
+        }
+        if (seg <= 2) {
+          const double radius = std::max(std::abs(r1), std::abs(r2));
+          seg = (uint32_t)AutoCircularSegments(radius, lod_policy.profile);
         }
         manifold::Manifold m = manifold::Manifold::Cylinder(h, r1, r2, (int)seg, center != 0);
         if (!check_status(m, "cylinder", error)) return false;
@@ -546,6 +574,9 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
           *error = "Replay failed: invalid cross circle payload.";
           return false;
         }
+        if (seg <= 2) {
+          seg = (uint32_t)AutoCircularSegments(radius, lod_policy.profile);
+        }
         c_nodes[out_id] = manifold::CrossSection::Circle(radius, (int)seg);
         has_c[out_id] = true;
         sem.params_f64 = {radius};
@@ -582,6 +613,9 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
             !read_u32(&payload, &seg)) {
           *error = "Replay failed: invalid cross point payload.";
           return false;
+        }
+        if (seg <= 2) {
+          seg = (uint32_t)AutoCircularSegments(radius, lod_policy.profile);
         }
         c_nodes[out_id] =
             manifold::CrossSection::Circle(radius, (int)seg).Translate(manifold::vec2(x, y));
@@ -670,7 +704,11 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
             *error = "Replay failed: fillet radius is too large for this cross-section.";
             return false;
           }
-          manifold::CrossSection rounded = inset.Offset(radius, manifold::CrossSection::JoinType::Round);
+          const int fillet_segments =
+              AutoCircularSegments(std::abs(radius), lod_policy.profile);
+          manifold::CrossSection rounded =
+              inset.Offset(radius, manifold::CrossSection::JoinType::Round,
+                           2.0, fillet_segments);
           if (rounded.IsEmpty()) {
             *error = "Replay failed: fillet operation produced an empty cross-section.";
             return false;
@@ -728,7 +766,13 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         }
         manifold::CrossSection cs;
         if (!need_c(c_nodes, has_c, cs_id, &cs, error)) return false;
-        manifold::Manifold m = manifold::Manifold::Revolve(cs.ToPolygons(), (int)seg, deg);
+        const manifold::Polygons polys = cs.ToPolygons();
+        if (seg <= 2) {
+          const double radius = revolve_effective_radius(polys);
+          seg = (uint32_t)AutoCircularSegmentsForRevolve(
+              radius, deg, lod_policy.profile);
+        }
+        manifold::Manifold m = manifold::Manifold::Revolve(polys, (int)seg, deg);
         if (!check_status(m, "revolve", error)) return false;
         m_nodes[out_id] = std::move(m);
         has_m[out_id] = true;
@@ -773,6 +817,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
 }
 
 bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                           const ReplayLodPolicy &lod_policy,
                            manifold::Manifold *out, std::string *error) {
   if (root_kind != (uint32_t)NodeKind::Manifold) {
     *error = "Replay failed: root node is not a manifold.";
@@ -784,7 +829,9 @@ bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint3
   }
   manifold::Manifold m = tables.manifold_nodes[root_id];
   if (!check_status(m, "final", error)) return false;
-  *out = std::move(m);
+  manifold::Manifold post = ApplyReplayPostprocess(m, lod_policy.postprocess);
+  if (!check_status(post, "postprocess", error)) return false;
+  *out = std::move(post);
   return true;
 }
 
@@ -916,9 +963,15 @@ bool BuildOperationTraceForRoot(const ReplayTables &tables, uint32_t root_kind, 
 
 bool ReplayOpsToMesh(const ReplayInput &in, manifold::MeshGL *mesh, std::string *error) {
   ReplayTables tables;
-  if (!ReplayOpsToTables(in.records, in.records_size, in.op_count, &tables, error)) return false;
+  if (!ReplayOpsToTables(in.records, in.records_size, in.op_count,
+                         in.lod_policy, &tables, error)) {
+    return false;
+  }
   manifold::Manifold out;
-  if (!ResolveReplayManifold(tables, in.root_kind, in.root_id, &out, error)) return false;
+  if (!ResolveReplayManifold(tables, in.root_kind, in.root_id,
+                             in.lod_policy, &out, error)) {
+    return false;
+  }
   *mesh = out.GetMeshGL();
   return true;
 }

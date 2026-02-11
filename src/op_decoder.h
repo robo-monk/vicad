@@ -8,6 +8,7 @@
 
 #include "manifold/manifold.h"
 #include "manifold/cross_section.h"
+#include "lod_policy.h"
 #include "sketch_dimensions.h"
 
 namespace vicad {
@@ -32,8 +33,10 @@ struct ReplayTables {
 };
 
 bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_count,
+                       const ReplayLodPolicy &lod_policy,
                        ReplayTables *tables, std::string *error);
 bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                           const ReplayLodPolicy &lod_policy,
                            manifold::Manifold *out, std::string *error);
 bool ResolveReplayCrossSection(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
                                manifold::CrossSection *out, std::string *error);
@@ -48,6 +51,8 @@ struct ReplayInput {
   uint32_t op_count;
   uint32_t root_kind;
   uint32_t root_id;
+  // Allows per-call modelling/export profile selection and future postprocess.
+  ReplayLodPolicy lod_policy = {};
 };
 bool ReplayOpsToMesh(const ReplayInput &in, manifold::MeshGL *mesh, std::string *error);
 

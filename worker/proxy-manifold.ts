@@ -207,6 +207,7 @@ export class CrossSection {
     this.nodeId = nodeId;
   }
 
+  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
   static circle(radius = 1, circularSegments = 0) {
     const out = reg.allocNodeId();
     reg.push(OP.CROSS_CIRCLE, makePayload([
@@ -255,6 +256,8 @@ export class CrossSection {
     return new CrossSection(out);
   }
 
+  // Explicit segment arguments are legacy compatibility; profile-driven auto LOD
+  // is used when the encoded value is <= 2.
   static point(positionOrX: number | Vec2Like = [0, 0], yOrRadius?: number, radiusOrSegments = 0.1, circularSegments = 12) {
     let x = 0;
     let y = 0;
@@ -374,6 +377,7 @@ export class Manifold {
     this.nodeId = nodeId;
   }
 
+  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
   static sphere(radius = 1, circularSegments = 0) {
     const out = reg.allocNodeId();
     reg.push(OP.SPHERE, makePayload([
@@ -397,6 +401,7 @@ export class Manifold {
     return new Manifold(out);
   }
 
+  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
   static cylinder(height: number, radiusLow: number, radiusHigh = -1, circularSegments = 0, center = false) {
     const out = reg.allocNodeId();
     reg.push(OP.CYLINDER, makePayload([
@@ -431,6 +436,7 @@ export class Manifold {
     return new Manifold(out);
   }
 
+  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
   static revolve(crossSection: CrossSection, circularSegments = 0, revolveDegrees = 360) {
     const out = reg.allocNodeId();
     reg.push(OP.REVOLVE, makePayload([

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { OP } from "./ipc_protocol";
-import { __vicadBeginRun, __vicadEncodeScene, CrossSection, vicad } from "./proxy-manifold";
+import { __vicadBeginRun, __vicadEncodeScene, CrossSection, Manifold, vicad } from "./proxy-manifold";
 
 type DecodedOp = {
   opcode: number;
@@ -106,5 +106,64 @@ describe("CrossSection.offsetClone", () => {
     const square = CrossSection.square(5);
     expect(() => square.offsetClone(Number.NaN)).toThrow("CrossSection.offsetClone requires a finite delta.");
     expect(() => square.offsetClone(Number.NEGATIVE_INFINITY)).toThrow("CrossSection.offsetClone requires a finite delta.");
+  });
+});
+
+describe("Legacy circular segment overrides", () => {
+  it("keeps explicit sphere segment override", () => {
+    __vicadBeginRun();
+    const sphere = Manifold.sphere(10, 48);
+    vicad.addToScene(sphere, { name: "sphere-explicit" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(1);
+    expect(ops[0].opcode).toBe(OP.SPHERE);
+
+    const view = new DataView(ops[0].payload.buffer, ops[0].payload.byteOffset, ops[0].payload.byteLength);
+    expect(view.getUint32(12, true)).toBe(48);
+  });
+
+  it("encodes sphere auto mode when no explicit segments are passed", () => {
+    __vicadBeginRun();
+    const sphere = Manifold.sphere(10);
+    vicad.addToScene(sphere, { name: "sphere-auto" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(1);
+    expect(ops[0].opcode).toBe(OP.SPHERE);
+
+    const view = new DataView(ops[0].payload.buffer, ops[0].payload.byteOffset, ops[0].payload.byteLength);
+    expect(view.getUint32(12, true)).toBe(0);
+  });
+
+  it("keeps explicit cylinder segment override", () => {
+    __vicadBeginRun();
+    const cyl = Manifold.cylinder(20, 5, -1, 36, false);
+    vicad.addToScene(cyl, { name: "cylinder-explicit" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(1);
+    expect(ops[0].opcode).toBe(OP.CYLINDER);
+
+    const view = new DataView(ops[0].payload.buffer, ops[0].payload.byteOffset, ops[0].payload.byteLength);
+    expect(view.getUint32(28, true)).toBe(36);
+  });
+
+  it("keeps explicit revolve segment override", () => {
+    __vicadBeginRun();
+    const profile = CrossSection.circle(5, 0);
+    const rev = Manifold.revolve(profile, 22, 360);
+    vicad.addToScene(rev, { name: "revolve-explicit" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(2);
+    expect(ops[1].opcode).toBe(OP.REVOLVE);
+
+    const view = new DataView(ops[1].payload.buffer, ops[1].payload.byteOffset, ops[1].payload.byteLength);
+    expect(view.getUint32(8, true)).toBe(22);
   });
 });

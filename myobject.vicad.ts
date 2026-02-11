@@ -115,3 +115,4 @@ for (const tri of triangles) {
 
 
 vicad.addToScene(beam);
+vicad.addToScene(Manifold.sphere(10));

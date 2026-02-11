@@ -269,9 +269,11 @@ bool ScriptWorkerClient::ReadLineWithTimeout(int timeout_ms, std::string *out, s
   }
 }
 
-bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL *mesh, std::string *error) {
+bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL *mesh,
+                                       std::string *error,
+                                       const ReplayLodPolicy &lod_policy) {
   std::vector<ScriptSceneObject> scene_objects;
-  if (!ExecuteScriptScene(script_path, &scene_objects, error)) return false;
+  if (!ExecuteScriptScene(script_path, &scene_objects, error, lod_policy)) return false;
   std::vector<manifold::Manifold> parts;
   parts.reserve(scene_objects.size());
   for (const ScriptSceneObject &obj : scene_objects) {
@@ -290,8 +292,10 @@ bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL
   return true;
 }
 
-bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector<ScriptSceneObject> *objects,
-                                            std::string *error) {
+bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
+                                            std::vector<ScriptSceneObject> *objects,
+                                            std::string *error,
+                                            const ReplayLodPolicy &lod_policy) {
   if (!Start(error)) return false;
   if (!script_path || !objects) return set_err(error, "Invalid execute arguments.");
   objects->clear();
@@ -367,7 +371,10 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector
   }
 
   ReplayTables tables;
-  if (!ReplayOpsToTables(records_ptr, ok.records_size, ok.op_count, &tables, error)) return false;
+  if (!ReplayOpsToTables(records_ptr, ok.records_size, ok.op_count,
+                         lod_policy, &tables, error)) {
+    return false;
+  }
 
   size_t name_off = 0;
   objects->reserve(ok.object_count);
@@ -391,7 +398,10 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector
 
     if (rec.root_kind == (uint32_t)NodeKind::Manifold) {
       manifold::Manifold m;
-      if (!ResolveReplayManifold(tables, rec.root_kind, rec.root_id, &m, error)) return false;
+      if (!ResolveReplayManifold(tables, rec.root_kind, rec.root_id,
+                                 lod_policy, &m, error)) {
+        return false;
+      }
       obj.kind = ScriptSceneObjectKind::Manifold;
       obj.manifold = std::move(m);
       obj.mesh = obj.manifold.GetMeshGL();

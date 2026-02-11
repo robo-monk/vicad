@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "manifold/manifold.h"
+#include "lod_policy.h"
 #include "sketch_dimensions.h"
 
 namespace vicad {
@@ -50,8 +51,14 @@ class ScriptWorkerClient {
   ScriptWorkerClient(const ScriptWorkerClient &) = delete;
   ScriptWorkerClient &operator=(const ScriptWorkerClient &) = delete;
 
-  bool ExecuteScript(const char *script_path, manifold::MeshGL *mesh, std::string *error);
-  bool ExecuteScriptScene(const char *script_path, std::vector<ScriptSceneObject> *objects, std::string *error);
+  // Replays scene operations to geometry using the provided LOD policy.
+  bool ExecuteScript(const char *script_path, manifold::MeshGL *mesh,
+                     std::string *error,
+                     const ReplayLodPolicy &lod_policy = {});
+  bool ExecuteScriptScene(const char *script_path,
+                          std::vector<ScriptSceneObject> *objects,
+                          std::string *error,
+                          const ReplayLodPolicy &lod_policy = {});
   bool started() const { return started_; }
   void Shutdown();
 
