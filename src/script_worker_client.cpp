@@ -60,6 +60,35 @@ bool compute_bounds(const manifold::MeshGL &mesh, SceneVec3 *out_min, SceneVec3 
   return true;
 }
 
+bool compute_sketch_bounds(const std::vector<ScriptSketchContour> &contours,
+                           SceneVec3 *out_min, SceneVec3 *out_max) {
+  double minx = std::numeric_limits<double>::infinity();
+  double miny = std::numeric_limits<double>::infinity();
+  double minz = std::numeric_limits<double>::infinity();
+  double maxx = -std::numeric_limits<double>::infinity();
+  double maxy = -std::numeric_limits<double>::infinity();
+  double maxz = -std::numeric_limits<double>::infinity();
+  for (const ScriptSketchContour &contour : contours) {
+    for (const SceneVec3 &p : contour.points) {
+      const double x = p.x;
+      const double y = p.y;
+      const double z = p.z;
+      if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) continue;
+      minx = std::min(minx, x);
+      miny = std::min(miny, y);
+      minz = std::min(minz, z);
+      maxx = std::max(maxx, x);
+      maxy = std::max(maxy, y);
+      maxz = std::max(maxz, z);
+    }
+  }
+  if (!std::isfinite(minx) || !std::isfinite(maxx)) return false;
+  const double pad = 1e-3;
+  *out_min = {(float)minx, (float)miny, (float)(minz - pad)};
+  *out_max = {(float)maxx, (float)maxy, (float)(maxz + pad)};
+  return true;
+}
+
 bool write_all(int fd, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *)buf;
   size_t off = 0;
@@ -243,10 +272,16 @@ bool ScriptWorkerClient::ReadLineWithTimeout(int timeout_ms, std::string *out, s
 bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL *mesh, std::string *error) {
   std::vector<ScriptSceneObject> scene_objects;
   if (!ExecuteScriptScene(script_path, &scene_objects, error)) return false;
-  if (scene_objects.empty()) return set_err(error, "Worker returned no scene objects.");
   std::vector<manifold::Manifold> parts;
   parts.reserve(scene_objects.size());
-  for (const ScriptSceneObject &obj : scene_objects) parts.push_back(obj.manifold);
+  for (const ScriptSceneObject &obj : scene_objects) {
+    if (obj.kind == ScriptSceneObjectKind::Manifold) {
+      parts.push_back(obj.manifold);
+    }
+  }
+  if (parts.empty()) {
+    return set_err(error, "Worker returned no manifold scene objects.");
+  }
   manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
   if (merged.Status() != manifold::Manifold::Error::NoError) {
     return set_err(error, "Failed to merge scene objects for legacy mesh output.");
@@ -342,16 +377,44 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path, std::vector
     if (name_off + rec.name_len > name_blob_size) {
       return set_err(error, "Worker scene name blob is truncated.");
     }
-    manifold::Manifold m;
-    if (!ResolveReplayManifold(tables, rec.root_kind, rec.root_id, &m, error)) return false;
     ScriptSceneObject obj;
     obj.objectId = rec.object_id_hash;
     obj.name.assign((const char *)(names_ptr + name_off), (size_t)rec.name_len);
-    obj.manifold = std::move(m);
-    obj.mesh = obj.manifold.GetMeshGL();
-    if (!compute_bounds(obj.mesh, &obj.bmin, &obj.bmax)) {
-      return set_err(error, "Failed to compute bounds for scene object " + std::to_string(i));
+    obj.kind = ScriptSceneObjectKind::Unknown;
+
+    if (rec.root_kind == (uint32_t)NodeKind::Manifold) {
+      manifold::Manifold m;
+      if (!ResolveReplayManifold(tables, rec.root_kind, rec.root_id, &m, error)) return false;
+      obj.kind = ScriptSceneObjectKind::Manifold;
+      obj.manifold = std::move(m);
+      obj.mesh = obj.manifold.GetMeshGL();
+      if (!compute_bounds(obj.mesh, &obj.bmin, &obj.bmax)) {
+        return set_err(error, "Failed to compute bounds for scene object " + std::to_string(i));
+      }
+    } else if (rec.root_kind == (uint32_t)NodeKind::CrossSection) {
+      manifold::CrossSection cs;
+      if (!ResolveReplayCrossSection(tables, rec.root_kind, rec.root_id, &cs, error)) return false;
+      obj.kind = ScriptSceneObjectKind::CrossSection;
+      obj.mesh.numProp = 3;
+      manifold::Polygons polys = cs.ToPolygons();
+      obj.sketchContours.reserve(polys.size());
+      for (const manifold::SimplePolygon &poly : polys) {
+        if (poly.empty()) continue;
+        ScriptSketchContour contour;
+        contour.points.reserve(poly.size());
+        for (const manifold::vec2 &p : poly) {
+          contour.points.push_back({(float)p.x, (float)p.y, 0.0f});
+        }
+        obj.sketchContours.push_back(std::move(contour));
+      }
+      if (!compute_sketch_bounds(obj.sketchContours, &obj.bmin, &obj.bmax)) {
+        obj.bmin = {0.0f, 0.0f, 0.0f};
+        obj.bmax = {0.0f, 0.0f, 0.0f};
+      }
+    } else {
+      return set_err(error, "Worker scene object has unsupported root kind.");
     }
+
     name_off += rec.name_len;
     objects->push_back(std::move(obj));
   }

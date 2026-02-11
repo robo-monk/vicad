@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "es2022",
+    "allowArbitraryExtensions": true
+  },
+  "include": [
+    "**/*.js",
+    "**/*.mjs",
+    "**/*.cjs",
+    "**/*.ts",
+    "**/*.d.ts",
+    "**/*.vicad"
+  ],
+  "exclude": [
+    "build",
+    "Clipper2",
+    "manifold"
+  ]
+}

@@ -22,6 +22,8 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
                        ReplayTables *tables, std::string *error);
 bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
                            manifold::Manifold *out, std::string *error);
+bool ResolveReplayCrossSection(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                               manifold::CrossSection *out, std::string *error);
 
 struct ReplayInput {
   const uint8_t *records;

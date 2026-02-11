@@ -9,19 +9,31 @@
 
 namespace vicad {
 
+enum class ScriptSceneObjectKind : uint32_t {
+  Unknown = 0,
+  Manifold = 1,
+  CrossSection = 2,
+};
+
 struct SceneVec3 {
   float x;
   float y;
   float z;
 };
 
+struct ScriptSketchContour {
+  std::vector<SceneVec3> points;
+};
+
 struct ScriptSceneObject {
-  uint64_t objectId;
+  uint64_t objectId = 0;
   std::string name;
+  ScriptSceneObjectKind kind = ScriptSceneObjectKind::Unknown;
   manifold::Manifold manifold;
   manifold::MeshGL mesh;
-  SceneVec3 bmin;
-  SceneVec3 bmax;
+  std::vector<ScriptSketchContour> sketchContours;
+  SceneVec3 bmin = {0.0f, 0.0f, 0.0f};
+  SceneVec3 bmax = {0.0f, 0.0f, 0.0f};
 };
 
 class ScriptWorkerClient {

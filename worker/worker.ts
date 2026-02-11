@@ -153,7 +153,7 @@ async function executeScript(scriptPath: string) {
     const loaded = await import(`file://${tempPath}?t=${Date.now()}`);
     if (multiMode) {
       if (loaded.default !== undefined) {
-        throw new Error("SceneRegistrationError: IPC scene mode requires vicad.addToScene(...); default export is disabled.");
+        throw new Error("SceneRegistrationError: IPC scene mode requires vicad.addToScene(...) or vicad.addSketch(...); default export is disabled.");
       }
       return { kind: "scene" as const, value: __vicadEncodeScene() };
     }

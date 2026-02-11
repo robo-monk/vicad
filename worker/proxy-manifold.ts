@@ -357,9 +357,20 @@ function toSceneRoot(value: unknown) {
   throw new Error("SceneRegistrationError: addToScene expects Manifold or GLTFNode(manifold).");
 }
 
+function toSketchRoot(value: unknown) {
+  if (value instanceof CrossSection) {
+    return { rootKind: NODE_KIND.CROSS_SECTION, rootId: value.nodeId };
+  }
+  throw new Error("SceneRegistrationError: addSketch expects CrossSection.");
+}
+
 export const vicad = {
   addToScene(value: unknown, opts?: { id?: string; name?: string }) {
     const root = toSceneRoot(value);
+    reg.addSceneObject(root.rootKind, root.rootId, opts);
+  },
+  addSketch(value: unknown, opts?: { id?: string; name?: string }) {
+    const root = toSketchRoot(value);
     reg.addSceneObject(root.rootKind, root.rootId, opts);
   },
   clearScene() {
@@ -401,7 +412,7 @@ export function __vicadEncodeDefault(value: unknown) {
 
 export function __vicadEncodeScene() {
   if (reg.sceneEntries.length === 0) {
-    throw new Error("SceneRegistrationError: no objects were added. Use vicad.addToScene(...)." );
+    throw new Error("SceneRegistrationError: no scene entries were added. Use vicad.addToScene(...) or vicad.addSketch(...)." );
   }
   return {
     opCount: reg.ops.length,

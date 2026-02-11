@@ -331,6 +331,20 @@ bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint3
   return true;
 }
 
+bool ResolveReplayCrossSection(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                               manifold::CrossSection *out, std::string *error) {
+  if (root_kind != (uint32_t)NodeKind::CrossSection) {
+    *error = "Replay failed: root node is not a cross-section.";
+    return false;
+  }
+  if ((size_t)root_id >= tables.cross_nodes.size() || !tables.has_cross[root_id]) {
+    *error = "Replay failed: root cross-section node missing.";
+    return false;
+  }
+  *out = tables.cross_nodes[root_id];
+  return true;
+}
+
 bool ReplayOpsToMesh(const ReplayInput &in, manifold::MeshGL *mesh, std::string *error) {
   ReplayTables tables;
   if (!ReplayOpsToTables(in.records, in.records_size, in.op_count, &tables, error)) return false;
