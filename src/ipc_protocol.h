@@ -50,6 +50,9 @@ enum class OpCode : uint16_t {
   CrossSquare = 101,
   CrossTranslate = 102,
   CrossRotate = 103,
+  CrossRect = 104,
+  CrossPoint = 105,
+  CrossPolygons = 106,
 };
 
 enum class NodeKind : uint32_t {

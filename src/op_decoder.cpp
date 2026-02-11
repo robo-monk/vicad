@@ -230,6 +230,57 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         c_nodes[out_id] = manifold::CrossSection::Square(manifold::vec2(x, y), center != 0);
         has_c[out_id] = true;
       } break;
+      case OpCode::CrossRect: {
+        double x = 0.0, y = 0.0;
+        uint32_t center = 0;
+        if (!read_f64(&payload, &x) || !read_f64(&payload, &y) || !read_u32(&payload, &center)) {
+          *error = "Replay failed: invalid cross rect payload.";
+          return false;
+        }
+        c_nodes[out_id] = manifold::CrossSection::Square(manifold::vec2(x, y), center != 0);
+        has_c[out_id] = true;
+      } break;
+      case OpCode::CrossPoint: {
+        double x = 0.0, y = 0.0, radius = 0.0;
+        uint32_t seg = 0;
+        if (!read_f64(&payload, &x) || !read_f64(&payload, &y) || !read_f64(&payload, &radius) ||
+            !read_u32(&payload, &seg)) {
+          *error = "Replay failed: invalid cross point payload.";
+          return false;
+        }
+        c_nodes[out_id] =
+            manifold::CrossSection::Circle(radius, (int)seg).Translate(manifold::vec2(x, y));
+        has_c[out_id] = true;
+      } break;
+      case OpCode::CrossPolygons: {
+        uint32_t contour_count = 0;
+        if (!read_u32(&payload, &contour_count) || contour_count == 0) {
+          *error = "Replay failed: invalid cross polygons payload.";
+          return false;
+        }
+        manifold::Polygons polys;
+        polys.reserve(contour_count);
+        for (uint32_t c = 0; c < contour_count; ++c) {
+          uint32_t point_count = 0;
+          if (!read_u32(&payload, &point_count) || point_count < 3) {
+            *error = "Replay failed: invalid cross polygon contour payload.";
+            return false;
+          }
+          manifold::SimplePolygon poly;
+          poly.reserve(point_count);
+          for (uint32_t i = 0; i < point_count; ++i) {
+            double x = 0.0, y = 0.0;
+            if (!read_f64(&payload, &x) || !read_f64(&payload, &y)) {
+              *error = "Replay failed: invalid cross polygon point payload.";
+              return false;
+            }
+            poly.push_back(manifold::vec2(x, y));
+          }
+          polys.push_back(std::move(poly));
+        }
+        c_nodes[out_id] = manifold::CrossSection(polys, manifold::CrossSection::FillRule::Positive);
+        has_c[out_id] = true;
+      } break;
       case OpCode::CrossTranslate: {
         uint32_t in_id = 0;
         double x = 0.0, y = 0.0;

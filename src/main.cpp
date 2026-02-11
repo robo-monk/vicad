@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <string>
 #include <vector>
 #include <sys/stat.h>
@@ -25,8 +26,13 @@
 #include <GL/gl.h>
 #endif
 
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+
 #define CLAY_IMPLEMENTATION
 #include "../clay.h"
+#include "funnel_sans_baked.h"
 
 struct Vec3 {
     float x;
@@ -37,33 +43,6 @@ struct Vec3 {
 struct Vec2 {
     float x;
     float y;
-};
-
-enum class SketchPlane {
-    XY,
-    XZ,
-    YZ,
-};
-
-struct SketchBasis {
-    Vec3 origin;
-    Vec3 u;
-    Vec3 v;
-    Vec3 normal;
-};
-
-struct SketchState {
-    bool active;
-    SketchPlane plane;
-    float planeOffset;
-    float snapStep;
-    bool snapEnabled;
-    float extrudeDepth;
-    bool closed;
-    bool hasHover;
-    Vec2 hoverUv;
-    std::vector<Vec2> points;
-    std::string lastError;
 };
 
 struct FaceSelectState {
@@ -101,15 +80,90 @@ struct ClayUiState {
     bool panelCollapsed;
     Clay_ElementData panelData;
     Clay_ElementData headerData;
+    std::array<std::string, 16> textSlots;
 };
 
 static ClayUiState g_ui = {};
 
+static Clay_String ui_text_slot(size_t slot, const char *text) {
+    if (slot >= g_ui.textSlots.size()) {
+        return CLAY_STRING("");
+    }
+    g_ui.textSlots[slot] = text ? text : "";
+    Clay_String s = {
+        .length = (int32_t)g_ui.textSlots[slot].size(),
+        .chars = g_ui.textSlots[slot].c_str(),
+        .isStaticallyAllocated = false,
+    };
+    return s;
+}
+
+static Clay_String ui_text_slot(size_t slot, const std::string &text) {
+    if (slot >= g_ui.textSlots.size()) {
+        return CLAY_STRING("");
+    }
+    g_ui.textSlots[slot] = text;
+    Clay_String s = {
+        .length = (int32_t)g_ui.textSlots[slot].size(),
+        .chars = g_ui.textSlots[slot].c_str(),
+        .isStaticallyAllocated = false,
+    };
+    return s;
+}
+
+struct BakedFontState {
+    GLuint texture;
+    bool initialized;
+};
+
+static BakedFontState g_baked_font = {};
+static constexpr float kDimensionLabelScale = 2.0f;
+static constexpr float kHudBaseScale = 0.75f;
+static constexpr float kHudLegacyScale = 1.5f;
+
+static const VicadBakedGlyph *glyph_for_char(unsigned char ch) {
+    if (ch < VICAD_BAKED_FIRST_CHAR || ch > VICAD_BAKED_LAST_CHAR) ch = '?';
+    return &vicad_baked_glyphs[ch - VICAD_BAKED_FIRST_CHAR];
+}
+
+static float text_width_for_slice(Clay_StringSlice text, float font_px) {
+    if (text.length <= 0 || !text.chars || font_px <= 0.0f) return 0.0f;
+    const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
+    float width = 0.0f;
+    float line_width = 0.0f;
+    for (int i = 0; i < text.length; ++i) {
+        const unsigned char ch = (unsigned char)text.chars[i];
+        if (ch == '\n') {
+            if (line_width > width) width = line_width;
+            line_width = 0.0f;
+            continue;
+        }
+        line_width += (float)glyph_for_char(ch)->advance * scale;
+    }
+    if (line_width > width) width = line_width;
+    return width;
+}
+
+static float text_width_for_cstr(const char *text, float font_px) {
+    if (!text) return 0.0f;
+    Clay_StringSlice s = {
+        .length = (int32_t)std::strlen(text),
+        .chars = text,
+    };
+    return text_width_for_slice(s, font_px);
+}
+
 static Clay_Dimensions measure_text_mono(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData) {
     (void)userData;
-    const float font = (float)(config ? config->fontSize : 16);
-    const float width = (float)text.length * (font * 0.62f);
-    return (Clay_Dimensions){width, font};
+    const float font_px = (float)(config ? config->fontSize : 16);
+    const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
+    const float width = text_width_for_slice(text, font_px);
+    int lines = 1;
+    for (int i = 0; i < text.length; ++i) {
+        if (text.chars && text.chars[i] == '\n') lines += 1;
+    }
+    const float height = (float)VICAD_BAKED_LINE_HEIGHT * scale * (float)lines;
+    return (Clay_Dimensions){width, height};
 }
 
 static void clay_error_handler(Clay_ErrorData errorData) {
@@ -136,7 +190,37 @@ static float clay_color_chan(float c) {
     return v;
 }
 
+static bool ensure_baked_font_texture(void) {
+    if (g_baked_font.initialized) return true;
+    glGenTextures(1, &g_baked_font.texture);
+    if (g_baked_font.texture == 0) return false;
+
+    glBindTexture(GL_TEXTURE_2D, g_baked_font.texture);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_ALPHA,
+                 VICAD_BAKED_ATLAS_WIDTH,
+                 VICAD_BAKED_ATLAS_HEIGHT,
+                 0,
+                 GL_ALPHA,
+                 GL_UNSIGNED_BYTE,
+                 vicad_baked_atlas);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    g_baked_font.initialized = true;
+    return true;
+}
+
+static void draw_text_5x7(float x, float y, float scale, const char *text, float r, float g, float b);
 static void draw_text_from_slice(float x, float y, float scale, Clay_StringSlice s, float r, float g, float b);
+static void draw_text_baked_world(const Vec3 &origin,
+                                  const Vec3 &axis_right,
+                                  const Vec3 &axis_up,
+                                  float world_scale, const char *text,
+                                  float r, float g, float b, float a);
 
 static void clay_render_commands(Clay_RenderCommandArray cmds, i32 pixel_width, i32 pixel_height, float ui_scale) {
     glMatrixMode(GL_PROJECTION);
@@ -196,7 +280,7 @@ static void clay_render_commands(Clay_RenderCommandArray cmds, i32 pixel_width, 
                 if (sf < 1.0f) sf = 1.0f;
                 if (sf > 8.0f) sf = 8.0f;
                 draw_text_from_slice(
-                    x0, y0 + sf,
+                    x0, y0,
                     sf, t.stringContents,
                     clay_color_chan(t.textColor.r),
                     clay_color_chan(t.textColor.g),
@@ -261,83 +345,18 @@ static float dot(const Vec3 &a, const Vec3 &b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
 }
 
-[[maybe_unused]] static Vec2 sub2(const Vec2 &a, const Vec2 &b) {
-    return {a.x - b.x, a.y - b.y};
-}
-
-[[maybe_unused]] static float length2_2d(const Vec2 &v) {
-    return v.x * v.x + v.y * v.y;
-}
-
-[[maybe_unused]] static Vec2 snap_vec2(const Vec2 &v, float step) {
-    if (step <= 1e-6f) return v;
-    return {
-        (float)std::lround(v.x / step) * step,
-        (float)std::lround(v.y / step) * step,
-    };
-}
-
-[[maybe_unused]] static const char *sketch_plane_name(SketchPlane plane) {
-    switch (plane) {
-        case SketchPlane::XY: return "XY";
-        case SketchPlane::XZ: return "XZ";
-        case SketchPlane::YZ: return "YZ";
-        default: return "UNKNOWN";
-    }
-}
-
-[[maybe_unused]] static SketchBasis sketch_basis(SketchPlane plane, float plane_offset) {
-    SketchBasis b = {};
-    switch (plane) {
-        case SketchPlane::XY:
-            b.origin = {0.0f, 0.0f, plane_offset};
-            b.u = {1.0f, 0.0f, 0.0f};
-            b.v = {0.0f, 1.0f, 0.0f};
-            b.normal = {0.0f, 0.0f, 1.0f};
-            break;
-        case SketchPlane::XZ:
-            b.origin = {0.0f, plane_offset, 0.0f};
-            b.u = {1.0f, 0.0f, 0.0f};
-            b.v = {0.0f, 0.0f, -1.0f};
-            b.normal = {0.0f, 1.0f, 0.0f};
-            break;
-        case SketchPlane::YZ:
-            b.origin = {plane_offset, 0.0f, 0.0f};
-            b.u = {0.0f, 1.0f, 0.0f};
-            b.v = {0.0f, 0.0f, 1.0f};
-            b.normal = {1.0f, 0.0f, 0.0f};
-            break;
-    }
-    return b;
-}
-
-[[maybe_unused]] static Vec3 sketch_uv_to_world(const SketchBasis &basis, const Vec2 &uv) {
-    Vec3 p = basis.origin;
-    p = add(p, mul(basis.u, uv.x));
-    p = add(p, mul(basis.v, uv.y));
-    return p;
-}
-
-[[maybe_unused]] static Vec2 world_to_sketch_uv(const SketchBasis &basis, const Vec3 &p) {
-    const Vec3 d = sub(p, basis.origin);
-    return {dot(d, basis.u), dot(d, basis.v)};
-}
-
-static bool ray_intersect_plane(const Vec3 &ray_origin, const Vec3 &ray_dir,
-                                const Vec3 &plane_origin, const Vec3 &plane_normal,
-                                Vec3 *hit) {
-    const float denom = dot(ray_dir, plane_normal);
-    if (std::fabs(denom) < 1e-6f) return false;
-    const float t = dot(sub(plane_origin, ray_origin), plane_normal) / denom;
-    if (t < 0.0f) return false;
-    *hit = add(ray_origin, mul(ray_dir, t));
-    return true;
-}
-
 static float clampf(float v, float lo, float hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+static float compute_display_scale(i32 pixel_w, i32 pixel_h, i32 window_w, i32 window_h) {
+    float sx = 1.0f;
+    float sy = 1.0f;
+    if (window_w > 0 && pixel_w > 0) sx = (float)pixel_w / (float)window_w;
+    if (window_h > 0 && pixel_h > 0) sy = (float)pixel_h / (float)window_h;
+    return clampf((sx + sy) * 0.5f, 1.0f, 4.0f);
 }
 
 static CameraBasis camera_basis(const Vec3 &eye, const Vec3 &target) {
@@ -418,113 +437,6 @@ static void draw_grid() {
         glVertex3f(half_cells * step, 0.0f, k);
     }
     glEnd();
-}
-
-[[maybe_unused]] static void draw_sketch_plane_grid(const SketchState &sketch) {
-    if (!sketch.active) return;
-
-    const SketchBasis basis = sketch_basis(sketch.plane, sketch.planeOffset);
-    const int half_cells = 60;
-    const float step = sketch.snapStep > 1e-6f ? sketch.snapStep : 1.0f;
-    const float span = (float)half_cells * step;
-
-    glDisable(GL_LIGHTING);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_DEPTH_TEST);
-    glLineWidth(1.0f);
-    glBegin(GL_LINES);
-    for (int i = -half_cells; i <= half_cells; ++i) {
-        const float k = (float)i * step;
-        const bool major = (i % 5) == 0;
-
-        if (i == 0) {
-            glColor3f(0.98f, 0.60f, 0.20f);
-        } else {
-            const float c = major ? 0.40f : 0.30f;
-            glColor3f(c, c + 0.04f, c + 0.08f);
-        }
-        Vec3 a = add(add(basis.origin, mul(basis.u, k)), mul(basis.v, -span));
-        Vec3 b = add(add(basis.origin, mul(basis.u, k)), mul(basis.v, span));
-        glVertex3f(a.x, a.y, a.z);
-        glVertex3f(b.x, b.y, b.z);
-
-        if (i == 0) {
-            glColor3f(0.25f, 0.78f, 1.0f);
-        } else {
-            const float c = major ? 0.38f : 0.28f;
-            glColor3f(c, c + 0.05f, c + 0.10f);
-        }
-        Vec3 c0 = add(add(basis.origin, mul(basis.v, k)), mul(basis.u, -span));
-        Vec3 c1 = add(add(basis.origin, mul(basis.v, k)), mul(basis.u, span));
-        glVertex3f(c0.x, c0.y, c0.z);
-        glVertex3f(c1.x, c1.y, c1.z);
-    }
-    glEnd();
-    glLineWidth(1.0f);
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
-}
-
-[[maybe_unused]] static void draw_sketch_profile(const SketchState &sketch) {
-    if (!sketch.active) return;
-
-    const SketchBasis basis = sketch_basis(sketch.plane, sketch.planeOffset);
-
-    glDisable(GL_LIGHTING);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_DEPTH_TEST);
-
-    if (!sketch.points.empty()) {
-        glLineWidth(2.5f);
-        glColor3f(1.0f, 0.86f, 0.28f);
-        glBegin(GL_LINE_STRIP);
-        for (const Vec2 &uv : sketch.points) {
-            const Vec3 p = sketch_uv_to_world(basis, uv);
-            glVertex3f(p.x, p.y, p.z);
-        }
-        if (sketch.closed) {
-            const Vec3 p0 = sketch_uv_to_world(basis, sketch.points.front());
-            glVertex3f(p0.x, p0.y, p0.z);
-        }
-        glEnd();
-        glLineWidth(1.0f);
-    }
-
-    if (!sketch.closed && sketch.hasHover && !sketch.points.empty()) {
-        const Vec3 last = sketch_uv_to_world(basis, sketch.points.back());
-        const Vec3 hover = sketch_uv_to_world(basis, sketch.hoverUv);
-        glColor3f(0.88f, 0.94f, 1.0f);
-        glLineWidth(1.8f);
-        glBegin(GL_LINES);
-        glVertex3f(last.x, last.y, last.z);
-        glVertex3f(hover.x, hover.y, hover.z);
-        glEnd();
-        glLineWidth(1.0f);
-    }
-
-    if (!sketch.points.empty()) {
-        glPointSize(7.0f);
-        glBegin(GL_POINTS);
-        for (size_t i = 0; i < sketch.points.size(); ++i) {
-            const Vec3 p = sketch_uv_to_world(basis, sketch.points[i]);
-            if (i == 0 && !sketch.closed) {
-                glColor3f(0.30f, 0.98f, 0.58f);
-            } else {
-                glColor3f(1.0f, 0.86f, 0.28f);
-            }
-            glVertex3f(p.x, p.y, p.z);
-        }
-        if (!sketch.closed && sketch.hasHover) {
-            const Vec3 hp = sketch_uv_to_world(basis, sketch.hoverUv);
-            glColor3f(0.78f, 0.90f, 1.0f);
-            glVertex3f(hp.x, hp.y, hp.z);
-        }
-        glEnd();
-        glPointSize(1.0f);
-    }
-
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
 }
 
 static void draw_mesh(const manifold::MeshGL &mesh) {
@@ -870,6 +782,448 @@ static void draw_script_sketches(const std::vector<vicad::ScriptSceneObject> &sc
     }
 }
 
+enum class SketchDimShapeKind {
+    Unknown,
+    Point,
+    Circle,
+    Rectangle,
+    Square,
+    RegularPolygon,
+    Polygon,
+};
+
+static Vec2 add2(const Vec2 &a, const Vec2 &b) { return {a.x + b.x, a.y + b.y}; }
+static Vec2 sub2v(const Vec2 &a, const Vec2 &b) { return {a.x - b.x, a.y - b.y}; }
+static Vec2 mul2(const Vec2 &v, float s) { return {v.x * s, v.y * s}; }
+static float dot2(const Vec2 &a, const Vec2 &b) { return a.x * b.x + a.y * b.y; }
+static float length2(const Vec2 &v) { return std::sqrt(dot2(v, v)); }
+static Vec2 normalize2(const Vec2 &v) {
+    const float len = length2(v);
+    if (len <= 1e-6f) return {0.0f, 0.0f};
+    return {v.x / len, v.y / len};
+}
+static Vec2 perp2(const Vec2 &v) { return {-v.y, v.x}; }
+
+static Vec3 vec3_from_2d(const Vec2 &v, float z) { return {v.x, v.y, z}; }
+
+static void contour_plane_axes(const vicad::ScriptSketchContour &contour,
+                               Vec3 *out_right,
+                               Vec3 *out_up,
+                               Vec3 *out_normal) {
+    Vec3 right = {1.0f, 0.0f, 0.0f};
+    Vec3 up = {0.0f, 1.0f, 0.0f};
+    Vec3 normal = {0.0f, 0.0f, 1.0f};
+    if (contour.points.size() >= 2) {
+        const auto to_v3 = [](const vicad::SceneVec3 &p) {
+            return Vec3{p.x, p.y, p.z};
+        };
+        const Vec3 p0 = to_v3(contour.points[0]);
+        bool found_right = false;
+        for (size_t i = 1; i < contour.points.size(); ++i) {
+            const Vec3 e = sub(to_v3(contour.points[i]), p0);
+            if (dot(e, e) > 1e-10f) {
+                right = normalize(e);
+                found_right = true;
+                break;
+            }
+        }
+        if (found_right) {
+            bool found_normal = false;
+            for (size_t i = 1; i < contour.points.size(); ++i) {
+                const Vec3 e = sub(to_v3(contour.points[i]), p0);
+                const Vec3 n = cross(right, e);
+                if (dot(n, n) > 1e-10f) {
+                    normal = normalize(n);
+                    found_normal = true;
+                    break;
+                }
+            }
+            if (!found_normal) {
+                const Vec3 fallback_up = std::fabs(right.z) < 0.95f
+                    ? Vec3{0.0f, 0.0f, 1.0f}
+                    : Vec3{0.0f, 1.0f, 0.0f};
+                normal = normalize(cross(right, fallback_up));
+            }
+            up = normalize(cross(normal, right));
+        }
+    }
+    if (out_right) *out_right = right;
+    if (out_up) *out_up = up;
+    if (out_normal) *out_normal = normal;
+}
+
+static float contour_signed_area(const std::vector<Vec2> &pts) {
+    const size_t n = pts.size();
+    if (n < 3) return 0.0f;
+    double a = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const Vec2 &p0 = pts[i];
+        const Vec2 &p1 = pts[(i + 1) % n];
+        a += (double)p0.x * (double)p1.y - (double)p1.x * (double)p0.y;
+    }
+    return (float)(0.5 * a);
+}
+
+static void contour_bbox(const std::vector<Vec2> &pts, Vec2 *mn, Vec2 *mx) {
+    Vec2 bmin = {0.0f, 0.0f};
+    Vec2 bmax = {0.0f, 0.0f};
+    if (!pts.empty()) {
+        bmin = pts[0];
+        bmax = pts[0];
+        for (size_t i = 1; i < pts.size(); ++i) {
+            const Vec2 &p = pts[i];
+            if (p.x < bmin.x) bmin.x = p.x;
+            if (p.y < bmin.y) bmin.y = p.y;
+            if (p.x > bmax.x) bmax.x = p.x;
+            if (p.y > bmax.y) bmax.y = p.y;
+        }
+    }
+    *mn = bmin;
+    *mx = bmax;
+}
+
+static Vec2 contour_centroid_mean(const std::vector<Vec2> &pts) {
+    if (pts.empty()) return {0.0f, 0.0f};
+    Vec2 c = {0.0f, 0.0f};
+    for (const Vec2 &p : pts) c = add2(c, p);
+    const float inv = 1.0f / (float)pts.size();
+    return mul2(c, inv);
+}
+
+static bool classify_rectangle_like(const std::vector<Vec2> &pts,
+                                    float *out_w, float *out_h) {
+    if (pts.size() != 4) return false;
+    const Vec2 e0 = sub2v(pts[1], pts[0]);
+    const Vec2 e1 = sub2v(pts[2], pts[1]);
+    const Vec2 e2 = sub2v(pts[3], pts[2]);
+    const Vec2 e3 = sub2v(pts[0], pts[3]);
+    const float l0 = length2(e0);
+    const float l1 = length2(e1);
+    const float l2 = length2(e2);
+    const float l3 = length2(e3);
+    if (l0 <= 1e-6f || l1 <= 1e-6f || l2 <= 1e-6f || l3 <= 1e-6f) return false;
+    const float orth = std::fabs(dot2(normalize2(e0), normalize2(e1)));
+    const float opp0 = std::fabs(l0 - l2) / ((l0 > l2) ? l0 : l2);
+    const float opp1 = std::fabs(l1 - l3) / ((l1 > l3) ? l1 : l3);
+    if (orth > 0.05f || opp0 > 0.05f || opp1 > 0.05f) return false;
+    *out_w = l0;
+    *out_h = l1;
+    return true;
+}
+
+static bool classify_circle_like(const std::vector<Vec2> &pts,
+                                 Vec2 *out_center, float *out_radius) {
+    const size_t n = pts.size();
+    if (n < 12) return false;
+    const Vec2 c = contour_centroid_mean(pts);
+    double sum_r = 0.0;
+    std::vector<float> rs;
+    rs.reserve(n);
+    for (const Vec2 &p : pts) {
+        const float r = length2(sub2v(p, c));
+        rs.push_back(r);
+        sum_r += (double)r;
+    }
+    const float mean_r = (float)(sum_r / (double)n);
+    if (mean_r <= 1e-6f) return false;
+    double max_dev = 0.0;
+    for (float r : rs) {
+        const double d = std::fabs((double)r - (double)mean_r);
+        if (d > max_dev) max_dev = d;
+    }
+    const double rel = max_dev / (double)mean_r;
+    if (rel > 0.03) return false;
+    *out_center = c;
+    *out_radius = mean_r;
+    return true;
+}
+
+static bool classify_regular_polygon_like(const std::vector<Vec2> &pts,
+                                          Vec2 *out_center,
+                                          float *out_radius,
+                                          float *out_side) {
+    const size_t n = pts.size();
+    if (n < 3 || n > 16) return false;
+    const Vec2 c = contour_centroid_mean(pts);
+    double sum_r = 0.0;
+    std::vector<float> rs;
+    rs.reserve(n);
+    for (const Vec2 &p : pts) {
+        const float r = length2(sub2v(p, c));
+        rs.push_back(r);
+        sum_r += (double)r;
+    }
+    const float mean_r = (float)(sum_r / (double)n);
+    if (mean_r <= 1e-6f) return false;
+    double max_rel_r = 0.0;
+    for (float r : rs) {
+        const double rel = std::fabs((double)r - (double)mean_r) / (double)mean_r;
+        if (rel > max_rel_r) max_rel_r = rel;
+    }
+    if (max_rel_r > 0.03) return false;
+
+    std::vector<float> edge_lengths;
+    edge_lengths.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const Vec2 &a = pts[i];
+        const Vec2 &b = pts[(i + 1) % n];
+        edge_lengths.push_back(length2(sub2v(b, a)));
+    }
+    float mean_e = 0.0f;
+    for (float e : edge_lengths) mean_e += e;
+    mean_e /= (float)n;
+    if (mean_e <= 1e-6f) return false;
+    double max_rel_e = 0.0;
+    for (float e : edge_lengths) {
+        const double rel = std::fabs((double)e - (double)mean_e) / (double)mean_e;
+        if (rel > max_rel_e) max_rel_e = rel;
+    }
+    if (max_rel_e > 0.04) return false;
+    *out_center = c;
+    *out_radius = mean_r;
+    *out_side = mean_e;
+    return true;
+}
+
+static void draw_world_line(const Vec3 &a, const Vec3 &b) {
+    glBegin(GL_LINES);
+    glVertex3f(a.x, a.y, a.z);
+    glVertex3f(b.x, b.y, b.z);
+    glEnd();
+}
+
+static void format_dim(char *buf, size_t cap, const char *prefix, float v) {
+    if (!buf || cap == 0) return;
+    std::snprintf(buf, cap, "%s%.3g", prefix ? prefix : "", (double)v);
+}
+
+static float text_width_world(const char *text, float world_scale) {
+    const float font_px = (float)VICAD_BAKED_PIXEL_SIZE * world_scale;
+    return text_width_for_cstr(text, font_px);
+}
+
+static void draw_dimension_label_world(const Vec3 &anchor,
+                                       const Vec3 &axis_right,
+                                       const Vec3 &axis_up,
+                                       float world_scale,
+                                       const char *text,
+                                       float r, float g, float b, float a,
+                                       bool center_x) {
+    if (!text || !text[0]) return;
+    const float label_world_scale = world_scale * kDimensionLabelScale;
+    Vec3 origin = anchor;
+    if (center_x) {
+        origin = add(origin, mul(axis_right, -0.5f * text_width_world(text, label_world_scale)));
+    }
+    draw_text_baked_world(origin, axis_right, axis_up, label_world_scale, text, r, g, b, a);
+}
+
+static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
+                                    const Vec3 &eye,
+                                    float alpha) {
+    if (contour.points.size() < 2) return;
+    std::vector<Vec2> pts2;
+    pts2.reserve(contour.points.size());
+    for (const vicad::SceneVec3 &p : contour.points) {
+        pts2.push_back({p.x, p.y});
+    }
+    const float z = contour.points.front().z;
+    const Vec2 centroid = contour_centroid_mean(pts2);
+    Vec2 bmin = {0.0f, 0.0f}, bmax = {0.0f, 0.0f};
+    contour_bbox(pts2, &bmin, &bmax);
+    const float bw = bmax.x - bmin.x;
+    const float bh = bmax.y - bmin.y;
+    const float bdiag = std::sqrt(bw * bw + bh * bh);
+    const Vec3 centroid3 = vec3_from_2d(centroid, z);
+    const Vec3 eye_to_centroid = sub(centroid3, eye);
+    const float eye_dist = std::sqrt(dot(eye_to_centroid, eye_to_centroid));
+    float world_scale = eye_dist * 0.00012f;
+    if (world_scale < 0.0025f) world_scale = 0.0025f;
+    if (world_scale > 0.03f) world_scale = 0.03f;
+    Vec3 text_right = {1.0f, 0.0f, 0.0f};
+    Vec3 text_up = {0.0f, 1.0f, 0.0f};
+    Vec3 plane_normal = {0.0f, 0.0f, 1.0f};
+    contour_plane_axes(contour, &text_right, &text_up, &plane_normal);
+    const Vec3 label_lift = add(mul(text_up, world_scale * 8.0f),
+                                mul(plane_normal, world_scale * 1.5f));
+
+    SketchDimShapeKind kind = SketchDimShapeKind::Polygon;
+    float rect_w = 0.0f, rect_h = 0.0f;
+    Vec2 c_center = {0.0f, 0.0f};
+    float c_radius = 0.0f;
+    Vec2 rp_center = {0.0f, 0.0f};
+    float rp_radius = 0.0f;
+    float rp_side = 0.0f;
+
+    if (classify_rectangle_like(pts2, &rect_w, &rect_h)) {
+        const float maxv = rect_w > rect_h ? rect_w : rect_h;
+        const float minv = rect_w > rect_h ? rect_h : rect_w;
+        if (maxv > 1e-6f && std::fabs(maxv - minv) / maxv < 0.02f) {
+            kind = SketchDimShapeKind::Square;
+        } else {
+            kind = SketchDimShapeKind::Rectangle;
+        }
+    } else if (classify_circle_like(pts2, &c_center, &c_radius)) {
+        if (c_radius <= 0.2f) {
+            kind = SketchDimShapeKind::Point;
+        } else {
+            kind = SketchDimShapeKind::Circle;
+        }
+    } else if (classify_regular_polygon_like(pts2, &rp_center, &rp_radius, &rp_side)) {
+        kind = SketchDimShapeKind::RegularPolygon;
+    } else {
+        kind = SketchDimShapeKind::Polygon;
+    }
+
+    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    char text[128];
+
+    if (kind == SketchDimShapeKind::Circle || kind == SketchDimShapeKind::Point) {
+        Vec2 a2 = {c_center.x - c_radius, c_center.y};
+        Vec2 b2 = {c_center.x + c_radius, c_center.y};
+        const Vec3 a3 = vec3_from_2d(a2, z);
+        const Vec3 b3 = vec3_from_2d(b2, z);
+        draw_world_line(a3, b3);
+        const Vec3 mid = mul(add(a3, b3), 0.5f);
+        if (kind == SketchDimShapeKind::Point) {
+            std::snprintf(text, sizeof(text), "P(%.3g, %.3g)", (double)c_center.x, (double)c_center.y);
+        } else {
+            std::snprintf(text, sizeof(text), "D=%.3g  R=%.3g", (double)(c_radius * 2.0f), (double)c_radius);
+        }
+        draw_dimension_label_world(add(mid, label_lift), text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+        if (kind == SketchDimShapeKind::Point) {
+            const float arm = (bdiag > 0.0f ? bdiag : 1.0f) * 0.06f + 0.04f;
+            draw_world_line(vec3_from_2d({c_center.x - arm, c_center.y}, z),
+                            vec3_from_2d({c_center.x + arm, c_center.y}, z));
+            draw_world_line(vec3_from_2d({c_center.x, c_center.y - arm}, z),
+                            vec3_from_2d({c_center.x, c_center.y + arm}, z));
+        }
+        return;
+    }
+
+    if (kind == SketchDimShapeKind::Rectangle || kind == SketchDimShapeKind::Square) {
+        const Vec2 p0 = pts2[0];
+        const Vec2 p1 = pts2[1];
+        const Vec2 p2 = pts2[2];
+        const Vec2 e0 = sub2v(p1, p0);
+        const Vec2 e1 = sub2v(p2, p1);
+        Vec2 n0 = perp2(normalize2(e0));
+        Vec2 n1 = perp2(normalize2(e1));
+        const Vec2 m0 = mul2(add2(p0, p1), 0.5f);
+        const Vec2 m1 = mul2(add2(p1, p2), 0.5f);
+        if (dot2(sub2v(m0, centroid), n0) < 0.0f) n0 = mul2(n0, -1.0f);
+        if (dot2(sub2v(m1, centroid), n1) < 0.0f) n1 = mul2(n1, -1.0f);
+        const float off = (bdiag > 0.0f ? bdiag : 1.0f) * 0.14f + 0.08f;
+
+        const Vec2 w0 = add2(p0, mul2(n0, off));
+        const Vec2 w1 = add2(p1, mul2(n0, off));
+        const Vec2 h0 = add2(p1, mul2(n1, off));
+        const Vec2 h1 = add2(p2, mul2(n1, off));
+        const Vec3 w03 = vec3_from_2d(w0, z);
+        const Vec3 w13 = vec3_from_2d(w1, z);
+        const Vec3 h03 = vec3_from_2d(h0, z);
+        const Vec3 h13 = vec3_from_2d(h1, z);
+        const Vec3 p03 = vec3_from_2d(p0, z);
+        const Vec3 p13 = vec3_from_2d(p1, z);
+        const Vec3 p23 = vec3_from_2d(p2, z);
+
+        draw_world_line(w03, w13);
+        draw_world_line(h03, h13);
+        draw_world_line(p03, w03);
+        draw_world_line(p13, w13);
+        draw_world_line(p13, h03);
+        draw_world_line(p23, h13);
+
+        format_dim(text, sizeof(text), "W=", rect_w);
+        draw_dimension_label_world(add(mul(add(w03, w13), 0.5f), label_lift),
+                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+        if (kind == SketchDimShapeKind::Square) {
+            format_dim(text, sizeof(text), "S=", rect_h);
+        } else {
+            format_dim(text, sizeof(text), "H=", rect_h);
+        }
+        draw_dimension_label_world(add(mul(add(h03, h13), 0.5f), label_lift),
+                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+        return;
+    }
+
+    if (kind == SketchDimShapeKind::RegularPolygon) {
+        const size_t n = pts2.size();
+        draw_world_line(vec3_from_2d(pts2[0], z), vec3_from_2d(pts2[1], z));
+        const float across_flats = 2.0f * rp_radius * std::cos(3.1415926535f / (float)n);
+        std::snprintf(text, sizeof(text), "N=%zu  S=%.3g  AF=%.3g", n, (double)rp_side, (double)across_flats);
+        draw_dimension_label_world(add(vec3_from_2d(rp_center, z), label_lift),
+                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+        return;
+    }
+
+    const size_t n = pts2.size();
+    if (n <= 8) {
+        for (size_t i = 0; i < n; ++i) {
+            const Vec2 &a = pts2[i];
+            const Vec2 &b = pts2[(i + 1) % n];
+            const float e = length2(sub2v(b, a));
+            const Vec3 wa = vec3_from_2d(a, z);
+            const Vec3 wb = vec3_from_2d(b, z);
+            const Vec3 mid = mul(add(wa, wb), 0.5f);
+            format_dim(text, sizeof(text), "", e);
+            draw_dimension_label_world(add(mid, label_lift), text_right, text_up, world_scale, text,
+                                       1.0f, 1.0f, 1.0f, alpha, true);
+        }
+    } else {
+        float perimeter = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            perimeter += length2(sub2v(pts2[(i + 1) % n], pts2[i]));
+        }
+        const float area = std::fabs(contour_signed_area(pts2));
+        std::snprintf(text, sizeof(text), "N=%zu  P=%.3g  A=%.3g", n, (double)perimeter, (double)area);
+        draw_dimension_label_world(add(vec3_from_2d(centroid, z), label_lift),
+                                   text_right, text_up, world_scale, text, 1.0f, 1.0f, 1.0f, alpha, true);
+    }
+}
+
+static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneObject> &scene,
+                                          int selected_object_index,
+                                          const Vec3 &eye) {
+    glDisable(GL_LIGHTING);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glLineWidth(1.5f);
+    for (size_t scene_index = 0; scene_index < scene.size(); ++scene_index) {
+        const vicad::ScriptSceneObject &obj = scene[scene_index];
+        if (!scene_object_is_sketch(obj)) continue;
+        if (obj.sketchContours.empty()) continue;
+        const bool selected = ((int)scene_index == selected_object_index);
+        const float alpha = selected ? 1.0f : 0.60f;
+        glColor4f(1.0f, 1.0f, 1.0f, alpha);
+
+        size_t largest_idx = 0;
+        float largest_area = -1.0f;
+        for (size_t i = 0; i < obj.sketchContours.size(); ++i) {
+            const vicad::ScriptSketchContour &c = obj.sketchContours[i];
+            if (c.points.size() < 3) continue;
+            std::vector<Vec2> pts;
+            pts.reserve(c.points.size());
+            for (const vicad::SceneVec3 &p : c.points) pts.push_back({p.x, p.y});
+            const float a = std::fabs(contour_signed_area(pts));
+            if (a > largest_area) {
+                largest_area = a;
+                largest_idx = i;
+            }
+        }
+        draw_contour_dimensions(obj.sketchContours[largest_idx], eye, alpha);
+    }
+
+    glLineWidth(1.0f);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    glEnable(GL_CULL_FACE);
+    glEnable(GL_LIGHTING);
+}
+
 static Vec3 light_anchor(const Vec3 &eye, const CameraBasis &basis,
                          float right, float up, float forward) {
     Vec3 p = eye;
@@ -890,32 +1244,6 @@ static Vec3 camera_ray_direction(int mouse_x, int mouse_y, i32 width, i32 height
     dir = add(dir, mul(basis.right, ndc_x * aspect * tan_half_fov));
     dir = add(dir, mul(basis.up, ndc_y * tan_half_fov));
     return normalize(dir);
-}
-
-[[maybe_unused]] static float sketch_close_threshold(const SketchState &sketch) {
-    const float snap_term = sketch.snapEnabled ? sketch.snapStep * 0.35f : 0.0f;
-    const float t = snap_term > 0.28f ? snap_term : 0.28f;
-    return t;
-}
-
-[[maybe_unused]] static bool mouse_to_sketch_uv(i32 mouse_x, i32 mouse_y,
-                               i32 width, i32 height,
-                               const Vec3 &eye,
-                               const CameraBasis &camera,
-                               float fov_degrees,
-                               const SketchState &sketch,
-                               Vec2 *out_uv,
-                               Vec3 *out_world) {
-    if (width <= 0 || height <= 0) return false;
-    const SketchBasis basis = sketch_basis(sketch.plane, sketch.planeOffset);
-    const Vec3 ray_dir = camera_ray_direction(mouse_x, mouse_y, width, height, fov_degrees, camera);
-    Vec3 hit = {0.0f, 0.0f, 0.0f};
-    if (!ray_intersect_plane(eye, ray_dir, basis.origin, basis.normal, &hit)) return false;
-    Vec2 uv = world_to_sketch_uv(basis, hit);
-    if (sketch.snapEnabled) uv = snap_vec2(uv, sketch.snapStep);
-    if (out_uv) *out_uv = uv;
-    if (out_world) *out_world = sketch_uv_to_world(basis, uv);
-    return true;
 }
 
 static void window_mouse_to_pixel(i32 mouse_x, i32 mouse_y,
@@ -993,46 +1321,6 @@ static void draw_pick_debug_overlay(i32 pixel_w, i32 pixel_h,
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
     glMatrixMode(GL_MODELVIEW);
-}
-
-[[maybe_unused]] static float ui_scale_for_window(i32 pixel_w, i32 pixel_h, i32 window_w, i32 window_h) {
-    if (window_w <= 0 || window_h <= 0) return 1.0f;
-    const float sx = (float)pixel_w / (float)window_w;
-    const float sy = (float)pixel_h / (float)window_h;
-    float s = sx < sy ? sx : sy;
-    if (s < 1.0f) s = 1.0f;
-    return s;
-}
-
-[[maybe_unused]] static bool ray_hits_aabb(const Vec3 &ray_origin, const Vec3 &ray_dir,
-                          const Vec3 &bmin, const Vec3 &bmax) {
-    float tmin = 0.0f;
-    float tmax = 1e30f;
-
-    const float ro[3] = {ray_origin.x, ray_origin.y, ray_origin.z};
-    const float rd[3] = {ray_dir.x, ray_dir.y, ray_dir.z};
-    const float mn[3] = {bmin.x, bmin.y, bmin.z};
-    const float mx[3] = {bmax.x, bmax.y, bmax.z};
-
-    for (int i = 0; i < 3; ++i) {
-        if (std::fabs(rd[i]) < 1e-6f) {
-            if (ro[i] < mn[i] || ro[i] > mx[i]) return false;
-            continue;
-        }
-        const float inv = 1.0f / rd[i];
-        float t0 = (mn[i] - ro[i]) * inv;
-        float t1 = (mx[i] - ro[i]) * inv;
-        if (t0 > t1) {
-            const float tmp = t0;
-            t0 = t1;
-            t1 = tmp;
-        }
-        if (t0 > tmin) tmin = t0;
-        if (t1 < tmax) tmax = t1;
-        if (tmax < tmin) return false;
-    }
-
-    return tmax >= 0.0f;
 }
 
 static bool ray_intersect_triangle(const Vec3 &orig, const Vec3 &dir,
@@ -1167,11 +1455,14 @@ static int pick_scene_object_by_ray(const std::vector<vicad::ScriptSceneObject> 
     return best;
 }
 
-static void draw_orientation_cube(const CameraBasis &basis, i32 width, i32 height, int top_offset_px) {
-    int size = (width < height ? width : height) / 5;
-    if (size < 96) size = 96;
-    if (size > 180) size = 180;
-    const int pad = 16;
+static void draw_orientation_cube(const CameraBasis &basis, i32 width, i32 height, int top_offset_px, float hud_scale) {
+    const float cube_scale = clampf(hud_scale / kHudLegacyScale, 0.5f, 2.0f);
+    int size = (int)std::lround((float)(width < height ? width : height) / 5.0f * cube_scale);
+    const int min_size = (int)std::lround(96.0f * cube_scale);
+    const int max_size = (int)std::lround(180.0f * cube_scale);
+    if (size < min_size) size = min_size;
+    if (size > max_size) size = max_size;
+    const int pad = (int)std::lround(16.0f * cube_scale);
     const int vx = width - size - pad;
     const int vy = height - size - pad - top_offset_px;
 
@@ -1239,102 +1530,114 @@ static void draw_orientation_cube(const CameraBasis &basis, i32 width, i32 heigh
     glViewport(0, 0, width, height);
 }
 
-struct StatusPanelRect {
-    int x;
-    int y;
-    int w;
-    int h;
-    int header_h;
-};
-
-static StatusPanelRect status_panel_rect(i32 width, i32 height, bool collapsed) {
-    (void)height;
-    StatusPanelRect r = {0, 0, 0, 0, 0};
-    r.w = 320;
-    r.header_h = 28;
-    r.h = collapsed ? r.header_h : 140;
-    r.x = (int)width - r.w - 16;
-    r.y = 16;
-    return r;
-}
-
 static bool point_in_rect(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && x < (rx + rw) && y >= ry && y < (ry + rh);
 }
 
-static uint8_t glyph_rows(char ch, int row) {
-    // 5x7 uppercase glyphs for the small status HUD.
-    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
-    switch (ch) {
-        case 'A': { const uint8_t g[7] = {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
-        case 'B': { const uint8_t g[7] = {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}; return g[row]; }
-        case 'C': { const uint8_t g[7] = {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}; return g[row]; }
-        case 'D': { const uint8_t g[7] = {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}; return g[row]; }
-        case 'E': { const uint8_t g[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}; return g[row]; }
-        case 'F': { const uint8_t g[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}; return g[row]; }
-        case 'H': { const uint8_t g[7] = {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}; return g[row]; }
-        case 'I': { const uint8_t g[7] = {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}; return g[row]; }
-        case 'K': { const uint8_t g[7] = {0x11,0x12,0x14,0x18,0x14,0x12,0x11}; return g[row]; }
-        case 'L': { const uint8_t g[7] = {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}; return g[row]; }
-        case 'M': { const uint8_t g[7] = {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}; return g[row]; }
-        case 'N': { const uint8_t g[7] = {0x11,0x11,0x19,0x15,0x13,0x11,0x11}; return g[row]; }
-        case 'O': { const uint8_t g[7] = {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
-        case 'P': { const uint8_t g[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}; return g[row]; }
-        case 'R': { const uint8_t g[7] = {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}; return g[row]; }
-        case 'S': { const uint8_t g[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}; return g[row]; }
-        case 'T': { const uint8_t g[7] = {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}; return g[row]; }
-        case 'U': { const uint8_t g[7] = {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}; return g[row]; }
-        case 'V': { const uint8_t g[7] = {0x11,0x11,0x11,0x11,0x0A,0x0A,0x04}; return g[row]; }
-        case 'X': { const uint8_t g[7] = {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}; return g[row]; }
-        case 'Y': { const uint8_t g[7] = {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}; return g[row]; }
-        case '0': { const uint8_t g[7] = {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}; return g[row]; }
-        case '1': { const uint8_t g[7] = {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}; return g[row]; }
-        case '2': { const uint8_t g[7] = {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}; return g[row]; }
-        case '3': { const uint8_t g[7] = {0x1F,0x01,0x02,0x06,0x01,0x11,0x0E}; return g[row]; }
-        case '4': { const uint8_t g[7] = {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}; return g[row]; }
-        case '5': { const uint8_t g[7] = {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}; return g[row]; }
-        case '6': { const uint8_t g[7] = {0x07,0x08,0x10,0x1E,0x11,0x11,0x0E}; return g[row]; }
-        case '7': { const uint8_t g[7] = {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}; return g[row]; }
-        case '8': { const uint8_t g[7] = {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}; return g[row]; }
-        case '9': { const uint8_t g[7] = {0x0E,0x11,0x11,0x0F,0x01,0x02,0x1C}; return g[row]; }
-        case ':': { const uint8_t g[7] = {0x00,0x04,0x00,0x00,0x04,0x00,0x00}; return g[row]; }
-        case '.': { const uint8_t g[7] = {0x00,0x00,0x00,0x00,0x00,0x06,0x06}; return g[row]; }
-        case '-': { const uint8_t g[7] = {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}; return g[row]; }
-        case '+': { const uint8_t g[7] = {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}; return g[row]; }
-        case '=': { const uint8_t g[7] = {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00}; return g[row]; }
-        case '/': { const uint8_t g[7] = {0x01,0x02,0x04,0x08,0x10,0x00,0x00}; return g[row]; }
-        case '(': { const uint8_t g[7] = {0x02,0x04,0x08,0x08,0x08,0x04,0x02}; return g[row]; }
-        case ')': { const uint8_t g[7] = {0x08,0x04,0x02,0x02,0x02,0x04,0x08}; return g[row]; }
-        case '[': { const uint8_t g[7] = {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}; return g[row]; }
-        case ']': { const uint8_t g[7] = {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E}; return g[row]; }
-        case ' ': return 0x00;
-        default:  { const uint8_t g[7] = {0x1F,0x11,0x02,0x04,0x04,0x00,0x04}; return g[row]; }
+static void draw_text_baked_rgba(float x, float y, float font_px, const char *text,
+                                 float r, float g, float b, float a) {
+    if (!text || !text[0]) return;
+    if (font_px <= 0.0f) return;
+    if (!ensure_baked_font_texture()) return;
+
+    const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
+    const float line_height = (float)VICAD_BAKED_LINE_HEIGHT * scale;
+    float pen_x = x;
+    float baseline = y + (float)VICAD_BAKED_ASCENDER * scale;
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_baked_font.texture);
+    glColor4f(r, g, b, a);
+    glBegin(GL_QUADS);
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        if (*p == '\n') {
+            pen_x = x;
+            baseline += line_height;
+            continue;
+        }
+
+        const VicadBakedGlyph *glyph = glyph_for_char(*p);
+        if (glyph->w > 0 && glyph->h > 0) {
+            const float x0 = pen_x + (float)glyph->bearing_x * scale;
+            const float y0 = baseline - (float)glyph->bearing_y * scale;
+            const float x1 = x0 + (float)glyph->w * scale;
+            const float y1 = y0 + (float)glyph->h * scale;
+            const float u0 = (float)glyph->x / (float)VICAD_BAKED_ATLAS_WIDTH;
+            const float v0 = (float)glyph->y / (float)VICAD_BAKED_ATLAS_HEIGHT;
+            const float u1 = (float)(glyph->x + glyph->w) / (float)VICAD_BAKED_ATLAS_WIDTH;
+            const float v1 = (float)(glyph->y + glyph->h) / (float)VICAD_BAKED_ATLAS_HEIGHT;
+
+            glTexCoord2f(u0, v0); glVertex2f(x0, y0);
+            glTexCoord2f(u1, v0); glVertex2f(x1, y0);
+            glTexCoord2f(u1, v1); glVertex2f(x1, y1);
+            glTexCoord2f(u0, v1); glVertex2f(x0, y1);
+        }
+        pen_x += (float)glyph->advance * scale;
     }
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
+}
+
+static void draw_text_baked_world(const Vec3 &origin,
+                                  const Vec3 &axis_right,
+                                  const Vec3 &axis_up,
+                                  float world_scale, const char *text,
+                                  float r, float g, float b, float a) {
+    if (!text || !text[0]) return;
+    if (world_scale <= 0.0f) return;
+    if (!ensure_baked_font_texture()) return;
+
+    const float line_height = (float)VICAD_BAKED_LINE_HEIGHT * world_scale;
+    float pen_x = 0.0f;
+    float baseline = (float)VICAD_BAKED_ASCENDER * world_scale;
+    const Vec3 down = mul(axis_up, -1.0f);
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, g_baked_font.texture);
+    glColor4f(r, g, b, a);
+    glBegin(GL_QUADS);
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        if (*p == '\n') {
+            pen_x = 0.0f;
+            baseline += line_height;
+            continue;
+        }
+
+        const VicadBakedGlyph *glyph = glyph_for_char(*p);
+        if (glyph->w > 0 && glyph->h > 0) {
+            const float x0 = pen_x + (float)glyph->bearing_x * world_scale;
+            const float y0 = baseline - (float)glyph->bearing_y * world_scale;
+            const float x1 = x0 + (float)glyph->w * world_scale;
+            const float y1 = y0 + (float)glyph->h * world_scale;
+            const float u0 = (float)glyph->x / (float)VICAD_BAKED_ATLAS_WIDTH;
+            const float v0 = (float)glyph->y / (float)VICAD_BAKED_ATLAS_HEIGHT;
+            const float u1 = (float)(glyph->x + glyph->w) / (float)VICAD_BAKED_ATLAS_WIDTH;
+            const float v1 = (float)(glyph->y + glyph->h) / (float)VICAD_BAKED_ATLAS_HEIGHT;
+
+            const Vec3 p00 = add(add(origin, mul(axis_right, x0)), mul(down, y0));
+            const Vec3 p10 = add(add(origin, mul(axis_right, x1)), mul(down, y0));
+            const Vec3 p11 = add(add(origin, mul(axis_right, x1)), mul(down, y1));
+            const Vec3 p01 = add(add(origin, mul(axis_right, x0)), mul(down, y1));
+
+            glTexCoord2f(u0, v0); glVertex3f(p00.x, p00.y, p00.z);
+            glTexCoord2f(u1, v0); glVertex3f(p10.x, p10.y, p10.z);
+            glTexCoord2f(u1, v1); glVertex3f(p11.x, p11.y, p11.z);
+            glTexCoord2f(u0, v1); glVertex3f(p01.x, p01.y, p01.z);
+        }
+        pen_x += (float)glyph->advance * world_scale;
+    }
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_BLEND);
 }
 
 static void draw_text_5x7(float x, float y, float scale, const char *text, float r, float g, float b) {
-    if (!text) return;
-    glColor3f(r, g, b);
-    glBegin(GL_QUADS);
-    float cx = x;
-    for (const char *p = text; *p; ++p) {
-        const char ch = *p;
-        for (int row = 0; row < 7; ++row) {
-            const uint8_t bits = glyph_rows(ch, row);
-            for (int col = 0; col < 5; ++col) {
-                if ((bits >> (4 - col)) & 1) {
-                    const float px = cx + col * scale;
-                    const float py = y + row * scale;
-                    glVertex2f(px, py);
-                    glVertex2f(px + scale, py);
-                    glVertex2f(px + scale, py + scale);
-                    glVertex2f(px, py + scale);
-                }
-            }
-        }
-        cx += 6 * scale;
-    }
-    glEnd();
+    draw_text_baked_rgba(x, y, scale * 7.0f, text, r, g, b, 1.0f);
 }
 
 static void draw_text_from_slice(float x, float y, float scale, Clay_StringSlice s, float r, float g, float b) {
@@ -1345,85 +1648,6 @@ static void draw_text_from_slice(float x, float y, float scale, Clay_StringSlice
     std::memcpy(tmp, s.chars, (size_t)n);
     tmp[n] = '\0';
     draw_text_5x7(x, y, scale, tmp, r, g, b);
-}
-
-[[maybe_unused]] static int draw_status_panel(i32 width, i32 height, bool collapsed,
-                             bool script_ok, const std::string &script_error,
-                             size_t tri_count, size_t vert_count, bool selected) {
-    StatusPanelRect p = status_panel_rect(width, height, collapsed);
-
-    glMatrixMode(GL_PROJECTION);
-    glPushMatrix();
-    glLoadIdentity();
-    glOrtho(0, width, height, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glPushMatrix();
-    glLoadIdentity();
-
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_LIGHTING);
-    glDisable(GL_CULL_FACE);
-    glDisable(GL_SCISSOR_TEST);
-
-    glBegin(GL_QUADS);
-    glColor4f(0.08f, 0.10f, 0.13f, 0.92f);
-    glVertex2i(p.x, p.y); glVertex2i(p.x + p.w, p.y); glVertex2i(p.x + p.w, p.y + p.h); glVertex2i(p.x, p.y + p.h);
-    glColor4f(0.14f, 0.17f, 0.21f, 0.98f);
-    glVertex2i(p.x, p.y); glVertex2i(p.x + p.w, p.y); glVertex2i(p.x + p.w, p.y + p.header_h); glVertex2i(p.x, p.y + p.header_h);
-    glEnd();
-
-    glLineWidth(1.0f);
-    glBegin(GL_LINE_LOOP);
-    glColor3f(0.35f, 0.39f, 0.46f);
-    glVertex2i(p.x, p.y); glVertex2i(p.x + p.w, p.y); glVertex2i(p.x + p.w, p.y + p.h); glVertex2i(p.x, p.y + p.h);
-    glEnd();
-
-    draw_text_5x7(p.x + 12, p.y + 8, 2, "STATUS", 0.95f, 0.97f, 0.99f);
-    draw_text_5x7(p.x + p.w - 26, p.y + 8, 2, collapsed ? "+" : "-", 0.95f, 0.97f, 0.99f);
-
-    if (!collapsed) {
-        char line[128] = {0};
-        std::snprintf(line, sizeof(line), "SCRIPT: %s", script_ok ? "OK" : "ERROR");
-        draw_text_5x7(p.x + 12, p.y + 38, 2, line, script_ok ? 0.55f : 1.0f, script_ok ? 0.90f : 0.45f, 0.55f);
-
-        std::snprintf(line, sizeof(line), "MESH: %zu TRI  %zu VERT", tri_count, vert_count);
-        draw_text_5x7(p.x + 12, p.y + 56, 2, line, 0.84f, 0.88f, 0.93f);
-
-        std::snprintf(line, sizeof(line), "SELECTED: %s", selected ? "ON" : "OFF");
-        draw_text_5x7(p.x + 12, p.y + 74, 2, line, selected ? 1.0f : 0.75f, selected ? 0.92f : 0.78f, selected ? 0.18f : 0.80f);
-
-        if (!script_ok) {
-            const std::string one_line = script_error.empty() ? "NO ERROR TEXT" :
-                script_error.substr(0, script_error.find('\n'));
-            draw_text_5x7(p.x + 12, p.y + 96, 2, "LAST ERROR:", 1.0f, 0.75f, 0.75f);
-            draw_text_5x7(p.x + 12, p.y + 114, 2, one_line.c_str(), 0.95f, 0.80f, 0.80f);
-        }
-    }
-
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_CULL_FACE);
-    glMatrixMode(GL_MODELVIEW);
-    glPopMatrix();
-    glMatrixMode(GL_PROJECTION);
-    glPopMatrix();
-    glMatrixMode(GL_MODELVIEW);
-
-    return p.h + 8;
-}
-
-static std::string read_text_file(const char *path) {
-    std::string out;
-    FILE *f = std::fopen(path, "rb");
-    if (!f) return out;
-
-    char buf[4096];
-    while (true) {
-        size_t n = std::fread(buf, 1, sizeof(buf), f);
-        if (n > 0) out.append(buf, n);
-        if (n < sizeof(buf)) break;
-    }
-    std::fclose(f);
-    return out;
 }
 
 static long long file_mtime_ns(const char *path) {
@@ -1486,186 +1710,6 @@ static const char *manifold_error_string(manifold::Manifold::Error error) {
     }
 }
 
-[[maybe_unused]] static bool build_sketch_feature(const SketchState &sketch,
-                                 manifold::Manifold *feature,
-                                 std::string *error) {
-    if (!sketch.closed || sketch.points.size() < 3) {
-        *error = "Sketch profile must be closed before finishing.";
-        return false;
-    }
-    if (!(sketch.extrudeDepth > 1e-4f)) {
-        *error = "Extrude depth must be positive.";
-        return false;
-    }
-
-    manifold::SimplePolygon contour;
-    contour.reserve(sketch.points.size());
-    for (const Vec2 &p : sketch.points) {
-        contour.push_back(manifold::vec2((double)p.x, (double)p.y));
-    }
-
-    manifold::CrossSection profile(contour, manifold::CrossSection::FillRule::Positive);
-    profile = profile.Simplify(1e-6);
-    if (profile.IsEmpty() || profile.NumContour() == 0 || std::fabs(profile.Area()) < 1e-9) {
-        *error = "Sketch profile is invalid or area is too small.";
-        return false;
-    }
-    manifold::Polygons polys = profile.ToPolygons();
-
-    manifold::Manifold local = manifold::Manifold::Extrude(polys, (double)sketch.extrudeDepth);
-    if (local.Status() != manifold::Manifold::Error::NoError) {
-        *error = std::string("Sketch extrusion failed: ") + manifold_error_string(local.Status());
-        return false;
-    }
-
-    const SketchBasis basis = sketch_basis(sketch.plane, sketch.planeOffset);
-    const manifold::mat3x4 xf(
-        manifold::vec3((double)basis.u.x, (double)basis.u.y, (double)basis.u.z),
-        manifold::vec3((double)basis.v.x, (double)basis.v.y, (double)basis.v.z),
-        manifold::vec3((double)basis.normal.x, (double)basis.normal.y, (double)basis.normal.z),
-        manifold::vec3((double)basis.origin.x, (double)basis.origin.y, (double)basis.origin.z));
-
-    manifold::Manifold placed = local.Transform(xf);
-    if (placed.Status() != manifold::Manifold::Error::NoError) {
-        *error = std::string("Sketch transform failed: ") + manifold_error_string(placed.Status());
-        return false;
-    }
-
-    *feature = std::move(placed);
-    return true;
-}
-
-[[maybe_unused]] static bool compose_scene_mesh(const manifold::MeshGL &base_mesh,
-                               const std::vector<manifold::Manifold> &features,
-                               manifold::MeshGL *mesh,
-                               Vec3 *bmin,
-                               Vec3 *bmax,
-                               std::string *error) {
-    if (features.empty()) {
-        Vec3 mn = {0.0f, 0.0f, 0.0f};
-        Vec3 mx = {0.0f, 0.0f, 0.0f};
-        if (!compute_mesh_bounds(base_mesh, &mn, &mx)) {
-            *error = "Base mesh has no valid bounds.";
-            return false;
-        }
-        *mesh = base_mesh;
-        *bmin = mn;
-        *bmax = mx;
-        return true;
-    }
-
-    manifold::Manifold scene(base_mesh);
-    if (scene.Status() != manifold::Manifold::Error::NoError) {
-        *error = std::string("Base mesh is not manifold: ") + manifold_error_string(scene.Status());
-        return false;
-    }
-
-    for (const manifold::Manifold &feature : features) {
-        scene += feature;
-        if (scene.Status() != manifold::Manifold::Error::NoError) {
-            *error = std::string("Feature union failed: ") + manifold_error_string(scene.Status());
-            return false;
-        }
-    }
-
-    manifold::MeshGL next = scene.GetMeshGL();
-    Vec3 mn = {0.0f, 0.0f, 0.0f};
-    Vec3 mx = {0.0f, 0.0f, 0.0f};
-    if (!compute_mesh_bounds(next, &mn, &mx)) {
-        *error = "Composed mesh has no valid bounds.";
-        return false;
-    }
-
-    *mesh = std::move(next);
-    *bmin = mn;
-    *bmax = mx;
-    return true;
-}
-
-static bool load_mesh_binary(const char *path, manifold::MeshGL *mesh, Vec3 *bmin, Vec3 *bmax, std::string *error) {
-    FILE *f = std::fopen(path, "rb");
-    if (!f) {
-        *error = "Failed to open script output binary.";
-        return false;
-    }
-
-    char magic[8] = {0};
-    if (std::fread(magic, 1, 8, f) != 8 || std::memcmp(magic, "VCADMSH1", 8) != 0) {
-        std::fclose(f);
-        *error = "Invalid script output header.";
-        return false;
-    }
-
-    uint32_t numProp = 0;
-    uint32_t vertLen = 0;
-    uint32_t triLen = 0;
-    if (std::fread(&numProp, 4, 1, f) != 1 ||
-        std::fread(&vertLen, 4, 1, f) != 1 ||
-        std::fread(&triLen, 4, 1, f) != 1) {
-        std::fclose(f);
-        *error = "Failed reading script output metadata.";
-        return false;
-    }
-
-    if (numProp < 3 || vertLen == 0 || triLen == 0 || (vertLen % numProp) != 0 || (triLen % 3) != 0) {
-        std::fclose(f);
-        *error = "Script output mesh metadata is invalid.";
-        return false;
-    }
-
-    std::vector<float> vertProperties;
-    std::vector<uint32_t> triVerts;
-    vertProperties.resize(vertLen);
-    triVerts.resize(triLen);
-
-    if (std::fread(vertProperties.data(), sizeof(float), vertLen, f) != vertLen ||
-        std::fread(triVerts.data(), sizeof(uint32_t), triLen, f) != triLen) {
-        std::fclose(f);
-        *error = "Script output mesh payload is incomplete.";
-        return false;
-    }
-
-    std::fclose(f);
-
-    manifold::MeshGL next;
-    next.numProp = numProp;
-    next.vertProperties = std::move(vertProperties);
-    next.triVerts = std::move(triVerts);
-
-    Vec3 mn = {0.0f, 0.0f, 0.0f};
-    Vec3 mx = {0.0f, 0.0f, 0.0f};
-    if (!compute_mesh_bounds(next, &mn, &mx)) {
-        *error = "Script output mesh has no valid bounds.";
-        return false;
-    }
-
-    *mesh = std::move(next);
-    *bmin = mn;
-    *bmax = mx;
-    return true;
-}
-
-static bool run_script_and_load_mesh(const char *script_path,
-                                     const char *out_path,
-                                     const char *log_path,
-                                     manifold::MeshGL *mesh,
-                                     Vec3 *bmin,
-                                     Vec3 *bmax,
-                                     std::string *error) {
-    char cmd[1024];
-    std::snprintf(cmd, sizeof(cmd), "bun script-runner.ts \"%s\" \"%s\" > \"%s\" 2>&1",
-                  script_path, out_path, log_path);
-
-    const int rc = std::system(cmd);
-    if (rc != 0) {
-        *error = read_text_file(log_path);
-        if (error->empty()) *error = "Bun script execution failed.";
-        return false;
-    }
-
-    return load_mesh_binary(out_path, mesh, bmin, bmax, error);
-}
-
 static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_ok,
                                              const std::string &script_error,
                                              size_t tri_count, size_t vert_count,
@@ -1676,9 +1720,10 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                                              int hovered_object_index,
                                              uint64_t selected_object_id,
                                              uint64_t hovered_object_id,
+                                             float hud_scale,
                                              const FaceSelectState &face_select,
                                              const EdgeSelectState &edge_select) {
-    const float hud = 2.0f;
+    const float hud = clampf(hud_scale, 0.75f, 3.0f);
     const int root_pad = (int)std::lround(16.0f * hud);
     int panel_w = (int)std::lround(320.0f * hud);
     if (panel_w > width - root_pad * 2) panel_w = width - root_pad * 2;
@@ -1752,20 +1797,20 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     const std::string one_line_error = script_error.empty() ? "NO ERROR TEXT" :
         script_error.substr(0, script_error.find('\n'));
 
-    Clay_String mesh_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(mesh_line), .chars = mesh_line};
-    Clay_String selected_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(selected_line), .chars = selected_line};
-    Clay_String object_count_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(object_count_line), .chars = object_count_line};
-    Clay_String sketch_count_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sketch_count_line), .chars = sketch_count_line};
-    Clay_String object_pick_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(object_pick_line), .chars = object_pick_line};
-    Clay_String sel_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(sel_mode_line), .chars = sel_mode_line};
-    Clay_String edge_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(edge_mode_line), .chars = edge_mode_line};
-    Clay_String edge_count_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(edge_count_line), .chars = edge_count_line};
-    Clay_String edge_hover_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(edge_hover_line), .chars = edge_hover_line};
-    Clay_String face_mode_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_mode_line), .chars = face_mode_line};
-    Clay_String face_region_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_region_line), .chars = face_region_line};
-    Clay_String face_hover_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_hover_line), .chars = face_hover_line};
-    Clay_String face_type_line_s = {.isStaticallyAllocated = false, .length = (int32_t)std::strlen(face_type_line), .chars = face_type_line};
-    Clay_String err_line_s = {.isStaticallyAllocated = false, .length = (int32_t)one_line_error.size(), .chars = one_line_error.c_str()};
+    Clay_String mesh_line_s = ui_text_slot(0, mesh_line);
+    Clay_String selected_line_s = ui_text_slot(1, selected_line);
+    Clay_String object_count_line_s = ui_text_slot(2, object_count_line);
+    Clay_String sketch_count_line_s = ui_text_slot(3, sketch_count_line);
+    Clay_String object_pick_line_s = ui_text_slot(4, object_pick_line);
+    Clay_String sel_mode_line_s = ui_text_slot(5, sel_mode_line);
+    Clay_String edge_mode_line_s = ui_text_slot(6, edge_mode_line);
+    Clay_String edge_count_line_s = ui_text_slot(7, edge_count_line);
+    Clay_String edge_hover_line_s = ui_text_slot(8, edge_hover_line);
+    Clay_String face_mode_line_s = ui_text_slot(9, face_mode_line);
+    Clay_String face_region_line_s = ui_text_slot(10, face_region_line);
+    Clay_String face_hover_line_s = ui_text_slot(11, face_hover_line);
+    Clay_String face_type_line_s = ui_text_slot(12, face_type_line);
+    Clay_String err_line_s = ui_text_slot(13, one_line_error);
 
     CLAY(CLAY_ID("StatusRoot"), {
         .layout = {
@@ -1859,12 +1904,6 @@ int main() {
     (void)compute_mesh_bounds(mesh, &mesh_bmin, &mesh_bmax);
 
     const char *script_path = "myobject.vicad.ts";
-    const char *script_out_path = "build/script_result.bin";
-    const char *script_log_path = "build/script_error.log";
-    const char *script_mode_env = std::getenv("VCAD_SCRIPT_MODE");
-    const bool force_legacy = (script_mode_env != nullptr && std::strcmp(script_mode_env, "legacy") == 0);
-    const bool use_multi_scene_mode = true;
-    bool use_ipc_mode = !force_legacy;
     vicad::ScriptWorkerClient worker_client;
     bool ipc_start_failed = false;
     std::vector<vicad::ScriptSceneObject> script_scene;
@@ -1928,7 +1967,7 @@ int main() {
     i32 height = 0;
     i32 window_w = 0;
     i32 window_h = 0;
-    const float ui_scale = 1.0f;
+    float ui_scale = 1.0f;
     i32 ui_width = 0;
     i32 ui_height = 0;
     RGFW_window_getSizeInPixels(win, &width, &height);
@@ -1982,54 +2021,40 @@ int main() {
             std::string err;
 
             bool loaded = false;
-            if (use_ipc_mode) {
-                if (use_multi_scene_mode) {
-                    std::vector<vicad::ScriptSceneObject> next_scene;
-                    loaded = worker_client.ExecuteScriptScene(script_path, &next_scene, &err);
-                    if (loaded) {
-                        script_scene = std::move(next_scene);
-                        std::vector<manifold::Manifold> parts;
-                        parts.reserve(script_scene.size());
-                        for (const vicad::ScriptSceneObject &obj : script_scene) {
-                            if (scene_object_is_manifold(obj)) {
-                                parts.push_back(obj.manifold);
-                            }
-                        }
-                        if (!parts.empty()) {
-                            manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
-                            if (merged.Status() != manifold::Manifold::Error::NoError) {
-                                loaded = false;
-                                err = std::string("Scene merge failed: ") + manifold_error_string(merged.Status());
-                            } else {
-                                next_mesh = merged.GetMeshGL();
-                                if (!compute_mesh_bounds(next_mesh, &next_bmin, &next_bmax)) {
-                                    loaded = false;
-                                    err = "Merged scene mesh has no valid bounds.";
-                                }
-                            }
-                        } else {
-                            next_mesh.numProp = 3;
-                            if (!compute_scene_bounds(script_scene, &next_bmin, &next_bmax)) {
-                                loaded = false;
-                                err = "Scene has no manifold or sketch geometry to visualize.";
-                            }
+            std::vector<vicad::ScriptSceneObject> next_scene;
+            loaded = worker_client.ExecuteScriptScene(script_path, &next_scene, &err);
+            if (loaded) {
+                script_scene = std::move(next_scene);
+                std::vector<manifold::Manifold> parts;
+                parts.reserve(script_scene.size());
+                for (const vicad::ScriptSceneObject &obj : script_scene) {
+                    if (scene_object_is_manifold(obj)) {
+                        parts.push_back(obj.manifold);
+                    }
+                }
+                if (!parts.empty()) {
+                    manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
+                    if (merged.Status() != manifold::Manifold::Error::NoError) {
+                        loaded = false;
+                        err = std::string("Scene merge failed: ") + manifold_error_string(merged.Status());
+                    } else {
+                        next_mesh = merged.GetMeshGL();
+                        if (!compute_mesh_bounds(next_mesh, &next_bmin, &next_bmax)) {
+                            loaded = false;
+                            err = "Merged scene mesh has no valid bounds.";
                         }
                     }
                 } else {
-                    loaded = worker_client.ExecuteScript(script_path, &next_mesh, &err);
-                }
-                if (!loaded && !worker_client.started()) {
-                    ipc_start_failed = true;
-                    std::fprintf(stderr, "[vicad] IPC worker startup failed: %s\n", err.c_str());
+                    next_mesh.numProp = 3;
+                    if (!compute_scene_bounds(script_scene, &next_bmin, &next_bmax)) {
+                        loaded = false;
+                        err = "Scene has no manifold or sketch geometry to visualize.";
+                    }
                 }
             }
-
-            if (!loaded && !use_ipc_mode) {
-                loaded = run_script_and_load_mesh(script_path, script_out_path, script_log_path,
-                                                  &next_mesh, &next_bmin, &next_bmax, &err);
-                if (loaded) {
-                    script_scene.clear();
-                }
+            if (!loaded && !worker_client.started()) {
+                ipc_start_failed = true;
+                std::fprintf(stderr, "[vicad] IPC worker startup failed: %s\n", err.c_str());
             }
 
             if (loaded) {
@@ -2067,8 +2092,7 @@ int main() {
                 edge_select.hoveredChain = -1;
                 edge_select.selectedChain = -1;
                 script_error.clear();
-                std::fprintf(stderr, "[vicad] script loaded: %s (%s)\n", script_path,
-                             use_ipc_mode ? "ipc" : "legacy");
+                std::fprintf(stderr, "[vicad] script loaded: %s (ipc)\n", script_path);
             } else {
                 if (ipc_start_failed && err.empty()) {
                     err = "IPC startup failed.";
@@ -2257,7 +2281,7 @@ int main() {
                         face_select.selectedRegion = region;
                         object_selected = region >= 0;
                     } else {
-                        if (use_multi_scene_mode && !script_scene.empty()) {
+                        if (!script_scene.empty()) {
                             selected_object_index = pick_scene_object_by_ray(script_scene, eye, ray_dir);
                             object_selected = selected_object_index >= 0;
                         } else {
@@ -2270,6 +2294,9 @@ int main() {
 
         if (height <= 0) height = 1;
         if (ui_height <= 0) ui_height = 1;
+        const float display_scale = compute_display_scale(width, height, window_w, window_h);
+        const float hud_scale = kHudBaseScale * display_scale;
+        ui_scale = 1.0f;
         glViewport(0, 0, width, height);
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2364,7 +2391,7 @@ int main() {
             edge_select.hoveredEdge = -1;
             edge_select.hoveredChain = -1;
             face_select.hoveredRegion = -1;
-            if (use_multi_scene_mode && !script_scene.empty()) {
+            if (!script_scene.empty()) {
                 const Vec3 ray_dir =
                     camera_ray_direction(mouse_px_x, mouse_px_y, width, height, fov_degrees, basis);
                 hovered_object_index = pick_scene_object_by_ray(script_scene, eye, ray_dir);
@@ -2386,6 +2413,7 @@ int main() {
             hovered_object_index >= 0 && (size_t)hovered_object_index < script_scene.size()
                 ? script_scene[(size_t)hovered_object_index].objectId
                 : 0ull,
+            hud_scale,
             face_select, edge_select);
 
         draw_grid();
@@ -2421,15 +2449,13 @@ int main() {
             }
         }
         if (object_selected && !face_select.enabled && !edge_select.enabled) {
-            if (use_multi_scene_mode &&
-                selected_object_index >= 0 &&
+            if (selected_object_index >= 0 &&
                 (size_t)selected_object_index < script_scene.size()) {
                 const vicad::ScriptSceneObject &obj = script_scene[(size_t)selected_object_index];
                 if (scene_object_is_manifold(obj)) {
                     draw_mesh_selection_overlay(obj.mesh, 0.22f, 0.52f, 0.98f, 0.28f);
                 }
-            } else if (use_multi_scene_mode &&
-                       hovered_object_index >= 0 &&
+            } else if (hovered_object_index >= 0 &&
                        (size_t)hovered_object_index < script_scene.size()) {
                 const vicad::ScriptSceneObject &obj = script_scene[(size_t)hovered_object_index];
                 if (scene_object_is_manifold(obj)) {
@@ -2439,13 +2465,14 @@ int main() {
                 draw_mesh_selection_overlay(mesh, 0.22f, 0.52f, 0.98f, 0.28f);
             }
         }
+        draw_script_sketch_dimensions(script_scene, selected_object_index, eye);
         if (pick_debug_overlay) {
             draw_pick_debug_overlay(width, height, window_w, window_h,
                                     mouse_x, mouse_y, mouse_px_x, mouse_px_y);
         }
         const int top_right_offset =
             (g_ui.panelData.found ? (int)std::lround(g_ui.panelData.boundingBox.height) : 0) + 8;
-        draw_orientation_cube(basis, width, height, top_right_offset);
+        draw_orientation_cube(basis, width, height, top_right_offset, hud_scale);
         clay_render_commands(ui_cmds, width, height, ui_scale);
 
         RGFW_window_swapBuffers_OpenGL(win);

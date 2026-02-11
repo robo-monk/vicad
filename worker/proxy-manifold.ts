@@ -65,6 +65,32 @@ function makePayload(parts: Part[]) {
   return out.buffer;
 }
 
+function makePolygonsPayload(outId: number, contours: [number, number][][]) {
+  let bytes = 8; // outId + contour count
+  for (const contour of contours) {
+    bytes += 4; // point count
+    bytes += contour.length * 16; // x,y per point
+  }
+  const out = new Uint8Array(bytes);
+  const view = new DataView(out.buffer);
+  let off = 0;
+  view.setUint32(off, outId >>> 0, true);
+  off += 4;
+  view.setUint32(off, contours.length >>> 0, true);
+  off += 4;
+  for (const contour of contours) {
+    view.setUint32(off, contour.length >>> 0, true);
+    off += 4;
+    for (const [x, y] of contour) {
+      view.setFloat64(off, x, true);
+      off += 8;
+      view.setFloat64(off, y, true);
+      off += 8;
+    }
+  }
+  return out.buffer;
+}
+
 function vec3(xOrArr: number | Vec3Like, y?: number, z?: number): [number, number, number] {
   if (Array.isArray(xOrArr)) {
     return [Number(xOrArr[0] ?? 0), Number(xOrArr[1] ?? 0), Number(xOrArr[2] ?? 0)];
@@ -77,6 +103,38 @@ function vec2(xOrArr: number | Vec2Like, y?: number): [number, number] {
     return [Number(xOrArr[0] ?? 0), Number(xOrArr[1] ?? 0)];
   }
   return [Number(xOrArr), Number(y ?? 0)];
+}
+
+function regularPolygonFromParallelDistance(sides: number, parallelDistance: number, center: boolean): [number, number][] {
+  const n = Math.floor(Number(sides));
+  const d = Number(parallelDistance);
+  if (!Number.isFinite(n) || n < 3) {
+    throw new Error("CrossSection.regularPolygon requires side count >= 3.");
+  }
+  if (!Number.isFinite(d) || d <= 0) {
+    throw new Error("CrossSection.regularPolygon requires a positive parallel distance.");
+  }
+  const apothem = d * 0.5;
+  const radius = apothem / Math.cos(Math.PI / n);
+  const start = Math.PI * 0.5 - Math.PI / n; // keep one side horizontal in the default orientation
+  const pts: [number, number][] = [];
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < n; i++) {
+    const a = start + (2.0 * Math.PI * i) / n;
+    const x = radius * Math.cos(a);
+    const y = radius * Math.sin(a);
+    pts.push([x, y]);
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+  }
+  if (!center) {
+    for (let i = 0; i < pts.length; i++) {
+      const [x, y] = pts[i];
+      pts[i] = [x - minX, y - minY];
+    }
+  }
+  return pts;
 }
 
 function unsupported(name: string): never {
@@ -169,6 +227,90 @@ export class CrossSection {
       { t: "u32", v: center ? 1 : 0 },
     ]));
     return new CrossSection(out);
+  }
+
+  static rectangle(sizeOrWidth: number | Vec2Like = [1, 1], heightOrCenter?: number | boolean, centerArg = false) {
+    let x = 1;
+    let y = 1;
+    let center = centerArg;
+    if (typeof sizeOrWidth === "number") {
+      x = Number(sizeOrWidth);
+      if (typeof heightOrCenter === "number") {
+        y = Number(heightOrCenter);
+      } else {
+        y = Number(sizeOrWidth);
+        if (typeof heightOrCenter === "boolean") center = heightOrCenter;
+      }
+    } else {
+      [x, y] = vec2(sizeOrWidth);
+      if (typeof heightOrCenter === "boolean") center = heightOrCenter;
+    }
+    const out = reg.allocNodeId();
+    reg.push(OP.CROSS_RECT, makePayload([
+      { t: "u32", v: out },
+      { t: "f64", v: x },
+      { t: "f64", v: y },
+      { t: "u32", v: center ? 1 : 0 },
+    ]));
+    return new CrossSection(out);
+  }
+
+  static point(positionOrX: number | Vec2Like = [0, 0], yOrRadius?: number, radiusOrSegments = 0.1, circularSegments = 12) {
+    let x = 0;
+    let y = 0;
+    let radius = 0.1;
+    let segments = 12;
+    if (Array.isArray(positionOrX)) {
+      [x, y] = vec2(positionOrX);
+      radius = Number(yOrRadius ?? 0.1);
+      segments = Math.max(0, Math.floor(Number(radiusOrSegments)));
+    } else {
+      x = Number(positionOrX);
+      y = Number(yOrRadius ?? 0);
+      radius = Number(radiusOrSegments);
+      segments = Math.max(0, Math.floor(Number(circularSegments)));
+    }
+    const out = reg.allocNodeId();
+    reg.push(OP.CROSS_POINT, makePayload([
+      { t: "u32", v: out },
+      { t: "f64", v: x },
+      { t: "f64", v: y },
+      { t: "f64", v: radius },
+      { t: "u32", v: segments },
+    ]));
+    return new CrossSection(out);
+  }
+
+  static polygons(contours: Vec2Like[][]) {
+    if (!Array.isArray(contours) || contours.length === 0) {
+      throw new Error("CrossSection.polygons requires a non-empty array of contours.");
+    }
+    const normalized: [number, number][][] = [];
+    for (const contour of contours) {
+      if (!Array.isArray(contour) || contour.length < 3) {
+        throw new Error("CrossSection.polygons requires each contour to have at least 3 points.");
+      }
+      const poly: [number, number][] = [];
+      for (const p of contour) {
+        const [x, y] = vec2(p);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          throw new Error("CrossSection.polygons points must be finite numbers.");
+        }
+        poly.push([x, y]);
+      }
+      normalized.push(poly);
+    }
+    const out = reg.allocNodeId();
+    reg.push(OP.CROSS_POLYGONS, makePolygonsPayload(out, normalized));
+    return new CrossSection(out);
+  }
+
+  static polygon(points: Vec2Like[]) {
+    return CrossSection.polygons([points]);
+  }
+
+  static regularPolygon(sides: number, parallelDistance: number, center = true) {
+    return CrossSection.polygon(regularPolygonFromParallelDistance(sides, parallelDistance, center));
   }
 
   translate(x: number | Vec2Like, y?: number) {

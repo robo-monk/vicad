@@ -284,7 +284,7 @@ bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL
   }
   manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
   if (merged.Status() != manifold::Manifold::Error::NoError) {
-    return set_err(error, "Failed to merge scene objects for legacy mesh output.");
+    return set_err(error, "Failed to merge scene objects for mesh output.");
   }
   *mesh = merged.GetMeshGL();
   return true;

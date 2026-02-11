@@ -30,6 +30,21 @@ static const char *app_sources[] = {
     "src/op_decoder.cpp",
     "src/script_worker_client.cpp",
 };
+static const char *font_baker_tool_source = "tools/font_baker.c";
+static const char *freetype_baker_sources[] = {
+    "freetype/src/base/ftsystem.c",
+    "freetype/src/base/ftinit.c",
+    "freetype/src/base/ftbase.c",
+    "freetype/src/base/ftbitmap.c",
+    "freetype/src/base/ftmm.c",
+    "freetype/src/base/ftdebug.c",
+    "freetype/src/sfnt/sfnt.c",
+    "freetype/src/truetype/truetype.c",
+    "freetype/src/smooth/smooth.c",
+    "freetype/src/raster/raster.c",
+    "freetype/src/psnames/psnames.c",
+    "freetype/src/gzip/ftgzip.c",
+};
 
 typedef struct {
     const char *root;
@@ -63,8 +78,15 @@ static Clipper2Info detect_clipper2(void) {
 static bool compile_object_if_needed(const char *src_path,
                                      const char *obj_path,
                                      bool enable_cross_section,
-                                     const char *clipper_include_dir) {
-    int rebuild = nob_needs_rebuild1(obj_path, src_path);
+                                     const char *clipper_include_dir,
+                                     const char *extra_dependency) {
+    int rebuild = 0;
+    if (extra_dependency != NULL && extra_dependency[0] != '\0') {
+        const char *deps[2] = {src_path, extra_dependency};
+        rebuild = nob_needs_rebuild(obj_path, deps, NOB_ARRAY_LEN(deps));
+    } else {
+        rebuild = nob_needs_rebuild1(obj_path, src_path);
+    }
     if (rebuild < 0) return false;
     if (rebuild == 0) return true;
 
@@ -77,6 +99,7 @@ static bool compile_object_if_needed(const char *src_path,
                    "-Wpedantic",
                    "-O2",
                    "-I.",
+                   "-Ibuild/generated",
                    "-Imanifold/include",
                    "-DMANIFOLD_PAR=-1",
                    enable_cross_section ? "-DMANIFOLD_CROSS_SECTION=1" : "-DMANIFOLD_CROSS_SECTION=0",
@@ -91,6 +114,109 @@ static bool compile_object_if_needed(const char *src_path,
     return nob_cmd_run(&cmd);
 }
 
+static bool compile_font_baker_object_if_needed(const char *src_path, const char *obj_path) {
+    const char *deps[] = {
+        src_path,
+        "tools/freetype/config/ftmodule.h",
+    };
+    int rebuild = nob_needs_rebuild(obj_path, deps, NOB_ARRAY_LEN(deps));
+    if (rebuild < 0) return false;
+    if (rebuild == 0) return true;
+
+    Nob_Cmd cmd = {0};
+    nob_cmd_append(&cmd, "cc");
+    nob_cmd_append(&cmd,
+                   "-std=c99",
+                   "-Wall",
+                   "-Wextra",
+                   "-Wpedantic",
+                   "-O2",
+                   "-DFT2_BUILD_LIBRARY",
+                   "-I.",
+                   "-Itools",
+                   "-Ifreetype/include",
+                   "-Ifreetype/src/base",
+                   "-Ifreetype/src/sfnt",
+                   "-Ifreetype/src/truetype",
+                   "-Ifreetype/src/smooth",
+                   "-Ifreetype/src/raster",
+                   "-Ifreetype/src/psnames",
+                   "-Ifreetype/src/gzip",
+                   "-c",
+                   src_path,
+                   "-o",
+                   obj_path);
+    return nob_cmd_run(&cmd);
+}
+
+static bool build_font_baker(const char *baker_bin_path) {
+    if (nob_file_exists("tools/freetype/config/ftmodule.h") == 0) {
+        nob_log(NOB_ERROR, "Missing tools/freetype/config/ftmodule.h");
+        return false;
+    }
+    if (nob_file_exists("freetype/include/ft2build.h") == 0) {
+        nob_log(NOB_ERROR, "Missing freetype/include/ft2build.h");
+        return false;
+    }
+    if (nob_file_exists(font_baker_tool_source) == 0) {
+        nob_log(NOB_ERROR, "Missing %s", font_baker_tool_source);
+        return false;
+    }
+
+    if (!nob_mkdir_if_not_exists("build")) return false;
+    if (!nob_mkdir_if_not_exists("build/font_baker")) return false;
+
+    Nob_File_Paths objects = {0};
+
+    const char *tool_obj = "build/font_baker/font_baker_tool.o";
+    nob_da_append(&objects, tool_obj);
+    if (!compile_font_baker_object_if_needed(font_baker_tool_source, tool_obj)) return false;
+
+    for (size_t i = 0; i < NOB_ARRAY_LEN(freetype_baker_sources); ++i) {
+        const char *src = freetype_baker_sources[i];
+        const char *base_name = nob_path_name(src);
+        const char *obj = nob_temp_sprintf("build/font_baker/%.*s.o",
+                                           (int)(strlen(base_name) - sizeof(".c") + 1),
+                                           base_name);
+        nob_da_append(&objects, obj);
+        if (!compile_font_baker_object_if_needed(src, obj)) return false;
+    }
+
+    int relink = nob_needs_rebuild(baker_bin_path, objects.items, objects.count);
+    if (relink < 0) return false;
+    if (relink == 0) return true;
+
+    Nob_Cmd link = {0};
+    nob_cmd_append(&link, "cc");
+    for (size_t i = 0; i < objects.count; ++i) {
+        nob_cmd_append(&link, objects.items[i]);
+    }
+    nob_cmd_append(&link, "-o", baker_bin_path);
+    return nob_cmd_run(&link);
+}
+
+static bool bake_funnel_sans_header(const char *baker_bin_path, const char *header_path) {
+    const char *font_path = "Funnel_Sans/static/FunnelSans-Regular.ttf";
+    if (nob_file_exists(font_path) == 0) {
+        nob_log(NOB_ERROR, "Missing font at %s", font_path);
+        return false;
+    }
+
+    const char *deps[] = {
+        baker_bin_path,
+        font_path,
+    };
+    int rebuild = nob_needs_rebuild(header_path, deps, NOB_ARRAY_LEN(deps));
+    if (rebuild < 0) return false;
+    if (rebuild == 0) return true;
+
+    if (!nob_mkdir_if_not_exists("build/generated")) return false;
+
+    Nob_Cmd cmd = {0};
+    nob_cmd_append(&cmd, baker_bin_path, font_path, header_path, "48");
+    return nob_cmd_run(&cmd);
+}
+
 int main(int argc, char **argv) {
     NOB_GO_REBUILD_URSELF(argc, argv);
 
@@ -99,6 +225,8 @@ int main(int argc, char **argv) {
     const char *build_tag = enable_cross_section ? "cross_section" : "base";
     const char *obj_root = nob_temp_sprintf("build/obj_%s", build_tag);
     const char *binary_mode_path = nob_temp_sprintf("build/vicad_%s", build_tag);
+    const char *font_baker_bin = "build/font_baker/font_baker";
+    const char *baked_font_header = "build/generated/funnel_sans_baked.h";
 
     if (enable_cross_section) {
         nob_log(NOB_INFO, "Clipper2 detected at %s; enabling MANIFOLD_CROSS_SECTION", clipper2.root);
@@ -110,6 +238,9 @@ int main(int argc, char **argv) {
     }
 
     if (!nob_mkdir_if_not_exists("build")) return 1;
+    if (!build_font_baker(font_baker_bin)) return 1;
+    if (!bake_funnel_sans_header(font_baker_bin, baked_font_header)) return 1;
+
     if (!nob_mkdir_if_not_exists(obj_root)) return 1;
     if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/src", obj_root))) return 1;
     if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/manifold", obj_root))) return 1;
@@ -128,7 +259,8 @@ int main(int argc, char **argv) {
                                            (int)(strlen(base) - sizeof(".cpp") + 1),
                                            base);
         nob_da_append(&objects, obj);
-        if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir)) return 1;
+        const char *extra_dep = strcmp(src, "src/main.cpp") == 0 ? baked_font_header : NULL;
+        if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir, extra_dep)) return 1;
     }
 
     for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
@@ -139,13 +271,13 @@ int main(int argc, char **argv) {
                                            (int)(strlen(base) - sizeof(".cpp") + 1),
                                            base);
         nob_da_append(&objects, obj);
-        if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir)) return 1;
+        if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir, NULL)) return 1;
     }
 
     if (enable_cross_section) {
         const char *obj = nob_temp_sprintf("%s/manifold/src/cross_section.o", obj_root);
         nob_da_append(&objects, obj);
-        if (!compile_object_if_needed(manifold_cross_section_source, obj, true, clipper2.include_dir)) return 1;
+        if (!compile_object_if_needed(manifold_cross_section_source, obj, true, clipper2.include_dir, NULL)) return 1;
 
         for (size_t i = 0; i < NOB_ARRAY_LEN(clipper2.sources); ++i) {
             const char *src = clipper2.sources[i];
@@ -155,7 +287,7 @@ int main(int argc, char **argv) {
                                                 (int)(strlen(base_name) - sizeof(".cpp") + 1),
                                                 base_name);
             nob_da_append(&objects, obj2);
-            if (!compile_object_if_needed(src, obj2, true, clipper2.include_dir)) return 1;
+            if (!compile_object_if_needed(src, obj2, true, clipper2.include_dir, NULL)) return 1;
         }
     }
 
