@@ -54,6 +54,7 @@ enum class OpCode : uint16_t {
   CrossPoint = 105,
   CrossPolygons = 106,
   CrossFillet = 107,
+  CrossOffsetClone = 108,
 };
 
 enum class NodeKind : uint32_t {

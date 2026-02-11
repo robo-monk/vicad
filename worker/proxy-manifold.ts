@@ -349,6 +349,20 @@ export class CrossSection {
     return new CrossSection(out);
   }
 
+  offsetClone(delta: number) {
+    const d = Number(delta);
+    if (!Number.isFinite(d)) {
+      throw new Error("CrossSection.offsetClone requires a finite delta.");
+    }
+    const out = reg.allocNodeId();
+    reg.push(OP.CROSS_OFFSET_CLONE, makePayload([
+      { t: "u32", v: out },
+      { t: "u32", v: this.nodeId },
+      { t: "f64", v: d },
+    ]));
+    return new CrossSection(out);
+  }
+
   scale(): never {
     return unsupported("CrossSection.scale");
   }

@@ -1083,7 +1083,7 @@ static void draw_dimension_label_world(const Vec3 &anchor,
                                        float r, float g, float b, float a,
                                        bool center_x) {
     if (!text || !text[0]) return;
-    const float label_world_scale = world_scale * kDimensionLabelScale;
+    const float label_world_scale = world_scale * kDimensionLabelScale * 0.25f;
     Vec3 origin = anchor;
     if (center_x) {
         origin = add(origin, mul(axis_right, -0.5f * text_width_world(text, label_world_scale)));
@@ -1111,10 +1111,18 @@ static void draw_dimension_arrowheads_world(const Vec3 &a,
     const float arrow_half_w = arrow_len * 0.52f;
     const Vec3 tail_a = add(a, mul(dir, arrow_len));
     const Vec3 tail_b = add(b, mul(dir, -arrow_len));
-    draw_world_line(a, add(tail_a, mul(side, arrow_half_w)));
-    draw_world_line(a, add(tail_a, mul(side, -arrow_half_w)));
-    draw_world_line(b, add(tail_b, mul(side, arrow_half_w)));
-    draw_world_line(b, add(tail_b, mul(side, -arrow_half_w)));
+    const Vec3 a_left = add(tail_a, mul(side, arrow_half_w));
+    const Vec3 a_right = add(tail_a, mul(side, -arrow_half_w));
+    const Vec3 b_left = add(tail_b, mul(side, arrow_half_w));
+    const Vec3 b_right = add(tail_b, mul(side, -arrow_half_w));
+    glBegin(GL_TRIANGLES);
+    glVertex3f(a.x, a.y, a.z);
+    glVertex3f(a_left.x, a_left.y, a_left.z);
+    glVertex3f(a_right.x, a_right.y, a_right.z);
+    glVertex3f(b.x, b.y, b.z);
+    glVertex3f(b_right.x, b_right.y, b_right.z);
+    glVertex3f(b_left.x, b_left.y, b_left.z);
+    glEnd();
 }
 
 static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
@@ -1190,7 +1198,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const Vec3 a3 = vec3_from_2d(a2, z);
         const Vec3 b3 = vec3_from_2d(b2, z);
         draw_world_line(a3, b3);
-        draw_dimension_arrowheads_world(a3, b3, facing_normal, world_scale * 6.0f);
+        draw_dimension_arrowheads_world(a3, b3, facing_normal, world_scale * 3.0f);
         const Vec3 mid = mul(add(a3, b3), 0.5f);
         if (kind == SketchDimShapeKind::Point) {
             std::snprintf(text, sizeof(text), "P(%.3g, %.3g)", (double)c_center.x, (double)c_center.y);
@@ -1239,8 +1247,8 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
 
         draw_world_line(w03, w13);
         draw_world_line(h03, h13);
-        draw_dimension_arrowheads_world(w03, w13, facing_normal, world_scale * 6.0f);
-        draw_dimension_arrowheads_world(h03, h13, facing_normal, world_scale * 6.0f);
+        draw_dimension_arrowheads_world(w03, w13, facing_normal, world_scale * 3.0f);
+        draw_dimension_arrowheads_world(h03, h13, facing_normal, world_scale * 3.0f);
         draw_world_line(p03, w03);
         draw_world_line(p13, w13);
         draw_world_line(p13, h03);

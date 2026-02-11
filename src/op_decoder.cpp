@@ -312,9 +312,47 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
           *error = "Replay failed: invalid cross fillet payload.";
           return false;
         }
+        if (radius < 0.0) {
+          *error = "Replay failed: cross fillet radius must be >= 0.";
+          return false;
+        }
         manifold::CrossSection in_c;
         if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
-        c_nodes[out_id] = in_c.Offset(radius, manifold::CrossSection::JoinType::Round);
+        if (radius == 0.0) {
+          c_nodes[out_id] = in_c;
+          has_c[out_id] = true;
+          break;
+        }
+        // Fillet without global growth: inset first, then regrow with round joins.
+        // Strict failure semantics: do not clamp or silently reduce radius.
+        manifold::CrossSection inset = in_c.Offset(-radius, manifold::CrossSection::JoinType::Miter);
+        if (inset.IsEmpty()) {
+          *error = "Replay failed: fillet radius is too large for this cross-section.";
+          return false;
+        }
+        manifold::CrossSection rounded = inset.Offset(radius, manifold::CrossSection::JoinType::Round);
+        if (rounded.IsEmpty()) {
+          *error = "Replay failed: fillet operation produced an empty cross-section.";
+          return false;
+        }
+        c_nodes[out_id] = std::move(rounded);
+        has_c[out_id] = true;
+      } break;
+      case OpCode::CrossOffsetClone: {
+        uint32_t in_id = 0;
+        double delta = 0.0;
+        if (!read_u32(&payload, &in_id) || !read_f64(&payload, &delta)) {
+          *error = "Replay failed: invalid cross offset clone payload.";
+          return false;
+        }
+        manifold::CrossSection in_c;
+        if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
+        manifold::CrossSection out_c = in_c.Offset(delta, manifold::CrossSection::JoinType::Miter);
+        if (out_c.IsEmpty()) {
+          *error = "Replay failed: offsetClone produced an empty cross-section.";
+          return false;
+        }
+        c_nodes[out_id] = std::move(out_c);
         has_c[out_id] = true;
       } break;
       case OpCode::Extrude: {

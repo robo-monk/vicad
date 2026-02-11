@@ -70,3 +70,41 @@ describe("CrossSection.fillet", () => {
     expect(() => square.fillet(Number.POSITIVE_INFINITY)).toThrow("CrossSection.fillet requires a finite radius >= 0.");
   });
 });
+
+describe("CrossSection.offsetClone", () => {
+  it("encodes CROSS_OFFSET_CLONE with inId and delta", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(10);
+    const offset = square.offsetClone(2.5);
+    vicad.addSketch(offset, { name: "offset-test" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(2);
+    expect(ops[1].opcode).toBe(OP.CROSS_OFFSET_CLONE);
+
+    const payload = ops[1].payload;
+    expect(payload.byteLength).toBe(16);
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const outId = view.getUint32(0, true);
+    const inId = view.getUint32(4, true);
+    const delta = view.getFloat64(8, true);
+    expect(outId).toBe(offset.nodeId);
+    expect(inId).toBe(square.nodeId);
+    expect(delta).toBe(2.5);
+  });
+
+  it("accepts negative finite delta", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(5);
+    const offset = square.offsetClone(-0.25);
+    expect(offset.nodeId).not.toBe(square.nodeId);
+  });
+
+  it("rejects NaN and Infinity delta", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(5);
+    expect(() => square.offsetClone(Number.NaN)).toThrow("CrossSection.offsetClone requires a finite delta.");
+    expect(() => square.offsetClone(Number.NEGATIVE_INFINITY)).toThrow("CrossSection.offsetClone requires a finite delta.");
+  });
+});

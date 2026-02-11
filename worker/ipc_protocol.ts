@@ -65,6 +65,7 @@ export const OP = {
   CROSS_POINT: 105,
   CROSS_POLYGONS: 106,
   CROSS_FILLET: 107,
+  CROSS_OFFSET_CLONE: 108,
 } as const;
 
 export type OpCode = (typeof OP)[keyof typeof OP];
