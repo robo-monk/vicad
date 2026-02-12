@@ -11,3 +11,6 @@ bun.lock
 *.log
 *.tmp
 .DS_Store
+
+# Generated exports
+vicad-export-*.3mf

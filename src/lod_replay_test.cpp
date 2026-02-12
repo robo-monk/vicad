@@ -197,20 +197,20 @@ int main() {
   }
 
   {
-    // Explicit segment override must be stable across profiles.
+    // Any encoded segment field is ignored; profile-driven auto LOD is canonical.
     std::vector<uint8_t> rec;
     append_record(&rec, vicad::OpCode::Sphere, payload_sphere(1, 20.0, 64));
 
     manifold::MeshGL d, m, e;
     std::string err;
     ok = ok && require(replay_to_mesh(rec, 1, 1, vicad::LodProfile::Draft, &d, &err),
-                       "explicit sphere draft");
+                       "ignored explicit sphere draft");
     ok = ok && require(replay_to_mesh(rec, 1, 1, vicad::LodProfile::Model, &m, &err),
-                       "explicit sphere model");
+                       "ignored explicit sphere model");
     ok = ok && require(replay_to_mesh(rec, 1, 1, vicad::LodProfile::Export3MF, &e, &err),
-                       "explicit sphere export");
-    ok = ok && require(d.NumTri() == m.NumTri() && m.NumTri() == e.NumTri(),
-                       "explicit segments unchanged across profiles");
+                       "ignored explicit sphere export");
+    ok = ok && require(d.NumTri() < m.NumTri() && m.NumTri() < e.NumTri(),
+                       "profile LOD wins even when segment field is non-zero");
   }
 
   {

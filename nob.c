@@ -26,12 +26,20 @@ static const char *manifold_sources[] = {
 static const char *manifold_cross_section_source = "manifold/src/cross_section/cross_section.cpp";
 static const char *manifold_meshio_source = "manifold/src/meshIO/meshIO.cpp";
 static const char *app_sources[] = {
+    "src/app_state.cpp",
     "src/main.cpp",
     "src/edge_detection.cpp",
     "src/face_detection.cpp",
+    "src/input_controller.cpp",
     "src/lod_policy.cpp",
     "src/op_decoder.cpp",
+    "src/op_reader.cpp",
+    "src/op_trace.cpp",
+    "src/render_scene.cpp",
+    "src/render_ui.cpp",
     "src/script_worker_client.cpp",
+    "src/scene_runtime.cpp",
+    "src/sketch_semantics.cpp",
     "src/sketch_dimensions.cpp",
 };
 static const char *font_baker_tool_source = "tools/font_baker.c";
@@ -67,6 +75,21 @@ typedef struct {
     const char *lib_zlib;
     bool found;
 } AssimpInfo;
+
+typedef struct {
+    bool asan;
+    bool asan_deps;
+} BuildOptions;
+
+static void append_sanitizer_flags(Nob_Cmd *cmd, BuildOptions opt) {
+    if (!opt.asan) return;
+    nob_cmd_append(cmd,
+                   "-O1",
+                   "-g",
+                   "-fno-omit-frame-pointer",
+                   "-fsanitize=address,undefined",
+                   "-fno-sanitize-recover=all");
+}
 
 static bool file_mtime_ns(const char *path, long long *out_ns) {
     struct stat st;
@@ -232,7 +255,9 @@ static bool compile_object_if_needed(const char *src_path,
                                      const char *clipper_include_dir,
                                      bool enable_meshio,
                                      const AssimpInfo *assimp,
-                                     const char *extra_dependency) {
+                                     const char *extra_dependency,
+                                     BuildOptions opt,
+                                     bool sanitize_this_object) {
     int rebuild = 0;
     if (extra_dependency != NULL && extra_dependency[0] != '\0') {
         const char *deps[2] = {src_path, extra_dependency};
@@ -261,6 +286,7 @@ static bool compile_object_if_needed(const char *src_path,
                    src_path,
                    "-o",
                    obj_path);
+    if (sanitize_this_object) append_sanitizer_flags(&cmd, opt);
     if (enable_cross_section && clipper_include_dir != NULL) {
         nob_cmd_append(&cmd, nob_temp_sprintf("-I%s", clipper_include_dir));
     }
@@ -377,12 +403,40 @@ static bool bake_funnel_sans_header(const char *baker_bin_path, const char *head
 
 int main(int argc, char **argv) {
     NOB_GO_REBUILD_URSELF(argc, argv);
+    BuildOptions opt = {0};
+    argc--;
+    argv++;
+
+    while (argc > 0) {
+        const char *arg = nob_shift_args(&argc, &argv);
+        if (strcmp(arg, "--asan") == 0) {
+            opt.asan = true;
+        } else if (strcmp(arg, "--asan-deps") == 0) {
+            opt.asan_deps = true;
+        } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
+            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps]");
+            nob_log(NOB_INFO, "  --asan  Build vicad with ASan+UBSan instrumentation.");
+            nob_log(NOB_INFO, "  --asan-deps  Also instrument manifold/clipper dependencies (requires --asan).");
+            return 0;
+        } else {
+            nob_log(NOB_ERROR, "Unknown argument: %s", arg);
+            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps]");
+            return 1;
+        }
+    }
+    if (opt.asan_deps && !opt.asan) {
+        nob_log(NOB_ERROR, "--asan-deps requires --asan");
+        return 1;
+    }
 
     const Clipper2Info clipper2 = detect_clipper2();
     const AssimpInfo assimp = detect_assimp();
     const bool enable_cross_section = clipper2.found;
     const bool enable_meshio = assimp.found;
     const char *build_tag = enable_cross_section ? "cross_section" : "base";
+    if (opt.asan) {
+        build_tag = nob_temp_sprintf("%s_asan", build_tag);
+    }
     const char *obj_root = nob_temp_sprintf("build/obj_%s", build_tag);
     const char *binary_mode_path = nob_temp_sprintf("build/vicad_%s", build_tag);
     const char *font_baker_bin = "build/font_baker/font_baker";
@@ -403,6 +457,14 @@ int main(int argc, char **argv) {
                 "Assimp not found at %s; building without meshIO export support. "
                 "Set ASSIMP_DIR to your clone root to enable it.",
                 assimp.root);
+    }
+    if (opt.asan) {
+        nob_log(NOB_INFO, "Sanitizers enabled (ASan+UBSan).");
+        if (opt.asan_deps) {
+            nob_log(NOB_INFO, "Dependency sanitizers enabled.");
+        } else {
+            nob_log(NOB_INFO, "Dependency sanitizers disabled; pass --asan-deps to enable.");
+        }
     }
 
     if (!nob_mkdir_if_not_exists("build")) return 1;
@@ -432,7 +494,7 @@ int main(int argc, char **argv) {
         nob_da_append(&objects, obj);
         const char *extra_dep = strcmp(src, "src/main.cpp") == 0 ? baked_font_header : NULL;
         if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir,
-                                      enable_meshio, &assimp, extra_dep)) return 1;
+                                      enable_meshio, &assimp, extra_dep, opt, opt.asan)) return 1;
     }
 
     for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
@@ -444,7 +506,7 @@ int main(int argc, char **argv) {
                                            base);
         nob_da_append(&objects, obj);
         if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir,
-                                      enable_meshio, &assimp, NULL)) return 1;
+                                      enable_meshio, &assimp, NULL, opt, opt.asan && opt.asan_deps)) return 1;
     }
 
     if (enable_meshio) {
@@ -452,14 +514,14 @@ int main(int argc, char **argv) {
         nob_da_append(&objects, obj);
         const char *meshio_dep = nob_temp_sprintf("%s/assimp/config.h", assimp.include_build_dir);
         if (!compile_object_if_needed(manifold_meshio_source, obj, enable_cross_section, clipper2.include_dir,
-                                      true, &assimp, meshio_dep)) return 1;
+                                      true, &assimp, meshio_dep, opt, opt.asan && opt.asan_deps)) return 1;
     }
 
     if (enable_cross_section) {
         const char *obj = nob_temp_sprintf("%s/manifold/src/cross_section.o", obj_root);
         nob_da_append(&objects, obj);
         if (!compile_object_if_needed(manifold_cross_section_source, obj, true, clipper2.include_dir,
-                                      enable_meshio, &assimp, NULL)) return 1;
+                                      enable_meshio, &assimp, NULL, opt, opt.asan && opt.asan_deps)) return 1;
 
         for (size_t i = 0; i < NOB_ARRAY_LEN(clipper2.sources); ++i) {
             const char *src = clipper2.sources[i];
@@ -470,7 +532,7 @@ int main(int argc, char **argv) {
                                                 base_name);
             nob_da_append(&objects, obj2);
             if (!compile_object_if_needed(src, obj2, true, clipper2.include_dir,
-                                          enable_meshio, &assimp, NULL)) return 1;
+                                          enable_meshio, &assimp, NULL, opt, opt.asan && opt.asan_deps)) return 1;
         }
     }
 
@@ -490,6 +552,7 @@ int main(int argc, char **argv) {
                 nob_cmd_append(&cmd, assimp.lib_zlib);
             }
         }
+        append_sanitizer_flags(&cmd, opt);
 
 #ifdef __APPLE__
         nob_cmd_append(&cmd,
@@ -515,5 +578,9 @@ int main(int argc, char **argv) {
     }
 
     nob_log(NOB_INFO, "Ready build/vicad (%s mode)", build_tag);
+    if (opt.asan) {
+        nob_log(NOB_INFO,
+                "Run leak checks with: ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build/vicad");
+    }
     return 0;
 }

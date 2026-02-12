@@ -20,6 +20,11 @@
 #include "../RGFW.h"
 #include "edge_detection.h"
 #include "face_detection.h"
+#include "app_state.h"
+#include "input_controller.h"
+#include "render_scene.h"
+#include "render_ui.h"
+#include "scene_runtime.h"
 #include "script_worker_client.h"
 #include "manifold/manifold.h"
 #include "manifold/cross_section.h"
@@ -43,52 +48,12 @@
 #include "../clay.h"
 #include "funnel_sans_baked.h"
 
-struct Vec3 {
-    float x;
-    float y;
-    float z;
-};
-
-struct Vec2 {
-    float x;
-    float y;
-};
-
-struct FaceSelectState {
-    bool enabled;
-    bool dirty;
-    float angleThresholdDeg;
-    int hoveredRegion;
-    int selectedRegion;
-    vicad::FaceDetectionResult faces;
-};
-
-struct EdgeSelectState {
-    bool enabled;
-    bool dirtyTopology;
-    bool dirtySilhouette;
-    float sharpAngleDeg;
-    int hoveredEdge;
-    int selectedEdge;
-    int hoveredChain;
-    int selectedChain;
-    vicad::EdgeDetectionResult edges;
-    vicad::SilhouetteResult silhouette;
-};
-
-struct CameraBasis {
-    Vec3 forward;
-    Vec3 right;
-    Vec3 up;
-};
-
-struct DimensionRenderContext {
-    Vec3 eye;
-    CameraBasis camera;
-    float fovDegrees;
-    int viewportHeight;
-    float arrowPixels;
-};
+using vicad_app::Vec2;
+using vicad_app::Vec3;
+using vicad_app::FaceSelectState;
+using vicad_app::EdgeSelectState;
+using vicad_app::CameraBasis;
+using vicad_app::DimensionRenderContext;
 
 struct ClayUiState {
     Clay_Arena arena;
@@ -334,51 +299,13 @@ static void clay_render_commands(Clay_RenderCommandArray cmds, i32 pixel_width, 
     glMatrixMode(GL_MODELVIEW);
 }
 
-static Vec3 add(const Vec3 &a, const Vec3 &b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-
-static Vec3 mul(const Vec3 &v, float s) {
-    return {v.x * s, v.y * s, v.z * s};
-}
-
-static Vec3 sub(const Vec3 &a, const Vec3 &b) {
-    return {a.x - b.x, a.y - b.y, a.z - b.z};
-}
-
-static Vec3 cross(const Vec3 &a, const Vec3 &b) {
-    return {
-        a.y * b.z - a.z * b.y,
-        a.z * b.x - a.x * b.z,
-        a.x * b.y - a.y * b.x,
-    };
-}
-
-static Vec3 normalize(const Vec3 &v) {
-    const float len2 = v.x * v.x + v.y * v.y + v.z * v.z;
-    if (len2 <= 1e-8f) return {0.0f, 0.0f, 1.0f};
-
-    const float inv_len = 1.0f / std::sqrt(len2);
-    return {v.x * inv_len, v.y * inv_len, v.z * inv_len};
-}
-
-static float dot(const Vec3 &a, const Vec3 &b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-static float clampf(float v, float lo, float hi) {
-    if (v < lo) return lo;
-    if (v > hi) return hi;
-    return v;
-}
-
-static float compute_display_scale(i32 pixel_w, i32 pixel_h, i32 window_w, i32 window_h) {
-    float sx = 1.0f;
-    float sy = 1.0f;
-    if (window_w > 0 && pixel_w > 0) sx = (float)pixel_w / (float)window_w;
-    if (window_h > 0 && pixel_h > 0) sy = (float)pixel_h / (float)window_h;
-    return clampf((sx + sy) * 0.5f, 1.0f, 4.0f);
-}
+using vicad_app::add;
+using vicad_app::mul;
+using vicad_app::sub;
+using vicad_app::cross;
+using vicad_app::normalize;
+using vicad_app::dot;
+using vicad_app::clampf;
 
 static CameraBasis camera_basis(const Vec3 &eye, const Vec3 &target) {
     CameraBasis basis = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
@@ -769,15 +696,6 @@ static bool selected_scene_object_bounds(const std::vector<vicad::ScriptSceneObj
     return true;
 }
 
-static const char *scene_object_kind_name(vicad::ScriptSceneObjectKind kind) {
-    switch (kind) {
-        case vicad::ScriptSceneObjectKind::Manifold: return "Manifold";
-        case vicad::ScriptSceneObjectKind::CrossSection: return "CrossSection";
-        case vicad::ScriptSceneObjectKind::Unknown:
-        default: return "Unknown";
-    }
-}
-
 static std::string format_op_trace_entry(const vicad::OpTraceEntry &entry) {
     std::ostringstream ss;
     ss << entry.name << "(";
@@ -862,19 +780,14 @@ enum class SketchDimShapeKind {
     Polygon,
 };
 
-static Vec2 add2(const Vec2 &a, const Vec2 &b) { return {a.x + b.x, a.y + b.y}; }
-static Vec2 sub2v(const Vec2 &a, const Vec2 &b) { return {a.x - b.x, a.y - b.y}; }
-static Vec2 mul2(const Vec2 &v, float s) { return {v.x * s, v.y * s}; }
-static float dot2(const Vec2 &a, const Vec2 &b) { return a.x * b.x + a.y * b.y; }
-static float length2(const Vec2 &v) { return std::sqrt(dot2(v, v)); }
-static Vec2 normalize2(const Vec2 &v) {
-    const float len = length2(v);
-    if (len <= 1e-6f) return {0.0f, 0.0f};
-    return {v.x / len, v.y / len};
-}
-static Vec2 perp2(const Vec2 &v) { return {-v.y, v.x}; }
-
-static Vec3 vec3_from_2d(const Vec2 &v, float z) { return {v.x, v.y, z}; }
+using vicad_app::add2;
+using vicad_app::sub2v;
+using vicad_app::mul2;
+using vicad_app::dot2;
+using vicad_app::length2;
+using vicad_app::normalize2;
+using vicad_app::perp2;
+using vicad_app::vec3_from_2d;
 
 static void contour_plane_axes(const vicad::ScriptSketchContour &contour,
                                Vec3 *out_right,
@@ -2048,26 +1961,6 @@ static bool export_mesh_to_3mf_native(const char *out_path, const manifold::Mesh
     return true;
 }
 
-static std::string make_export_3mf_filename(void) {
-    std::time_t now = std::time(nullptr);
-    std::tm tmv = {};
-#if defined(_WIN32)
-    localtime_s(&tmv, &now);
-#else
-    localtime_r(&now, &tmv);
-#endif
-    char buf[128];
-    std::snprintf(buf, sizeof(buf),
-                  "vicad-export-%04d%02d%02d-%02d%02d%02d.3mf",
-                  tmv.tm_year + 1900,
-                  tmv.tm_mon + 1,
-                  tmv.tm_mday,
-                  tmv.tm_hour,
-                  tmv.tm_min,
-                  tmv.tm_sec);
-    return std::string(buf);
-}
-
 static bool export_script_scene_3mf(vicad::ScriptWorkerClient *worker_client,
                                     const char *script_path,
                                     const char *out_path,
@@ -2080,12 +1973,29 @@ static bool export_script_scene_3mf(vicad::ScriptWorkerClient *worker_client,
         if (error) *error = "Script path is empty.";
         return false;
     }
-    manifold::MeshGL export_mesh;
+    std::vector<vicad::ScriptSceneObject> scene_objects;
     vicad::ReplayLodPolicy lod_policy = {};
     lod_policy.profile = vicad::LodProfile::Export3MF;
-    if (!worker_client->ExecuteScript(script_path, &export_mesh, error, lod_policy)) {
+    if (!worker_client->ExecuteScriptScene(script_path, &scene_objects, error, lod_policy)) {
         return false;
     }
+    std::vector<manifold::Manifold> parts;
+    parts.reserve(scene_objects.size());
+    for (const vicad::ScriptSceneObject &obj : scene_objects) {
+        if (obj.kind == vicad::ScriptSceneObjectKind::Manifold) {
+            parts.push_back(obj.manifold);
+        }
+    }
+    if (parts.empty()) {
+        if (error) *error = "Worker returned no manifold scene objects.";
+        return false;
+    }
+    manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
+    if (merged.Status() != manifold::Manifold::Error::NoError) {
+        if (error) *error = "Failed to merge scene objects for mesh export.";
+        return false;
+    }
+    manifold::MeshGL export_mesh = merged.GetMeshGL();
     return export_mesh_to_3mf_native(out_path, export_mesh, error);
 }
 
@@ -2106,7 +2016,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                                              const EdgeSelectState &edge_select,
                                              const std::string &export_status_line,
                                              bool export_status_ok) {
-    const float hud = clampf(hud_scale, 0.75f, 3.0f);
+    const float hud = vicad_render_ui::ClampHudScale(hud_scale);
     const int root_pad = (int)std::lround(16.0f * hud);
     int panel_w = (int)std::lround(320.0f * hud);
     if (panel_w > width - root_pad * 2) panel_w = width - root_pad * 2;
@@ -2210,7 +2120,7 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
         char tmp[256];
         std::snprintf(tmp, sizeof(tmp), "Name: %s", info_object->name.c_str());
         info_lines.push_back(tmp);
-        std::snprintf(tmp, sizeof(tmp), "Kind: %s", scene_object_kind_name(info_object->kind));
+        std::snprintf(tmp, sizeof(tmp), "Kind: %s", vicad_render_scene::SceneObjectKindName(info_object->kind));
         info_lines.push_back(tmp);
         std::snprintf(tmp, sizeof(tmp), "Object ID: %llx", (unsigned long long)info_object->objectId);
         info_lines.push_back(tmp);
@@ -2771,7 +2681,7 @@ int main() {
                         point_in_rect(mouse_ui_x, mouse_ui_y,
                                       (int)g_ui.exportButtonData.boundingBox.x, (int)g_ui.exportButtonData.boundingBox.y,
                                       (int)g_ui.exportButtonData.boundingBox.width, (int)g_ui.exportButtonData.boundingBox.height)) {
-                        const std::string out_name = make_export_3mf_filename();
+                        const std::string out_name = vicad_runtime::MakeExport3mfFilename();
                         std::string export_error;
                         if (export_script_scene_3mf(&worker_client, script_path, out_name.c_str(), &export_error)) {
                             export_status_ok = true;
@@ -2865,7 +2775,7 @@ int main() {
 
         if (height <= 0) height = 1;
         if (ui_height <= 0) ui_height = 1;
-        const float display_scale = compute_display_scale(width, height, window_w, window_h);
+        const float display_scale = vicad_input::ComputeDisplayScale(width, height, window_w, window_h);
         const float hud_scale = kHudBaseScale * display_scale;
         ui_scale = 1.0f;
         glViewport(0, 0, width, height);

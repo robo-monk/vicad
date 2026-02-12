@@ -51,10 +51,6 @@ class ScriptWorkerClient {
   ScriptWorkerClient(const ScriptWorkerClient &) = delete;
   ScriptWorkerClient &operator=(const ScriptWorkerClient &) = delete;
 
-  // Replays scene operations to geometry using the provided LOD policy.
-  bool ExecuteScript(const char *script_path, manifold::MeshGL *mesh,
-                     std::string *error,
-                     const ReplayLodPolicy &lod_policy = {});
   bool ExecuteScriptScene(const char *script_path,
                           std::vector<ScriptSceneObject> *objects,
                           std::string *error,

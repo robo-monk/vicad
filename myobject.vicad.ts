@@ -9,8 +9,8 @@ const $2D = CrossSection;
 // setMinCircularEdgeLength(0.1);
 
 // const bead1 =
-//     revolve(circle(beadRadius, 200).translate([outerRadius, 0]), 50, 90)
-//         .add(sphere(beadRadius, 200).translate([outerRadius, 0, 0]))
+//     revolve(circle(beadRadius).translate([outerRadius, 0]), 90)
+//         .add(sphere(beadRadius).translate([outerRadius, 0, 0]))
 //         .translate([0, -outerRadius, 0]);
 
 // const beads = [];
@@ -31,7 +31,7 @@ const $2D = CrossSection;
 // const tri = $2D.polygon([
 //     [0, 0], [3, 0], [1.5, 2],
 //   ]);
-// const point = $2D.point(10, 10, 0.01);
+// const point = $2D.point([10, 10], 0.01);
 // const result = extrude(circle.subtract(square), 10, 200, 0);
 
 // vicad.addSketch(circle);

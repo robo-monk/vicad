@@ -231,10 +231,22 @@ bool ScriptWorkerClient::AcceptWorker(std::string *error) {
 
 bool ScriptWorkerClient::Start(std::string *error) {
   if (started_) return true;
-  if (!CreateSharedMemory(error)) return false;
-  if (!CreateSocket(error)) return false;
-  if (!SpawnWorker(error)) return false;
-  if (!AcceptWorker(error)) return false;
+  if (!CreateSharedMemory(error)) {
+    Shutdown();
+    return false;
+  }
+  if (!CreateSocket(error)) {
+    Shutdown();
+    return false;
+  }
+  if (!SpawnWorker(error)) {
+    Shutdown();
+    return false;
+  }
+  if (!AcceptWorker(error)) {
+    Shutdown();
+    return false;
+  }
   started_ = true;
   return true;
 }
@@ -269,33 +281,14 @@ bool ScriptWorkerClient::ReadLineWithTimeout(int timeout_ms, std::string *out, s
   }
 }
 
-bool ScriptWorkerClient::ExecuteScript(const char *script_path, manifold::MeshGL *mesh,
-                                       std::string *error,
-                                       const ReplayLodPolicy &lod_policy) {
-  std::vector<ScriptSceneObject> scene_objects;
-  if (!ExecuteScriptScene(script_path, &scene_objects, error, lod_policy)) return false;
-  std::vector<manifold::Manifold> parts;
-  parts.reserve(scene_objects.size());
-  for (const ScriptSceneObject &obj : scene_objects) {
-    if (obj.kind == ScriptSceneObjectKind::Manifold) {
-      parts.push_back(obj.manifold);
-    }
-  }
-  if (parts.empty()) {
-    return set_err(error, "Worker returned no manifold scene objects.");
-  }
-  manifold::Manifold merged = manifold::Manifold::BatchBoolean(parts, manifold::OpType::Add);
-  if (merged.Status() != manifold::Manifold::Error::NoError) {
-    return set_err(error, "Failed to merge scene objects for mesh output.");
-  }
-  *mesh = merged.GetMeshGL();
-  return true;
-}
-
 bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
                                             std::vector<ScriptSceneObject> *objects,
                                             std::string *error,
                                             const ReplayLodPolicy &lod_policy) {
+  // The Bun worker uses dynamic ESM imports for every run, and those modules are
+  // retained in the process module cache. Restarting the worker per run keeps
+  // memory usage bounded across repeated script reloads.
+  if (started_) Shutdown();
   if (!Start(error)) return false;
   if (!script_path || !objects) return set_err(error, "Invalid execute arguments.");
   objects->clear();

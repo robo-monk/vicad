@@ -207,13 +207,15 @@ export class CrossSection {
     this.nodeId = nodeId;
   }
 
-  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
-  static circle(radius = 1, circularSegments = 0) {
+  static circle(radius = 1) {
+    if (arguments.length > 1) {
+      throw new Error("CrossSection.circle only accepts (radius).");
+    }
     const out = reg.allocNodeId();
     reg.push(OP.CROSS_CIRCLE, makePayload([
       { t: "u32", v: out },
       { t: "f64", v: radius },
-      { t: "u32", v: circularSegments },
+      { t: "u32", v: 0 },
     ]));
     return new CrossSection(out);
   }
@@ -256,30 +258,21 @@ export class CrossSection {
     return new CrossSection(out);
   }
 
-  // Explicit segment arguments are legacy compatibility; profile-driven auto LOD
-  // is used when the encoded value is <= 2.
-  static point(positionOrX: number | Vec2Like = [0, 0], yOrRadius?: number, radiusOrSegments = 0.1, circularSegments = 12) {
-    let x = 0;
-    let y = 0;
-    let radius = 0.1;
-    let segments = 12;
-    if (Array.isArray(positionOrX)) {
-      [x, y] = vec2(positionOrX);
-      radius = Number(yOrRadius ?? 0.1);
-      segments = Math.max(0, Math.floor(Number(radiusOrSegments)));
-    } else {
-      x = Number(positionOrX);
-      y = Number(yOrRadius ?? 0);
-      radius = Number(radiusOrSegments);
-      segments = Math.max(0, Math.floor(Number(circularSegments)));
+  static point(position: Vec2Like = [0, 0], radius = 0.1) {
+    if (arguments.length > 2) {
+      throw new Error("CrossSection.point only accepts (position, radius).");
     }
+    if (!Array.isArray(position)) {
+      throw new Error("CrossSection.point requires position as [x, y].");
+    }
+    const [x, y] = vec2(position);
     const out = reg.allocNodeId();
     reg.push(OP.CROSS_POINT, makePayload([
       { t: "u32", v: out },
       { t: "f64", v: x },
       { t: "f64", v: y },
       { t: "f64", v: radius },
-      { t: "u32", v: segments },
+      { t: "u32", v: 0 },
     ]));
     return new CrossSection(out);
   }
@@ -377,13 +370,15 @@ export class Manifold {
     this.nodeId = nodeId;
   }
 
-  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
-  static sphere(radius = 1, circularSegments = 0) {
+  static sphere(radius = 1) {
+    if (arguments.length > 1) {
+      throw new Error("Manifold.sphere only accepts (radius).");
+    }
     const out = reg.allocNodeId();
     reg.push(OP.SPHERE, makePayload([
       { t: "u32", v: out },
       { t: "f64", v: radius },
-      { t: "u32", v: circularSegments },
+      { t: "u32", v: 0 },
     ]));
     return new Manifold(out);
   }
@@ -401,15 +396,17 @@ export class Manifold {
     return new Manifold(out);
   }
 
-  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
-  static cylinder(height: number, radiusLow: number, radiusHigh = -1, circularSegments = 0, center = false) {
+  static cylinder(height: number, radiusLow: number, radiusHigh = -1, center = false) {
+    if (arguments.length > 4) {
+      throw new Error("Manifold.cylinder only accepts (height, radiusLow, radiusHigh?, center?).");
+    }
     const out = reg.allocNodeId();
     reg.push(OP.CYLINDER, makePayload([
       { t: "u32", v: out },
       { t: "f64", v: height },
       { t: "f64", v: radiusLow },
       { t: "f64", v: radiusHigh },
-      { t: "u32", v: circularSegments },
+      { t: "u32", v: 0 },
       { t: "u32", v: center ? 1 : 0 },
     ]));
     return new Manifold(out);
@@ -436,13 +433,15 @@ export class Manifold {
     return new Manifold(out);
   }
 
-  // `circularSegments` is a legacy explicit override. Prefer profile-driven auto LOD.
-  static revolve(crossSection: CrossSection, circularSegments = 0, revolveDegrees = 360) {
+  static revolve(crossSection: CrossSection, revolveDegrees = 360) {
+    if (arguments.length > 2) {
+      throw new Error("Manifold.revolve only accepts (crossSection, revolveDegrees?).");
+    }
     const out = reg.allocNodeId();
     reg.push(OP.REVOLVE, makePayload([
       { t: "u32", v: out },
       { t: "u32", v: crossSection.nodeId },
-      { t: "u32", v: circularSegments },
+      { t: "u32", v: 0 },
       { t: "f64", v: revolveDegrees },
     ]));
     return new Manifold(out);
@@ -564,26 +563,6 @@ export const vicad = {
 
 export function __vicadBeginRun() {
   reg.reset();
-}
-
-export function __vicadEncodeDefault(value: unknown) {
-  if (value instanceof Manifold) {
-    return {
-      rootKind: NODE_KIND.MANIFOLD,
-      rootId: value.nodeId,
-      opCount: reg.ops.length,
-      records: encodeOps(reg.ops),
-    };
-  }
-  if (value instanceof GLTFNode && value.manifold instanceof Manifold) {
-    return {
-      rootKind: NODE_KIND.MANIFOLD,
-      rootId: value.manifold.nodeId,
-      opCount: reg.ops.length,
-      records: encodeOps(reg.ops),
-    };
-  }
-  throw new Error("Default export must resolve to Manifold or GLTFNode(manifold).");
 }
 
 export function __vicadEncodeScene() {

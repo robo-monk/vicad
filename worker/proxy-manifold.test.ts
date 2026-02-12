@@ -109,25 +109,11 @@ describe("CrossSection.offsetClone", () => {
   });
 });
 
-describe("Legacy circular segment overrides", () => {
-  it("keeps explicit sphere segment override", () => {
-    __vicadBeginRun();
-    const sphere = Manifold.sphere(10, 48);
-    vicad.addToScene(sphere, { name: "sphere-explicit" });
-
-    const scene = __vicadEncodeScene();
-    const ops = decodeOps(scene.records);
-    expect(ops.length).toBe(1);
-    expect(ops[0].opcode).toBe(OP.SPHERE);
-
-    const view = new DataView(ops[0].payload.buffer, ops[0].payload.byteOffset, ops[0].payload.byteLength);
-    expect(view.getUint32(12, true)).toBe(48);
-  });
-
-  it("encodes sphere auto mode when no explicit segments are passed", () => {
+describe("Canonical circular primitive signatures", () => {
+  it("encodes sphere with auto profile-driven segments", () => {
     __vicadBeginRun();
     const sphere = Manifold.sphere(10);
-    vicad.addToScene(sphere, { name: "sphere-auto" });
+    vicad.addToScene(sphere, { name: "sphere" });
 
     const scene = __vicadEncodeScene();
     const ops = decodeOps(scene.records);
@@ -138,10 +124,10 @@ describe("Legacy circular segment overrides", () => {
     expect(view.getUint32(12, true)).toBe(0);
   });
 
-  it("keeps explicit cylinder segment override", () => {
+  it("encodes cylinder with auto profile-driven segments", () => {
     __vicadBeginRun();
-    const cyl = Manifold.cylinder(20, 5, -1, 36, false);
-    vicad.addToScene(cyl, { name: "cylinder-explicit" });
+    const cyl = Manifold.cylinder(20, 5, -1, false);
+    vicad.addToScene(cyl, { name: "cylinder" });
 
     const scene = __vicadEncodeScene();
     const ops = decodeOps(scene.records);
@@ -149,14 +135,14 @@ describe("Legacy circular segment overrides", () => {
     expect(ops[0].opcode).toBe(OP.CYLINDER);
 
     const view = new DataView(ops[0].payload.buffer, ops[0].payload.byteOffset, ops[0].payload.byteLength);
-    expect(view.getUint32(28, true)).toBe(36);
+    expect(view.getUint32(28, true)).toBe(0);
   });
 
-  it("keeps explicit revolve segment override", () => {
+  it("encodes revolve with auto profile-driven segments", () => {
     __vicadBeginRun();
-    const profile = CrossSection.circle(5, 0);
-    const rev = Manifold.revolve(profile, 22, 360);
-    vicad.addToScene(rev, { name: "revolve-explicit" });
+    const profile = CrossSection.circle(5);
+    const rev = Manifold.revolve(profile, 360);
+    vicad.addToScene(rev, { name: "revolve" });
 
     const scene = __vicadEncodeScene();
     const ops = decodeOps(scene.records);
@@ -164,6 +150,26 @@ describe("Legacy circular segment overrides", () => {
     expect(ops[1].opcode).toBe(OP.REVOLVE);
 
     const view = new DataView(ops[1].payload.buffer, ops[1].payload.byteOffset, ops[1].payload.byteLength);
-    expect(view.getUint32(8, true)).toBe(22);
+    expect(view.getUint32(8, true)).toBe(0);
+  });
+
+  it("rejects removed overloads and explicit segment arguments", () => {
+    __vicadBeginRun();
+    expect(() => (Manifold.sphere as unknown as (...args: unknown[]) => unknown)(10, 48)).toThrow(
+      "Manifold.sphere only accepts (radius).",
+    );
+    expect(() => (Manifold.cylinder as unknown as (...args: unknown[]) => unknown)(20, 5, -1, 36, false)).toThrow(
+      "Manifold.cylinder only accepts (height, radiusLow, radiusHigh?, center?).",
+    );
+    expect(() => {
+      const profile = CrossSection.circle(5);
+      (Manifold.revolve as unknown as (...args: unknown[]) => unknown)(profile, 22, 360);
+    }).toThrow("Manifold.revolve only accepts (crossSection, revolveDegrees?).");
+    expect(() => (CrossSection.circle as unknown as (...args: unknown[]) => unknown)(5, 24)).toThrow(
+      "CrossSection.circle only accepts (radius).",
+    );
+    expect(() => (CrossSection.point as unknown as (...args: unknown[]) => unknown)(10, 10, 0.1, 12)).toThrow(
+      "CrossSection.point only accepts (position, radius).",
+    );
   });
 });
