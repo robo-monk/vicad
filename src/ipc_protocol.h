@@ -7,7 +7,7 @@
 namespace vicad {
 
 static constexpr const char kIpcMagic[8] = {'V', 'C', 'A', 'D', 'I', 'P', 'C', '1'};
-static constexpr uint32_t kIpcVersion = 2;
+static constexpr uint32_t kIpcVersion = 3;
 static constexpr size_t kDefaultShmSize = 100u * 1024u * 1024u;
 static constexpr uint32_t kDefaultRequestOffset = 4096u;
 static constexpr uint32_t kDefaultResponseOffset = 1024u * 1024u;
@@ -24,13 +24,22 @@ enum class IpcState : uint32_t {
 enum class IpcErrorCode : uint32_t {
   None = 0,
   InvalidRequest = 1,
-  SandboxViolation = 2,
-  ScriptFailure = 3,
-  EncodeFailure = 4,
-  DecodeFailure = 5,
-  ReplayFailure = 6,
-  Timeout = 7,
-  InternalError = 8,
+  ScriptFailure = 2,
+  EncodeFailure = 3,
+  DecodeFailure = 4,
+  ReplayFailure = 5,
+  Timeout = 6,
+  InternalError = 7,
+};
+
+enum class IpcErrorPhase : uint32_t {
+  Unknown = 0,
+  RequestDecode = 1,
+  ScriptLoad = 2,
+  ScriptExecute = 3,
+  SceneEncode = 4,
+  ResponseDecode = 5,
+  Transport = 6,
 };
 
 enum class OpCode : uint16_t {
@@ -113,6 +122,13 @@ struct ResponsePayloadScene {
 struct ResponsePayloadError {
   uint32_t version;
   uint32_t error_code;
+  uint32_t phase;
+  uint32_t line;
+  uint32_t column;
+  uint64_t run_id;
+  uint32_t duration_ms;
+  uint32_t file_len;
+  uint32_t stack_len;
   uint32_t message_len;
 };
 

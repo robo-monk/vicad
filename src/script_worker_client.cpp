@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,34 @@ namespace {
 bool set_err(std::string *error, const std::string &msg) {
   if (error) *error = msg;
   return false;
+}
+
+const char *phase_name(uint32_t phase) {
+  switch ((IpcErrorPhase)phase) {
+    case IpcErrorPhase::RequestDecode: return "request_decode";
+    case IpcErrorPhase::ScriptLoad: return "script_load";
+    case IpcErrorPhase::ScriptExecute: return "script_execute";
+    case IpcErrorPhase::SceneEncode: return "scene_encode";
+    case IpcErrorPhase::ResponseDecode: return "response_decode";
+    case IpcErrorPhase::Transport: return "transport";
+    case IpcErrorPhase::Unknown:
+    default: return "unknown";
+  }
+}
+
+std::string format_diagnostic_message(const ScriptExecutionDiagnostic &diag) {
+  std::string out = "phase=" + std::string(phase_name(diag.phase));
+  if (!diag.file.empty()) {
+    out += " file=" + diag.file;
+    if (diag.line > 0) {
+      out += ":" + std::to_string(diag.line);
+      if (diag.column > 0) out += ":" + std::to_string(diag.column);
+    }
+  }
+  if (diag.durationMs > 0) out += " duration_ms=" + std::to_string(diag.durationMs);
+  if (!diag.message.empty()) out += "\n" + diag.message;
+  if (!diag.stack.empty()) out += "\n" + diag.stack;
+  return out;
 }
 
 bool compute_bounds(const manifold::MeshGL &mesh, SceneVec3 *out_min, SceneVec3 *out_max) {
@@ -103,7 +132,8 @@ bool write_all(int fd, const void *buf, size_t len) {
   return true;
 }
 
-bool read_error_message(const SharedHeader *hdr, const uint8_t *base, std::string *message, std::string *error) {
+bool read_error_message(const SharedHeader *hdr, const uint8_t *base,
+                        ScriptExecutionDiagnostic *diag, std::string *error) {
   if (hdr->response_length < sizeof(ResponsePayloadError)) {
     return set_err(error, "Worker error payload is truncated.");
   }
@@ -114,9 +144,20 @@ bool read_error_message(const SharedHeader *hdr, const uint8_t *base, std::strin
   ResponsePayloadError resp = {};
   std::memcpy(&resp, payload_ptr, sizeof(resp));
   if (resp.version != kIpcVersion) return set_err(error, "Worker error payload has invalid version.");
-  const size_t total = sizeof(resp) + (size_t)resp.message_len;
+  const size_t total = sizeof(resp) + (size_t)resp.file_len + (size_t)resp.stack_len + (size_t)resp.message_len;
   if (total > hdr->response_length) return set_err(error, "Worker error message is truncated.");
-  message->assign((const char *)(payload_ptr + sizeof(resp)), (size_t)resp.message_len);
+  const uint8_t *payload = payload_ptr + sizeof(resp);
+  diag->errorCode = resp.error_code;
+  diag->phase = resp.phase;
+  diag->line = resp.line;
+  diag->column = resp.column;
+  diag->runId = resp.run_id;
+  diag->durationMs = resp.duration_ms;
+  diag->file.assign((const char *)payload, (size_t)resp.file_len);
+  payload += resp.file_len;
+  diag->stack.assign((const char *)payload, (size_t)resp.stack_len);
+  payload += resp.stack_len;
+  diag->message.assign((const char *)payload, (size_t)resp.message_len);
   return true;
 }
 
@@ -130,7 +171,8 @@ ScriptWorkerClient::ScriptWorkerClient()
       listen_fd_(-1),
       conn_fd_(-1),
       worker_pid_(-1),
-      next_seq_(1) {}
+      next_seq_(1),
+      last_diagnostic_() {}
 
 ScriptWorkerClient::~ScriptWorkerClient() { Shutdown(); }
 
@@ -197,6 +239,7 @@ bool ScriptWorkerClient::CreateSocket(std::string *error) {
 }
 
 bool ScriptWorkerClient::SpawnWorker(std::string *error) {
+  LogEvent("WORKER_STARTING", 0);
   const int pid = fork();
   if (pid < 0) {
     return set_err(error, std::string("fork failed: ") + std::strerror(errno));
@@ -208,6 +251,7 @@ bool ScriptWorkerClient::SpawnWorker(std::string *error) {
     _exit(127);
   }
   worker_pid_ = pid;
+  LogEvent("WORKER_STARTED", 0, "pid=" + std::to_string(pid));
   return true;
 }
 
@@ -226,6 +270,7 @@ bool ScriptWorkerClient::AcceptWorker(std::string *error) {
   if (conn_fd_ < 0) {
     return set_err(error, std::string("accept failed: ") + std::strerror(errno));
   }
+  LogEvent("WORKER_CONNECTED", 0);
   return true;
 }
 
@@ -285,13 +330,10 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
                                             std::vector<ScriptSceneObject> *objects,
                                             std::string *error,
                                             const ReplayLodPolicy &lod_policy) {
-  // The Bun worker uses dynamic ESM imports for every run, and those modules are
-  // retained in the process module cache. Restarting the worker per run keeps
-  // memory usage bounded across repeated script reloads.
-  if (started_) Shutdown();
   if (!Start(error)) return false;
   if (!script_path || !objects) return set_err(error, "Invalid execute arguments.");
   objects->clear();
+  last_diagnostic_ = {};
 
   SharedHeader *hdr = (SharedHeader *)shm_ptr_;
   if (std::memcmp(hdr->magic, kIpcMagic, sizeof(kIpcMagic)) != 0 || hdr->version != kIpcVersion) {
@@ -312,28 +354,48 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
   std::memcpy(req + sizeof(rp), script_path, path_len);
 
   const uint64_t seq = next_seq_++;
+  const auto run_started = std::chrono::steady_clock::now();
   hdr->request_seq = seq;
   hdr->request_length = (uint32_t)req_size;
   hdr->response_length = 0;
   hdr->error_code = (uint32_t)IpcErrorCode::None;
   hdr->state = (uint32_t)IpcState::RequestReady;
 
-  if (!SendLine("RUN " + std::to_string(seq) + "\n", error)) return false;
+  LogEvent("RUN_QUEUED", seq, script_path);
+  if (!SendLine("RUN " + std::to_string(seq) + "\n", error)) {
+    Shutdown();
+    return false;
+  }
+  LogEvent("RUN_STARTED", seq);
 
   std::string line;
-  if (!ReadLineWithTimeout(30 * 1000, &line, error)) return false;
+  if (!ReadLineWithTimeout(30 * 1000, &line, error)) {
+    LogEvent("RUN_FAILED", seq, "transport_timeout");
+    Shutdown();
+    return false;
+  }
 
   const std::string done = "DONE " + std::to_string(seq);
   const std::string fail = "ERROR " + std::to_string(seq);
   if (line == fail) {
-    std::string msg;
     std::string read_err;
-    if (!read_error_message(hdr, base, &msg, &read_err)) return set_err(error, read_err);
-    return set_err(error, msg.empty() ? "Worker reported an error." : msg);
+    if (!read_error_message(hdr, base, &last_diagnostic_, &read_err)) return set_err(error, read_err);
+    if (last_diagnostic_.durationMs == 0) {
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - run_started).count();
+      last_diagnostic_.durationMs = (uint32_t)((ms < 0) ? 0 : ms);
+    }
+    LogEvent("RUN_FAILED", seq, "phase=" + std::string(phase_name(last_diagnostic_.phase)));
+    return set_err(error, format_diagnostic_message(last_diagnostic_));
   }
   if (line != done) {
+    LogEvent("RUN_FAILED", seq, "unexpected_response");
+    Shutdown();
     return set_err(error, "Unexpected worker response: " + line);
   }
+  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - run_started).count();
+  LogEvent("RUN_DONE", seq, "duration_ms=" + std::to_string((long long)elapsed_ms));
 
   if (hdr->state != (uint32_t)IpcState::ResponseReady) return set_err(error, "Worker state is not ResponseReady.");
   if (hdr->response_seq != seq) return set_err(error, "Worker sequence mismatch.");
@@ -439,6 +501,17 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
   return true;
 }
 
+void ScriptWorkerClient::LogEvent(const char *event, uint64_t run_id, const std::string &details) {
+  if (!event) return;
+  if (details.empty()) {
+    std::fprintf(stderr, "[vicad-ipc] %s run_id=%llu\n",
+                 event, (unsigned long long)run_id);
+  } else {
+    std::fprintf(stderr, "[vicad-ipc] %s run_id=%llu %s\n",
+                 event, (unsigned long long)run_id, details.c_str());
+  }
+}
+
 void ScriptWorkerClient::Shutdown() {
   if (conn_fd_ >= 0) {
     std::string unused;
@@ -455,9 +528,11 @@ void ScriptWorkerClient::Shutdown() {
     socket_path_.clear();
   }
   if (worker_pid_ > 0) {
+    LogEvent("WORKER_STOPPING", 0, "pid=" + std::to_string(worker_pid_));
     kill(worker_pid_, SIGTERM);
     int status = 0;
     waitpid(worker_pid_, &status, 0);
+    LogEvent("WORKER_STOPPED", 0, "status=" + std::to_string(status));
     worker_pid_ = -1;
   }
   if (shm_ptr_) {

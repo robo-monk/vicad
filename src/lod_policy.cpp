@@ -7,7 +7,7 @@ namespace vicad {
 
 // Balanced defaults selected for profile-driven modelling/export.
 const double kLodToleranceDraft = 0.1;
-const double kLodToleranceModel = 0.01;
+const double kLodToleranceModel = 0.001;
 const double kLodToleranceExport3MF = 0.0001;
 
 namespace {

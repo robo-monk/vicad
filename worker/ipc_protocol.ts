@@ -1,4 +1,4 @@
-export const IPC_VERSION = 2;
+export const IPC_VERSION = 3;
 export const IPC_MAGIC = "VCADIPC1";
 
 export const HEADER_OFFSETS = {
@@ -29,13 +29,22 @@ export const IPC_STATE = {
 export const IPC_ERROR = {
   NONE: 0,
   INVALID_REQUEST: 1,
-  SANDBOX_VIOLATION: 2,
-  SCRIPT_FAILURE: 3,
-  ENCODE_FAILURE: 4,
-  DECODE_FAILURE: 5,
-  REPLAY_FAILURE: 6,
-  TIMEOUT: 7,
-  INTERNAL_ERROR: 8,
+  SCRIPT_FAILURE: 2,
+  ENCODE_FAILURE: 3,
+  DECODE_FAILURE: 4,
+  REPLAY_FAILURE: 5,
+  TIMEOUT: 6,
+  INTERNAL_ERROR: 7,
+} as const;
+
+export const IPC_ERROR_PHASE = {
+  UNKNOWN: 0,
+  REQUEST_DECODE: 1,
+  SCRIPT_LOAD: 2,
+  SCRIPT_EXECUTE: 3,
+  SCENE_ENCODE: 4,
+  RESPONSE_DECODE: 5,
+  TRANSPORT: 6,
 } as const;
 
 export const NODE_KIND = {

@@ -43,6 +43,18 @@ struct ScriptSceneObject {
   SceneVec3 bmax = {0.0f, 0.0f, 0.0f};
 };
 
+struct ScriptExecutionDiagnostic {
+  uint32_t errorCode = 0;
+  uint32_t phase = 0;
+  uint32_t line = 0;
+  uint32_t column = 0;
+  uint64_t runId = 0;
+  uint32_t durationMs = 0;
+  std::string file;
+  std::string message;
+  std::string stack;
+};
+
 class ScriptWorkerClient {
  public:
   ScriptWorkerClient();
@@ -56,6 +68,7 @@ class ScriptWorkerClient {
                           std::string *error,
                           const ReplayLodPolicy &lod_policy = {});
   bool started() const { return started_; }
+  const ScriptExecutionDiagnostic &last_diagnostic() const { return last_diagnostic_; }
   void Shutdown();
 
  private:
@@ -66,6 +79,7 @@ class ScriptWorkerClient {
   bool AcceptWorker(std::string *error);
   bool SendLine(const std::string &line, std::string *error);
   bool ReadLineWithTimeout(int timeout_ms, std::string *out, std::string *error);
+  void LogEvent(const char *event, uint64_t run_id, const std::string &details = "");
 
   bool started_;
   int shm_fd_;
@@ -75,6 +89,7 @@ class ScriptWorkerClient {
   int conn_fd_;
   int worker_pid_;
   uint64_t next_seq_;
+  ScriptExecutionDiagnostic last_diagnostic_;
   std::string shm_name_;
   std::string socket_path_;
 };

@@ -1,18 +1,26 @@
 import { dlopen, FFIType, toArrayBuffer } from "bun:ffi";
-import { basename, dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { createConnection } from "node:net";
 
 import {
   HEADER_OFFSETS,
   HEADER_SIZE,
   IPC_ERROR,
+  IPC_ERROR_PHASE,
   IPC_MAGIC,
   IPC_STATE,
   IPC_VERSION,
   RESPONSE_OFFSETS,
 } from "./ipc_protocol";
-import { __vicadBeginRun, __vicadEncodeScene } from "./proxy-manifold";
-import { enforceScriptSandbox, rewriteManifoldImports } from "./sandbox";
+import {
+  __vicadBeginRun,
+  __vicadEncodeScene,
+  CrossSection,
+  GLTFNode,
+  Manifold,
+  Mesh,
+  vicad,
+} from "./proxy-manifold";
 
 const args = Bun.argv.slice(2);
 function arg(name: string) {
@@ -55,13 +63,6 @@ function readAscii(offset: number, len: number) {
   return new TextDecoder().decode(shared.subarray(offset, offset + len));
 }
 
-function writeAscii(offset: number, value: string) {
-  const bytes = new TextEncoder().encode(value);
-  shared.fill(0, offset, offset + bytes.byteLength);
-  shared.set(bytes, offset);
-  return bytes.byteLength;
-}
-
 function getU32(off: number) {
   return view.getUint32(off, true);
 }
@@ -82,18 +83,44 @@ function headerCheck() {
   if (version !== IPC_VERSION) throw new Error(`Shared memory version mismatch: ${version}`);
 }
 
-function writeErrorResponse(code: number, message: string) {
+type ErrorDiagnostic = {
+  code: number;
+  phase: number;
+  message: string;
+  stack: string;
+  file: string;
+  line: number;
+  column: number;
+  runId: bigint;
+  durationMs: number;
+};
+
+function writeErrorResponse(diag: ErrorDiagnostic) {
   const responseOffset = getU32(HEADER_OFFSETS.responseOffset);
   const capacity = getU32(HEADER_OFFSETS.capacityBytes);
-  const msg = new TextEncoder().encode(message);
-  const total = 12 + msg.byteLength;
+  const message = new TextEncoder().encode(diag.message);
+  const stack = new TextEncoder().encode(diag.stack);
+  const file = new TextEncoder().encode(diag.file);
+  const total = 44 + message.byteLength + stack.byteLength + file.byteLength;
   if (responseOffset + total > capacity) throw new Error("Error response exceeds shared memory size.");
   view.setUint32(responseOffset + 0, IPC_VERSION, true);
-  view.setUint32(responseOffset + 4, code >>> 0, true);
-  view.setUint32(responseOffset + 8, msg.byteLength >>> 0, true);
-  shared.set(msg, responseOffset + 12);
+  view.setUint32(responseOffset + 4, diag.code >>> 0, true);
+  view.setUint32(responseOffset + 8, diag.phase >>> 0, true);
+  view.setUint32(responseOffset + 12, Math.max(0, diag.line) >>> 0, true);
+  view.setUint32(responseOffset + 16, Math.max(0, diag.column) >>> 0, true);
+  view.setBigUint64(responseOffset + 20, diag.runId, true);
+  view.setUint32(responseOffset + 28, Math.max(0, Math.trunc(diag.durationMs)) >>> 0, true);
+  view.setUint32(responseOffset + 32, file.byteLength >>> 0, true);
+  view.setUint32(responseOffset + 36, stack.byteLength >>> 0, true);
+  view.setUint32(responseOffset + 40, message.byteLength >>> 0, true);
+  let off = responseOffset + 44;
+  shared.set(file, off);
+  off += file.byteLength;
+  shared.set(stack, off);
+  off += stack.byteLength;
+  shared.set(message, off);
   setU32(HEADER_OFFSETS.responseLength, total);
-  setU32(HEADER_OFFSETS.errorCode, code);
+  setU32(HEADER_OFFSETS.errorCode, diag.code);
   setU32(HEADER_OFFSETS.state, IPC_STATE.RESP_ERROR);
 }
 
@@ -141,32 +168,61 @@ function requestScriptPath() {
 
 async function executeScript(scriptPath: string) {
   const abs = resolve(scriptPath);
-  const src = await Bun.file(abs).text();
-  enforceScriptSandbox(src);
   __vicadBeginRun();
-  const rewritten = rewriteManifoldImports(src, resolve("worker/proxy-manifold.ts"), abs);
-  const tempPath = `${dirname(abs)}/.vicad-ipc-${process.pid}-${Date.now()}-${basename(abs)}.mjs`;
-  await Bun.write(tempPath, rewritten);
-  try {
-    const loaded = await import(`file://${tempPath}?t=${Date.now()}`);
-    if (loaded.default !== undefined) {
-      throw new Error("SceneRegistrationError: scene mode requires vicad.addToScene(...) or vicad.addSketch(...); default export is disabled.");
-    }
-    return __vicadEncodeScene();
-  } finally {
-    try {
-      await Bun.file(tempPath).delete();
-    } catch {
-      // ignore
-    }
+  (globalThis as any).Manifold = Manifold;
+  (globalThis as any).CrossSection = CrossSection;
+  (globalThis as any).GLTFNode = GLTFNode;
+  (globalThis as any).Mesh = Mesh;
+  (globalThis as any).vicad = vicad;
+  const loaded = await import(`file://${abs}?t=${Date.now()}`);
+  if (loaded.default !== undefined) {
+    throw new Error("SceneRegistrationError: scene mode uses side-effect registration only; default export is disabled.");
   }
+  return __vicadEncodeScene();
 }
 
 function toErrCode(e: unknown) {
   const s = String(e);
-  if (s.includes("SandboxViolation")) return IPC_ERROR.SANDBOX_VIOLATION;
   if (s.includes("UnsupportedOperationError")) return IPC_ERROR.ENCODE_FAILURE;
   return IPC_ERROR.SCRIPT_FAILURE;
+}
+
+function parseStackLocation(stack: string) {
+  const line = stack.split("\n");
+  for (const row of line) {
+    const m = row.match(/\((file:\/\/[^:]+):(\d+):(\d+)\)/) ?? row.match(/at (file:\/\/[^:]+):(\d+):(\d+)/);
+    if (m) {
+      return {
+        file: m[1].replace(/^file:\/\//, ""),
+        line: Number(m[2]) || 0,
+        column: Number(m[3]) || 0,
+      };
+    }
+  }
+  return { file: "", line: 0, column: 0 };
+}
+
+function makeDiag(error: unknown, phase: number, runId: bigint, startedAt: number): ErrorDiagnostic {
+  const err = error instanceof Error ? error : new Error(String(error));
+  const stack = err.stack ?? String(error);
+  const loc = parseStackLocation(stack);
+  let inferredPhase = phase;
+  if (err.message.includes("Cannot find module") || err.message.includes("Unexpected")) {
+    inferredPhase = IPC_ERROR_PHASE.SCRIPT_LOAD;
+  } else if (err.message.includes("SceneRegistrationError") || err.message.includes("UnsupportedOperationError")) {
+    inferredPhase = IPC_ERROR_PHASE.SCENE_ENCODE;
+  }
+  return {
+    code: toErrCode(error),
+    phase: inferredPhase,
+    message: err.message || String(error),
+    stack,
+    file: loc.file,
+    line: loc.line,
+    column: loc.column,
+    runId,
+    durationMs: Date.now() - startedAt,
+  };
 }
 
 headerCheck();
@@ -194,12 +250,25 @@ sock.on("data", async (chunk: Buffer) => {
     const seq = BigInt(line.slice(4).trim() || "0");
     const hdrSeq = getU64(HEADER_OFFSETS.requestSeq);
     if (seq !== hdrSeq) {
-      writeErrorResponse(IPC_ERROR.INVALID_REQUEST, "Sequence mismatch.");
+      const diag: ErrorDiagnostic = {
+        code: IPC_ERROR.INVALID_REQUEST,
+        phase: IPC_ERROR_PHASE.REQUEST_DECODE,
+        message: "Sequence mismatch.",
+        stack: "",
+        file: "",
+        line: 0,
+        column: 0,
+        runId: seq,
+        durationMs: 0,
+      };
+      writeErrorResponse(diag);
       setU64(HEADER_OFFSETS.responseSeq, seq);
       sock.write(`ERROR ${seq}\n`);
       continue;
     }
     setU32(HEADER_OFFSETS.state, IPC_STATE.REQ_RUNNING);
+    const startedAt = Date.now();
+    console.error(`[vicad-worker] RUN_STARTED run_id=${seq.toString()}`);
     try {
       const path = requestScriptPath();
       const result = await executeScript(path);
@@ -228,11 +297,13 @@ sock.on("data", async (chunk: Buffer) => {
       }
       writeSuccessResponseScene(entries.length, result.opCount, result.records, objectTable, namesBlob);
       setU64(HEADER_OFFSETS.responseSeq, seq);
+      console.error(`[vicad-worker] RUN_DONE run_id=${seq.toString()} duration_ms=${Date.now() - startedAt}`);
       sock.write(`DONE ${seq}\n`);
     } catch (error) {
-      const code = toErrCode(error);
-      writeErrorResponse(code, error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error));
+      const diag = makeDiag(error, IPC_ERROR_PHASE.SCRIPT_EXECUTE, seq, startedAt);
+      writeErrorResponse(diag);
       setU64(HEADER_OFFSETS.responseSeq, seq);
+      console.error(`[vicad-worker] RUN_FAILED run_id=${seq.toString()} duration_ms=${Date.now() - startedAt} code=${diag.code}`);
       sock.write(`ERROR ${seq}\n`);
     }
   }
@@ -240,6 +311,17 @@ sock.on("data", async (chunk: Buffer) => {
 
 sock.on("error", (error) => {
   if (!shuttingDown) {
-    writeErrorResponse(IPC_ERROR.INTERNAL_ERROR, `Socket error: ${String(error)}`);
+    const diag: ErrorDiagnostic = {
+      code: IPC_ERROR.INTERNAL_ERROR,
+      phase: IPC_ERROR_PHASE.TRANSPORT,
+      message: `Socket error: ${String(error)}`,
+      stack: "",
+      file: "",
+      line: 0,
+      column: 0,
+      runId: 0n,
+      durationMs: 0,
+    };
+    writeErrorResponse(diag);
   }
 });

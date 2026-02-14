@@ -27,7 +27,11 @@ static const char *manifold_cross_section_source = "manifold/src/cross_section/c
 static const char *manifold_meshio_source = "manifold/src/meshIO/meshIO.cpp";
 static const char *app_sources[] = {
     "src/app_state.cpp",
+    "src/app_kernel.cpp",
+    "src/event_router.cpp",
+    "src/interaction_state.cpp",
     "src/main.cpp",
+    "src/picking.cpp",
     "src/edge_detection.cpp",
     "src/face_detection.cpp",
     "src/input_controller.cpp",
@@ -37,10 +41,15 @@ static const char *app_sources[] = {
     "src/op_trace.cpp",
     "src/render_scene.cpp",
     "src/render_ui.cpp",
+    "src/renderer_3d.cpp",
+    "src/renderer_overlay.cpp",
+    "src/scene_session.cpp",
     "src/script_worker_client.cpp",
     "src/scene_runtime.cpp",
     "src/sketch_semantics.cpp",
     "src/sketch_dimensions.cpp",
+    "src/ui_layout.cpp",
+    "src/ui_state.cpp",
 };
 static const char *font_baker_tool_source = "tools/font_baker.c";
 static const char *freetype_baker_sources[] = {
@@ -75,6 +84,14 @@ typedef struct {
     const char *lib_zlib;
     bool found;
 } AssimpInfo;
+
+typedef struct {
+    const char *root;
+    const char *include_dir;
+    const char *common_source;
+    const char *platform_source;
+    bool found;
+} NfdInfo;
 
 typedef struct {
     bool asan;
@@ -160,6 +177,29 @@ static AssimpInfo detect_assimp(void) {
     info.lib_zlib = nob_temp_sprintf("%s/contrib/zlib/libzlibstatic.a", info.build_dir);
     const char *cmakelists = nob_temp_sprintf("%s/CMakeLists.txt", info.root);
     info.found = nob_file_exists(cmakelists) != 0;
+    return info;
+}
+
+static NfdInfo detect_nativefiledialog(void) {
+    NfdInfo info = {0};
+    info.root = getenv("NATIVEFILEDIALOG_DIR");
+    if (info.root == NULL || info.root[0] == '\0') {
+        info.root = "nativefiledialog";
+    }
+    info.include_dir = nob_temp_sprintf("%s/src/include", info.root);
+    info.common_source = nob_temp_sprintf("%s/src/nfd_common.c", info.root);
+#if defined(__APPLE__)
+    info.platform_source = nob_temp_sprintf("%s/src/nfd_cocoa.m", info.root);
+#elif defined(_WIN32)
+    info.platform_source = nob_temp_sprintf("%s/src/nfd_win.cpp", info.root);
+#else
+    info.platform_source = nob_temp_sprintf("%s/src/nfd_gtk.c", info.root);
+#endif
+
+    const char *header = nob_temp_sprintf("%s/nfd.h", info.include_dir);
+    info.found = nob_file_exists(header) != 0 &&
+                 nob_file_exists(info.common_source) != 0 &&
+                 nob_file_exists(info.platform_source) != 0;
     return info;
 }
 
@@ -255,6 +295,8 @@ static bool compile_object_if_needed(const char *src_path,
                                      const char *clipper_include_dir,
                                      bool enable_meshio,
                                      const AssimpInfo *assimp,
+                                     bool enable_nfd,
+                                     const char *nfd_include_dir,
                                      const char *extra_dependency,
                                      BuildOptions opt,
                                      bool sanitize_this_object) {
@@ -295,6 +337,11 @@ static bool compile_object_if_needed(const char *src_path,
                        nob_temp_sprintf("-I%s", assimp->include_src_dir),
                        nob_temp_sprintf("-I%s", assimp->include_build_dir));
     }
+    if (enable_nfd && nfd_include_dir != NULL) {
+        nob_cmd_append(&cmd,
+                       "-DVICAD_HAS_NFD=1",
+                       nob_temp_sprintf("-I%s", nfd_include_dir));
+    }
     return nob_cmd_run(&cmd);
 }
 
@@ -330,6 +377,37 @@ static bool compile_font_baker_object_if_needed(const char *src_path, const char
                    src_path,
                    "-o",
                    obj_path);
+    return nob_cmd_run(&cmd);
+}
+
+static bool compile_nativefiledialog_object_if_needed(const char *src_path,
+                                                      const char *obj_path,
+                                                      const char *include_dir,
+                                                      BuildOptions opt,
+                                                      bool sanitize_this_object,
+                                                      bool objc_source) {
+    int rebuild = nob_needs_rebuild1(obj_path, src_path);
+    if (rebuild < 0) return false;
+    if (rebuild == 0) return true;
+
+    Nob_Cmd cmd = {0};
+    nob_cmd_append(&cmd, "clang");
+    if (objc_source) {
+        nob_cmd_append(&cmd, "-x", "objective-c");
+    }
+    nob_cmd_append(&cmd,
+                   "-std=c99",
+                   "-Wall",
+                   "-Wextra",
+                   "-Wpedantic",
+                   "-O2",
+                   "-I.",
+                   nob_temp_sprintf("-I%s", include_dir),
+                   "-c",
+                   src_path,
+                   "-o",
+                   obj_path);
+    if (sanitize_this_object) append_sanitizer_flags(&cmd, opt);
     return nob_cmd_run(&cmd);
 }
 
@@ -431,8 +509,10 @@ int main(int argc, char **argv) {
 
     const Clipper2Info clipper2 = detect_clipper2();
     const AssimpInfo assimp = detect_assimp();
+    const NfdInfo nfd = detect_nativefiledialog();
     const bool enable_cross_section = clipper2.found;
     const bool enable_meshio = assimp.found;
+    const bool enable_nfd = nfd.found;
     const char *build_tag = enable_cross_section ? "cross_section" : "base";
     if (opt.asan) {
         build_tag = nob_temp_sprintf("%s_asan", build_tag);
@@ -458,6 +538,14 @@ int main(int argc, char **argv) {
                 "Set ASSIMP_DIR to your clone root to enable it.",
                 assimp.root);
     }
+    if (enable_nfd) {
+        nob_log(NOB_INFO, "nativefiledialog detected at %s; enabling native Open dialog", nfd.root);
+    } else {
+        nob_log(NOB_WARNING,
+                "nativefiledialog not found at %s; File/Open dialog will be disabled. "
+                "Set NATIVEFILEDIALOG_DIR to your clone root to enable it.",
+                nfd.root);
+    }
     if (opt.asan) {
         nob_log(NOB_INFO, "Sanitizers enabled (ASan+UBSan).");
         if (opt.asan_deps) {
@@ -482,6 +570,9 @@ int main(int argc, char **argv) {
         if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/clipper2", obj_root))) return 1;
         if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/clipper2/src", obj_root))) return 1;
     }
+    if (enable_nfd) {
+        if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/nativefiledialog", obj_root))) return 1;
+    }
 
     Nob_File_Paths objects = {0};
     for (size_t i = 0; i < NOB_ARRAY_LEN(app_sources); ++i) {
@@ -492,9 +583,11 @@ int main(int argc, char **argv) {
                                            (int)(strlen(base) - sizeof(".cpp") + 1),
                                            base);
         nob_da_append(&objects, obj);
-        const char *extra_dep = strcmp(src, "src/main.cpp") == 0 ? baked_font_header : NULL;
+        const char *extra_dep = strcmp(src, "src/app_kernel.cpp") == 0 ? baked_font_header : NULL;
         if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir,
-                                      enable_meshio, &assimp, extra_dep, opt, opt.asan)) return 1;
+                                      enable_meshio, &assimp,
+                                      enable_nfd, nfd.include_dir,
+                                      extra_dep, opt, opt.asan)) return 1;
     }
 
     for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
@@ -506,7 +599,9 @@ int main(int argc, char **argv) {
                                            base);
         nob_da_append(&objects, obj);
         if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir,
-                                      enable_meshio, &assimp, NULL, opt, opt.asan && opt.asan_deps)) return 1;
+                                      enable_meshio, &assimp,
+                                      enable_nfd, nfd.include_dir,
+                                      NULL, opt, opt.asan && opt.asan_deps)) return 1;
     }
 
     if (enable_meshio) {
@@ -514,14 +609,18 @@ int main(int argc, char **argv) {
         nob_da_append(&objects, obj);
         const char *meshio_dep = nob_temp_sprintf("%s/assimp/config.h", assimp.include_build_dir);
         if (!compile_object_if_needed(manifold_meshio_source, obj, enable_cross_section, clipper2.include_dir,
-                                      true, &assimp, meshio_dep, opt, opt.asan && opt.asan_deps)) return 1;
+                                      true, &assimp,
+                                      enable_nfd, nfd.include_dir,
+                                      meshio_dep, opt, opt.asan && opt.asan_deps)) return 1;
     }
 
     if (enable_cross_section) {
         const char *obj = nob_temp_sprintf("%s/manifold/src/cross_section.o", obj_root);
         nob_da_append(&objects, obj);
         if (!compile_object_if_needed(manifold_cross_section_source, obj, true, clipper2.include_dir,
-                                      enable_meshio, &assimp, NULL, opt, opt.asan && opt.asan_deps)) return 1;
+                                      enable_meshio, &assimp,
+                                      enable_nfd, nfd.include_dir,
+                                      NULL, opt, opt.asan && opt.asan_deps)) return 1;
 
         for (size_t i = 0; i < NOB_ARRAY_LEN(clipper2.sources); ++i) {
             const char *src = clipper2.sources[i];
@@ -532,8 +631,33 @@ int main(int argc, char **argv) {
                                                 base_name);
             nob_da_append(&objects, obj2);
             if (!compile_object_if_needed(src, obj2, true, clipper2.include_dir,
-                                          enable_meshio, &assimp, NULL, opt, opt.asan && opt.asan_deps)) return 1;
+                                          enable_meshio, &assimp,
+                                          enable_nfd, nfd.include_dir,
+                                          NULL, opt, opt.asan && opt.asan_deps)) return 1;
         }
+    }
+
+    if (enable_nfd) {
+        const char *nfd_common_obj = nob_temp_sprintf("%s/nativefiledialog/nfd_common.o", obj_root);
+        nob_da_append(&objects, nfd_common_obj);
+        if (!compile_nativefiledialog_object_if_needed(nfd.common_source, nfd_common_obj, nfd.include_dir,
+                                                       opt, opt.asan && opt.asan_deps, false)) return 1;
+
+        const char *base_name = nob_path_name(nfd.platform_source);
+        const char *dot = strrchr(base_name, '.');
+        int stem_len = dot ? (int)(dot - base_name) : (int)strlen(base_name);
+        const char *nfd_platform_obj = nob_temp_sprintf("%s/nativefiledialog/%.*s.o",
+                                                        obj_root,
+                                                        stem_len,
+                                                        base_name);
+        nob_da_append(&objects, nfd_platform_obj);
+#if defined(__APPLE__)
+        const bool objc_source = true;
+#else
+        const bool objc_source = false;
+#endif
+        if (!compile_nativefiledialog_object_if_needed(nfd.platform_source, nfd_platform_obj, nfd.include_dir,
+                                                       opt, opt.asan && opt.asan_deps, objc_source)) return 1;
     }
 
     int relink = nob_needs_rebuild(binary_mode_path, objects.items, objects.count);

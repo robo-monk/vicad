@@ -201,10 +201,72 @@ export class GLTFNode {
   }
 }
 
+function toCrossSectionRoot(value: unknown) {
+  if (value instanceof CrossSection) {
+    value.assertValid("CrossSection");
+    return { rootKind: NODE_KIND.CROSS_SECTION, rootId: value.nodeId };
+  }
+  throw new Error("SceneRegistrationError: expected CrossSection.");
+}
+
+function toManifoldRoot(value: unknown) {
+  if (value instanceof Manifold) {
+    value.assertValid("Manifold");
+    return { rootKind: NODE_KIND.MANIFOLD, rootId: value.nodeId };
+  }
+  if (value instanceof GLTFNode && value.manifold instanceof Manifold) {
+    value.manifold.assertValid("Manifold");
+    return { rootKind: NODE_KIND.MANIFOLD, rootId: value.manifold.nodeId };
+  }
+  if (value instanceof Mesh) {
+    throw new Error("UnsupportedOperationError: Mesh values cannot be added to scene in IPC mode.");
+  }
+  throw new Error("SceneRegistrationError: expected Manifold or GLTFNode(manifold).");
+}
+
+function toAnyRoot(value: unknown) {
+  if (value instanceof CrossSection) return toCrossSectionRoot(value);
+  return toManifoldRoot(value);
+}
+
+const _crossSections = new Set<CrossSection>();
+const _manifolds = new Set<Manifold>();
+
 export class CrossSection {
   readonly nodeId: number;
+  autoAddToScene = true;
+  private valid = true;
+
   constructor(nodeId: number) {
     this.nodeId = nodeId;
+    _crossSections.add(this);
+  }
+
+  assertValid(name = "CrossSection") {
+    if (!this.valid) throw new Error(`InvalidObjectError: ${name} is invalidated.`);
+  }
+
+  private invalidate() {
+    this.valid = false;
+    this.autoAddToScene = false;
+  }
+
+  private derive(outNodeId: number, opName: string) {
+    this.assertValid(opName);
+    this.invalidate();
+    return new CrossSection(outNodeId);
+  }
+
+  consume(opName: string) {
+    this.assertValid(opName);
+    this.invalidate();
+  }
+
+  clone() {
+    this.assertValid("CrossSection.clone");
+    const out = new CrossSection(this.nodeId);
+    out.autoAddToScene = this.autoAddToScene;
+    return out;
   }
 
   static circle(radius = 1) {
@@ -318,7 +380,7 @@ export class CrossSection {
       { t: "f64", v: tx },
       { t: "f64", v: ty },
     ]));
-    return new CrossSection(out);
+    return this.derive(out, "CrossSection.translate");
   }
 
   rotate(degrees: number) {
@@ -328,7 +390,7 @@ export class CrossSection {
       { t: "u32", v: this.nodeId },
       { t: "f64", v: degrees },
     ]));
-    return new CrossSection(out);
+    return this.derive(out, "CrossSection.rotate");
   }
 
   fillet(radius: number) {
@@ -342,7 +404,7 @@ export class CrossSection {
       { t: "u32", v: this.nodeId },
       { t: "f64", v: r },
     ]));
-    return new CrossSection(out);
+    return this.derive(out, "CrossSection.fillet");
   }
 
   offsetClone(delta: number) {
@@ -356,7 +418,7 @@ export class CrossSection {
       { t: "u32", v: this.nodeId },
       { t: "f64", v: d },
     ]));
-    return new CrossSection(out);
+    return this.derive(out, "CrossSection.offsetClone");
   }
 
   scale(): never {
@@ -366,8 +428,34 @@ export class CrossSection {
 
 export class Manifold {
   readonly nodeId: number;
+  autoAddToScene = true;
+  private valid = true;
+
   constructor(nodeId: number) {
     this.nodeId = nodeId;
+    _manifolds.add(this);
+  }
+
+  assertValid(name = "Manifold") {
+    if (!this.valid) throw new Error(`InvalidObjectError: ${name} is invalidated.`);
+  }
+
+  private invalidate() {
+    this.valid = false;
+    this.autoAddToScene = false;
+  }
+
+  private derive(outNodeId: number, opName: string) {
+    this.assertValid(opName);
+    this.invalidate();
+    return new Manifold(outNodeId);
+  }
+
+  clone() {
+    this.assertValid("Manifold.clone");
+    const out = new Manifold(this.nodeId);
+    out.autoAddToScene = this.autoAddToScene;
+    return out;
   }
 
   static sphere(radius = 1) {
@@ -414,14 +502,17 @@ export class Manifold {
 
   static union(items: Manifold[]) {
     if (!Array.isArray(items) || items.length === 0) throw new Error("Manifold.union requires a non-empty array.");
+    for (const item of items) item.assertValid("Manifold.union");
     const out = reg.allocNodeId();
     const parts: Part[] = [{ t: "u32", v: out }, { t: "u32", v: items.length }];
     for (const item of items) parts.push({ t: "u32", v: item.nodeId });
     reg.push(OP.UNION, makePayload(parts));
+    for (const item of items) item.invalidate();
     return new Manifold(out);
   }
 
   static extrude(crossSection: CrossSection, height: number, divisions = 0, twistDegrees = 0) {
+    crossSection.assertValid("Manifold.extrude");
     const out = reg.allocNodeId();
     reg.push(OP.EXTRUDE, makePayload([
       { t: "u32", v: out },
@@ -437,6 +528,7 @@ export class Manifold {
     if (arguments.length > 2) {
       throw new Error("Manifold.revolve only accepts (crossSection, revolveDegrees?).");
     }
+    crossSection.assertValid("Manifold.revolve");
     const out = reg.allocNodeId();
     reg.push(OP.REVOLVE, makePayload([
       { t: "u32", v: out },
@@ -444,28 +536,37 @@ export class Manifold {
       { t: "u32", v: 0 },
       { t: "f64", v: revolveDegrees },
     ]));
+    crossSection.consume("Manifold.revolve");
     return new Manifold(out);
   }
 
   add(other: Manifold) { return Manifold.union([this, other]); }
 
   subtract(other: Manifold) {
+    this.assertValid("Manifold.subtract");
+    other.assertValid("Manifold.subtract");
     const out = reg.allocNodeId();
     reg.push(OP.SUBTRACT, makePayload([
       { t: "u32", v: out },
       { t: "u32", v: this.nodeId },
       { t: "u32", v: other.nodeId },
     ]));
+    this.invalidate();
+    other.invalidate();
     return new Manifold(out);
   }
 
   intersect(other: Manifold) {
+    this.assertValid("Manifold.intersect");
+    other.assertValid("Manifold.intersect");
     const out = reg.allocNodeId();
     reg.push(OP.INTERSECT, makePayload([
       { t: "u32", v: out },
       { t: "u32", v: this.nodeId },
       { t: "u32", v: other.nodeId },
     ]));
+    this.invalidate();
+    other.invalidate();
     return new Manifold(out);
   }
 
@@ -479,7 +580,7 @@ export class Manifold {
       { t: "f64", v: ty },
       { t: "f64", v: tz },
     ]));
-    return new Manifold(out);
+    return this.derive(out, "Manifold.translate");
   }
 
   rotate(x: number | Vec3Like, y?: number, z?: number) {
@@ -492,7 +593,7 @@ export class Manifold {
       { t: "f64", v: ry },
       { t: "f64", v: rz },
     ]));
-    return new Manifold(out);
+    return this.derive(out, "Manifold.rotate");
   }
 
   scale(x: number | Vec3Like, y?: number, z?: number) {
@@ -505,48 +606,42 @@ export class Manifold {
       { t: "f64", v: sy },
       { t: "f64", v: sz },
     ]));
-    return new Manifold(out);
+    return this.derive(out, "Manifold.scale");
   }
 
   slice(height = 0) {
+    this.assertValid("Manifold.slice");
     const out = reg.allocNodeId();
     reg.push(OP.SLICE, makePayload([
       { t: "u32", v: out },
       { t: "u32", v: this.nodeId },
       { t: "f64", v: height },
     ]));
+    this.invalidate();
     return new CrossSection(out);
   }
 }
 
-function toSceneRoot(value: unknown) {
-  if (value instanceof Manifold) {
-    return { rootKind: NODE_KIND.MANIFOLD, rootId: value.nodeId };
-  }
-  if (value instanceof GLTFNode && value.manifold instanceof Manifold) {
-    return { rootKind: NODE_KIND.MANIFOLD, rootId: value.manifold.nodeId };
-  }
-  if (value instanceof Mesh) {
-    throw new Error("UnsupportedOperationError: Mesh values cannot be added to scene in IPC mode.");
-  }
-  throw new Error("SceneRegistrationError: addToScene expects Manifold or GLTFNode(manifold).");
-}
-
-function toSketchRoot(value: unknown) {
-  if (value instanceof CrossSection) {
-    return { rootKind: NODE_KIND.CROSS_SECTION, rootId: value.nodeId };
-  }
-  throw new Error("SceneRegistrationError: addSketch expects CrossSection.");
-}
-
 export const vicad = {
-  addToScene(value: unknown, opts?: { id?: string; name?: string }) {
-    const root = toSceneRoot(value);
+  add(value: unknown, opts?: { id?: string; name?: string }) {
+    const root = toAnyRoot(value);
     reg.addSceneObject(root.rootKind, root.rootId, opts);
+    if (value instanceof CrossSection || value instanceof Manifold) {
+      value.autoAddToScene = false;
+    } else if (value instanceof GLTFNode && value.manifold instanceof Manifold) {
+      value.manifold.autoAddToScene = false;
+    }
+  },
+  addToScene(value: unknown, opts?: { id?: string; name?: string }) {
+    const root = toManifoldRoot(value);
+    reg.addSceneObject(root.rootKind, root.rootId, opts);
+    if (value instanceof Manifold) value.autoAddToScene = false;
+    if (value instanceof GLTFNode && value.manifold instanceof Manifold) value.manifold.autoAddToScene = false;
   },
   addSketch(value: unknown, opts?: { id?: string; name?: string }) {
-    const root = toSketchRoot(value);
+    const root = toCrossSectionRoot(value);
     reg.addSceneObject(root.rootKind, root.rootId, opts);
+    (value as CrossSection).autoAddToScene = false;
   },
   clearScene() {
     reg.sceneEntries = [];
@@ -563,15 +658,31 @@ export const vicad = {
 
 export function __vicadBeginRun() {
   reg.reset();
+  _crossSections.clear();
+  _manifolds.clear();
 }
 
 export function __vicadEncodeScene() {
-  if (reg.sceneEntries.length === 0) {
-    throw new Error("SceneRegistrationError: no scene entries were added. Use vicad.addToScene(...) or vicad.addSketch(...)." );
+  const sceneEntries = reg.sceneEntries.slice();
+  for (const crossSection of _crossSections) {
+    if (crossSection.autoAddToScene) {
+      reg.addSceneObject(NODE_KIND.CROSS_SECTION, crossSection.nodeId);
+    }
+  }
+  for (const manifold of _manifolds) {
+    if (manifold.autoAddToScene) {
+      reg.addSceneObject(NODE_KIND.MANIFOLD, manifold.nodeId);
+    }
+  }
+  const finalSceneEntries = reg.sceneEntries.slice();
+  reg.sceneEntries = sceneEntries;
+
+  if (finalSceneEntries.length === 0) {
+    throw new Error("SceneRegistrationError: no scene entries were produced. Use autoAddToScene or vicad.add(...).");
   }
   return {
     opCount: reg.ops.length,
     records: encodeOps(reg.ops),
-    sceneEntries: reg.sceneEntries.slice(),
+    sceneEntries: finalSceneEntries,
   };
 }

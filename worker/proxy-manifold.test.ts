@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { OP } from "./ipc_protocol";
+import { NODE_KIND, OP } from "./ipc_protocol";
 import { __vicadBeginRun, __vicadEncodeScene, CrossSection, Manifold, vicad } from "./proxy-manifold";
 
 type DecodedOp = {
@@ -171,5 +171,53 @@ describe("Canonical circular primitive signatures", () => {
     expect(() => (CrossSection.point as unknown as (...args: unknown[]) => unknown)(10, 10, 0.1, 12)).toThrow(
       "CrossSection.point only accepts (position, radius).",
     );
+  });
+});
+
+describe("Auto-add lifecycle", () => {
+  it("auto-adds only the latest derived cross section", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(10);
+    const filleted = square.fillet(1);
+
+    const scene = __vicadEncodeScene();
+    expect(scene.sceneEntries.length).toBe(1);
+    expect(scene.sceneEntries[0]?.rootKind).toBe(NODE_KIND.CROSS_SECTION);
+    expect(scene.sceneEntries[0]?.rootId).toBe(filleted.nodeId);
+  });
+
+  it("invalidates consumed objects for follow-up ops", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(10);
+    square.fillet(1);
+    expect(() => square.rotate(15)).toThrow("InvalidObjectError: CrossSection.rotate is invalidated.");
+  });
+
+  it("clone keeps the parent valid", () => {
+    __vicadBeginRun();
+    const base = Manifold.cube(5);
+    const moved = base.clone().translate(5, 0, 0);
+
+    const scene = __vicadEncodeScene();
+    expect(scene.sceneEntries.length).toBe(2);
+    const ids = scene.sceneEntries.map((e) => e.rootId).sort((a, b) => a - b);
+    expect(ids).toEqual([base.nodeId, moved.nodeId]);
+  });
+
+  it("extrude keeps both the source sketch and new manifold", () => {
+    __vicadBeginRun();
+    const sketch = CrossSection.rectangle(10, 10).fillet(1).translate(10, 0);
+    const solid = Manifold.extrude(sketch, 10);
+
+    const scene = __vicadEncodeScene();
+    expect(scene.sceneEntries.length).toBe(2);
+
+    const kinds = scene.sceneEntries.map((e) => e.rootKind);
+    expect(kinds.includes(NODE_KIND.CROSS_SECTION)).toBe(true);
+    expect(kinds.includes(NODE_KIND.MANIFOLD)).toBe(true);
+
+    const ids = scene.sceneEntries.map((e) => e.rootId);
+    expect(ids.includes(sketch.nodeId)).toBe(true);
+    expect(ids.includes(solid.nodeId)).toBe(true);
   });
 });
