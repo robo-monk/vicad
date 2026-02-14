@@ -71,5 +71,5 @@ for (const tri of triangles) {
   beam = beam.subtract(extrude(tri, w));
 }
 
-// vicad.addToScene(beam);
+// vicad.add(beam, { name: "Beam" });
 // vicad.addToScene(Manifold.sphere(10));

@@ -2628,7 +2628,9 @@ static int AppRunLoop() {
     const float global_ambient[4] = {0.14f, 0.15f, 0.17f, 1.0f};
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient);
     glClearColor(0.93333334f, 0.93333334f, 0.93333334f, 1.0f);
-    RGFW_window_swapInterval_OpenGL(win, 1);
+    // macOS window drags can lag badly with swap interval 1 in RGFW/OpenGL.
+    // Keep interval 0 to avoid compositor blocking during move/dock.
+    RGFW_window_swapInterval_OpenGL(win, 0);
 
     const float light0_ambient[4] = {0.10f, 0.10f, 0.11f, 1.0f};
     const float light0_diffuse[4] = {0.92f, 0.95f, 1.00f, 1.0f};
