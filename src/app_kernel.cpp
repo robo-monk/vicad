@@ -5,6 +5,7 @@
 #include <cstring>
 #include <array>
 #include <cstdint>
+#include <chrono>
 #include <ctime>
 #include <optional>
 #include <sstream>
@@ -2628,9 +2629,10 @@ static int AppRunLoop() {
     const float global_ambient[4] = {0.14f, 0.15f, 0.17f, 1.0f};
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient);
     glClearColor(0.93333334f, 0.93333334f, 0.93333334f, 1.0f);
-    // macOS window drags can lag badly with swap interval 1 in RGFW/OpenGL.
-    // Keep interval 0 to avoid compositor blocking during move/dock.
-    RGFW_window_swapInterval_OpenGL(win, 0);
+    // Default to v-sync on to avoid an uncapped render loop when idle.
+    // Set VICAD_DISABLE_VSYNC=1 to restore uncapped swaps for debugging.
+    const bool disable_vsync = std::getenv("VICAD_DISABLE_VSYNC") != nullptr;
+    RGFW_window_swapInterval_OpenGL(win, disable_vsync ? 0 : 1);
 
     const float light0_ambient[4] = {0.10f, 0.10f, 0.11f, 1.0f};
     const float light0_diffuse[4] = {0.92f, 0.95f, 1.00f, 1.0f};
@@ -2706,12 +2708,14 @@ static int AppRunLoop() {
     bool file_menu_open = false;
     std::string export_status_line = "Ready (uses Export3MF LOD profile)";
     bool export_status_ok = true;
+    bool needs_redraw = true;
     auto activate_script_path = [&](const std::string &path) {
         const std::string norm = normalize_path_lex(path);
         if (norm.empty()) return;
         if (!file_exists_path(norm)) {
             export_status_ok = false;
             export_status_line = std::string("Missing file: ") + norm;
+            needs_redraw = true;
             return;
         }
         scene_session.script_path = norm;
@@ -2720,43 +2724,67 @@ static int AppRunLoop() {
         save_recent_files(recent_files);
         export_status_ok = true;
         export_status_line = std::string("Opened: ") + recent_display_name(norm);
+        needs_redraw = true;
     };
 
+    using Clock = std::chrono::steady_clock;
+    constexpr int kScriptPollIntervalMs = 250;
+    constexpr int kIdleWaitMaxMs = 50;
+    auto last_script_poll = Clock::now() - std::chrono::milliseconds(kScriptPollIntervalMs);
+
     while (!RGFW_window_shouldClose(win)) {
-        const long long prev_mtime = scene_session.last_mtime_ns;
-        std::string reload_err;
-        vicad::ReplayLodPolicy lod_policy = {};
-        lod_policy.profile = vicad::LodProfile::Model;
-        const bool loaded = vicad_scene::SceneSessionReloadIfChanged(
-            &scene_session, &worker_client, lod_policy, &reload_err);
-        const bool changed = scene_session.last_mtime_ns != prev_mtime;
-        if (changed) {
-            if (loaded) {
-                base_mesh = scene_session.merged_mesh;
-                mesh = base_mesh;
-                mesh_bmin = scene_session.bounds_min;
-                mesh_bmax = scene_session.bounds_max;
-                object_selected = false;
-                selected_object_index = -1;
-                hovered_object_index = -1;
-                face_select.dirty = true;
-                face_select.hoveredRegion = -1;
-                face_select.selectedRegion = -1;
-                edge_select.dirtyTopology = true;
-                edge_select.dirtySilhouette = true;
-                edge_select.hoveredEdge = -1;
-                edge_select.selectedEdge = -1;
-                edge_select.hoveredChain = -1;
-                edge_select.selectedChain = -1;
-                script_error.clear();
-                std::fprintf(stderr, "[vicad] script loaded: %s (ipc)\n", scene_session.script_path.c_str());
-            } else {
-                script_error = reload_err;
-                std::fprintf(stderr, "[vicad] script error:\n%s\n", script_error.c_str());
+        const auto now = Clock::now();
+        const int since_script_poll_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_script_poll).count();
+        if (!needs_redraw && since_script_poll_ms < kScriptPollIntervalMs) {
+            int wait_ms = kScriptPollIntervalMs - since_script_poll_ms;
+            if (wait_ms > kIdleWaitMaxMs) wait_ms = kIdleWaitMaxMs;
+            if (wait_ms < 1) wait_ms = 1;
+            RGFW_waitForEvent(wait_ms);
+        }
+
+        const auto poll_now = Clock::now();
+        const int script_poll_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
+            poll_now - last_script_poll).count();
+        if (script_poll_elapsed_ms >= kScriptPollIntervalMs) {
+            last_script_poll = poll_now;
+            const long long prev_mtime = scene_session.last_mtime_ns;
+            std::string reload_err;
+            vicad::ReplayLodPolicy lod_policy = {};
+            lod_policy.profile = vicad::LodProfile::Model;
+            const bool loaded = vicad_scene::SceneSessionReloadIfChanged(
+                &scene_session, &worker_client, lod_policy, &reload_err);
+            const bool changed = scene_session.last_mtime_ns != prev_mtime;
+            if (changed) {
+                if (loaded) {
+                    base_mesh = scene_session.merged_mesh;
+                    mesh = base_mesh;
+                    mesh_bmin = scene_session.bounds_min;
+                    mesh_bmax = scene_session.bounds_max;
+                    object_selected = false;
+                    selected_object_index = -1;
+                    hovered_object_index = -1;
+                    face_select.dirty = true;
+                    face_select.hoveredRegion = -1;
+                    face_select.selectedRegion = -1;
+                    edge_select.dirtyTopology = true;
+                    edge_select.dirtySilhouette = true;
+                    edge_select.hoveredEdge = -1;
+                    edge_select.selectedEdge = -1;
+                    edge_select.hoveredChain = -1;
+                    edge_select.selectedChain = -1;
+                    script_error.clear();
+                    std::fprintf(stderr, "[vicad] script loaded: %s (ipc)\n", scene_session.script_path.c_str());
+                } else {
+                    script_error = reload_err;
+                    std::fprintf(stderr, "[vicad] script error:\n%s\n", script_error.c_str());
+                }
+                needs_redraw = true;
             }
         }
 
         while (RGFW_window_checkEvent(win, &event)) {
+            needs_redraw = true;
             if (event.type == RGFW_quit) break;
             if (event.type == RGFW_windowResized || event.type == RGFW_scaleUpdated) {
                 RGFW_window_getSizeInPixels(win, &width, &height);
@@ -3092,6 +3120,8 @@ static int AppRunLoop() {
             }
         }
 
+        if (!needs_redraw) continue;
+
         if (height <= 0) height = 1;
         if (ui_height <= 0) ui_height = 1;
         const float display_scale = vicad_input::ComputeDisplayScale(width, height, window_w, window_h);
@@ -3321,6 +3351,7 @@ static int AppRunLoop() {
         clay_render_commands(ui_cmds, width, height, ui_scale);
 
         RGFW_window_swapBuffers_OpenGL(win);
+        needs_redraw = false;
     }
 
     RGFW_window_close(win);
