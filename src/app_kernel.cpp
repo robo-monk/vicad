@@ -2606,7 +2606,7 @@ static int AppRunLoop() {
         100,
         1200,
         800,
-        (RGFW_windowFlags)(RGFW_windowCenter | RGFW_windowOpenGL));
+        (RGFW_windowFlags)(RGFW_windowCenter | RGFW_windowOpenGL | RGFW_windowTransparentTitlebar));
     if (win == nullptr) return 1;
 
     RGFW_window_setExitKey(win, RGFW_escape);

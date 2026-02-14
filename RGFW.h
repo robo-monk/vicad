@@ -876,6 +876,7 @@ typedef RGFW_ENUM(u32, RGFW_windowFlags) {
 	RGFW_windowOpenGL = RGFW_BIT(17), /*!< create an OpenGL context (you can also do this manually with RGFW_window_createContext_OpenGL) */
 	RGFW_windowEGL = RGFW_BIT(18), /*!< create an EGL context (you can also do this manually with RGFW_window_createContext_EGL) */
 	RGFW_noDeinitOnClose = RGFW_BIT(19), /*!< do not auto deinit RGFW if the window closes and this is the last window open */
+	RGFW_windowTransparentTitlebar = RGFW_BIT(20), /*!< (macOS) keep stoplights while extending content into a transparent titlebar */
 	RGFW_windowedFullscreen = RGFW_windowNoBorder | RGFW_windowMaximize,
 	RGFW_windowCaptureRawMouse = RGFW_windowCaptureMouse | RGFW_windowRawMouse
 };
@@ -13486,6 +13487,12 @@ i32 RGFW_initPlatform(void) {
 	objc_msgSend_void_id(_RGFW->NSApp, sel_registerName("setDelegate:"), _RGFW->customNSAppDelegate);
 
 	((void (*)(id, SEL, NSUInteger))objc_msgSend) ((id)_RGFW->NSApp, sel_registerName("setActivationPolicy:"), NSApplicationActivationPolicyRegular);
+	if (objc_msgSend_id((id)_RGFW->NSApp, sel_registerName("mainMenu")) == NULL) {
+		id mainMenu = objc_msgSend_id(NSAlloc(objc_getClass("NSMenu")), sel_registerName("init"));
+		objc_msgSend_void_id((id)_RGFW->NSApp, sel_registerName("setMainMenu:"), mainMenu);
+		NSRelease(mainMenu);
+	}
+	objc_msgSend_void((id)_RGFW->NSApp, sel_registerName("finishLaunching"));
 
 	_RGFW->customViewClasses[0] = objc_allocateClassPair(objc_getClass("NSView"), "RGFWCustomView", 0);
 	_RGFW->customViewClasses[1] = objc_allocateClassPair(objc_getClass("NSOpenGLView"), "RGFWOpenGLCustomView", 0);
@@ -13577,22 +13584,31 @@ RGFW_window* RGFW_createWindowPlatform(const char* name, RGFW_windowFlags flags,
 	windowRect.origin.y = (double)RGFW_cocoaYTransform((float)(win->y + win->h - 1));
 	windowRect.size.width = (double)win->w;
 	windowRect.size.height = (double)win->h;
-	NSBackingStoreType macArgs = (NSBackingStoreType)(NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSBackingStoreBuffered | NSWindowStyleMaskTitled);
+	NSWindowStyleMask styleMask = NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskTitled;
+	NSBackingStoreType backing = NSBackingStoreBuffered;
 
 	if (!(flags & RGFW_windowNoResize))
-		macArgs = (NSBackingStoreType)(macArgs | (NSBackingStoreType)NSWindowStyleMaskResizable);
+		styleMask = (NSWindowStyleMask)(styleMask | NSWindowStyleMaskResizable);
 	if (!(flags & RGFW_windowNoBorder))
-		macArgs = (NSBackingStoreType)(macArgs | (NSBackingStoreType)NSWindowStyleMaskTitled);
+		styleMask = (NSWindowStyleMask)(styleMask | NSWindowStyleMaskTitled);
+	else
+		styleMask = (NSWindowStyleMask)(styleMask & ~NSWindowStyleMaskTitled);
+	if ((flags & RGFW_windowTransparentTitlebar) && !(flags & RGFW_windowNoBorder))
+		styleMask = (NSWindowStyleMask)(styleMask | NSWindowStyleMaskFullSizeContentView);
 	{
 		void* nsclass = objc_getClass("NSWindow");
 		SEL func = sel_registerName("initWithContentRect:styleMask:backing:defer:");
 
 		win->src.window = ((id(*)(id, SEL, NSRect, NSWindowStyleMask, NSBackingStoreType, bool))objc_msgSend)
-			(NSAlloc(nsclass), func, windowRect, (NSWindowStyleMask)macArgs, macArgs, false);
+			(NSAlloc(nsclass), func, windowRect, styleMask, backing, false);
 	}
 
 	id str = NSString_stringWithUTF8String(name);
 	objc_msgSend_void_id((id)win->src.window, sel_registerName("setTitle:"), str);
+	if ((flags & RGFW_windowTransparentTitlebar) && !(flags & RGFW_windowNoBorder)) {
+		((void (*)(id, SEL, BOOL))objc_msgSend)((id)win->src.window, sel_registerName("setTitlebarAppearsTransparent:"), YES);
+		((void (*)(id, SEL, NSInteger))objc_msgSend)((id)win->src.window, sel_registerName("setTitleVisibility:"), 1);
+	}
 
 	win->src.delegate = (void*)objc_msgSend_id(NSAlloc((Class)_RGFW->customWindowDelegateClass), sel_registerName("init"));
 	object_setInstanceVariable((id)win->src.delegate, "RGFW_window", win);
@@ -13636,14 +13652,21 @@ void RGFW_window_setBorder(RGFW_window* win, RGFW_bool border) {
 	double offset = 0;
 
 	RGFW_setBit(&win->internal.flags, RGFW_windowNoBorder, !border);
-	NSBackingStoreType storeType = (NSBackingStoreType)(NSWindowStyleMaskBorderless | NSWindowStyleMaskFullSizeContentView);
+	NSWindowStyleMask storeType = NSWindowStyleMaskBorderless | NSWindowStyleMaskFullSizeContentView;
 	if (border)
-		storeType = (NSBackingStoreType)(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable);
+		storeType = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
 	if (!(win->internal.flags & RGFW_windowNoResize)) {
-		storeType = (NSBackingStoreType)(storeType | (NSBackingStoreType)NSWindowStyleMaskResizable);
+		storeType = (NSWindowStyleMask)(storeType | NSWindowStyleMaskResizable);
+	}
+	if (border && (win->internal.flags & RGFW_windowTransparentTitlebar)) {
+		storeType = (NSWindowStyleMask)(storeType | NSWindowStyleMaskFullSizeContentView);
 	}
 
-	((void (*)(id, SEL, NSBackingStoreType))objc_msgSend)((id)win->src.window, sel_registerName("setStyleMask:"), storeType);
+	((void (*)(id, SEL, NSWindowStyleMask))objc_msgSend)((id)win->src.window, sel_registerName("setStyleMask:"), storeType);
+	if (border && (win->internal.flags & RGFW_windowTransparentTitlebar)) {
+		((void (*)(id, SEL, BOOL))objc_msgSend)((id)win->src.window, sel_registerName("setTitlebarAppearsTransparent:"), YES);
+		((void (*)(id, SEL, NSInteger))objc_msgSend)((id)win->src.window, sel_registerName("setTitleVisibility:"), 1);
+	}
 
 	if (!border) {
 		id miniaturizeButton = objc_msgSend_int((id)win->src.window, sel_registerName("standardWindowButton:"),  NSWindowMiniaturizeButton);
