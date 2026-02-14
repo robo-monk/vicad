@@ -330,6 +330,10 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
                                             std::vector<ScriptSceneObject> *objects,
                                             std::string *error,
                                             const ReplayLodPolicy &lod_policy) {
+  // Bun caches file:// ESM modules per process and does not re-run top-level
+  // side effects for repeated imports of the same path. Restart per run to keep
+  // hot-reload behavior deterministic.
+  if (started_) Shutdown();
   if (!Start(error)) return false;
   if (!script_path || !objects) return set_err(error, "Invalid execute arguments.");
   objects->clear();
