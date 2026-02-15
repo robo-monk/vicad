@@ -13,6 +13,17 @@
 
 namespace vicad {
 
+enum class SketchPlaneKind : uint32_t {
+  XY = 0,
+  XZ = 1,
+  YZ = 2,
+};
+
+struct SketchPlane {
+  SketchPlaneKind kind = SketchPlaneKind::XY;
+  double offset = 0.0;
+};
+
 struct ReplayNodeSemantic {
   uint16_t opcode = 0;
   uint32_t out_id = 0;
@@ -29,6 +40,7 @@ struct ReplayTables {
   std::vector<bool> has_manifold;
   std::vector<manifold::CrossSection> cross_nodes;
   std::vector<bool> has_cross;
+  std::vector<SketchPlane> cross_plane;
   std::vector<ReplayNodeSemantic> node_semantics;
 };
 
@@ -40,6 +52,8 @@ bool ResolveReplayManifold(const ReplayTables &tables, uint32_t root_kind, uint3
                            manifold::Manifold *out, std::string *error);
 bool ResolveReplayCrossSection(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
                                manifold::CrossSection *out, std::string *error);
+bool ResolveReplayCrossSectionPlane(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                                    SketchPlane *out, std::string *error);
 bool BuildSketchDimensionModelForRoot(const ReplayTables &tables, uint32_t root_id,
                                       SketchDimensionModel *out, std::string *error);
 bool BuildOperationTraceForRoot(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,

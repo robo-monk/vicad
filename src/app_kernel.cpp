@@ -6,6 +6,12 @@
 #include <array>
 #include <cstdint>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <deque>
+#include <map>
+#include <set>
 #include <ctime>
 #include <optional>
 #include <sstream>
@@ -77,11 +83,17 @@ struct ClayUiState {
     Clay_ElementData exportPanelData;
     Clay_ElementData exportButtonData;
     Clay_ElementData topToolbarData;
-    Clay_ElementData fileMenuButtonData;
-    Clay_ElementData fileMenuDropdownData;
-    Clay_ElementData fileMenuOpenData;
-    std::array<Clay_ElementData, 8> fileMenuRecentData;
-    std::array<std::string, 128> textSlots;
+    Clay_ElementData tabsStripData;
+    Clay_ElementData tabPlusData;
+    Clay_ElementData toggleStatusData;
+    Clay_ElementData toggleInfoData;
+    Clay_ElementData toggleExportData;
+    Clay_ElementData newTabViewData;
+    Clay_ElementData newTabOpenData;
+    std::array<Clay_ElementData, 8> newTabRecentData;
+    std::vector<Clay_ElementData> editorTabData;
+    std::vector<Clay_ElementData> editorTabCloseData;
+    std::array<std::string, 512> textSlots;
 };
 
 static ClayUiState g_ui = {};
@@ -895,7 +907,19 @@ static float contour_signed_area(const std::vector<Vec2> &pts) {
         const Vec2 &p1 = pts[(i + 1) % n];
         a += (double)p0.x * (double)p1.y - (double)p1.x * (double)p0.y;
     }
-    return (float)(0.5 * a);
+  return (float)(0.5 * a);
+}
+
+static float contour_projected_area3d(const vicad::ScriptSketchContour &contour) {
+    const size_t n = contour.points.size();
+    if (n < 3) return 0.0f;
+    Vec3 area_vec = {0.0f, 0.0f, 0.0f};
+    for (size_t i = 0; i < n; ++i) {
+        const vicad::SceneVec3 &a = contour.points[i];
+        const vicad::SceneVec3 &b = contour.points[(i + 1) % n];
+        area_vec = add(area_vec, cross({a.x, a.y, a.z}, {b.x, b.y, b.z}));
+    }
+    return 0.5f * std::sqrt(dot(area_vec, area_vec));
 }
 
 static void contour_bbox(const std::vector<Vec2> &pts, Vec2 *mn, Vec2 *mx) {
@@ -1092,6 +1116,7 @@ static void orient_label_axes_for_camera(const Vec3 &eye,
                                          const Vec3 &anchor,
                                          const Vec3 &plane_normal,
                                          const Vec3 &fallback_right,
+                                         const Vec3 &fallback_up,
                                          Vec3 *out_right,
                                          Vec3 *out_up,
                                          Vec3 *out_facing_normal) {
@@ -1101,25 +1126,50 @@ static void orient_label_axes_for_camera(const Vec3 &eye,
         facing_normal = mul(facing_normal, -1.0f);
     }
 
-    Vec3 right = project_onto_plane(camera.right, facing_normal);
+    // Prefer stable plane axes first; only fall back to camera axes if degenerate.
+    Vec3 right = project_onto_plane(fallback_right, facing_normal);
     if (dot(right, right) <= 1e-8f) {
-        right = project_onto_plane(fallback_right, facing_normal);
+        right = project_onto_plane(camera.right, facing_normal);
     }
     if (dot(right, right) <= 1e-8f) {
         right = project_onto_plane(camera.up, facing_normal);
     }
     if (dot(right, right) <= 1e-8f) {
-        right = {1.0f, 0.0f, 0.0f};
+        const Vec3 seed = std::fabs(facing_normal.z) < 0.95f ? Vec3{0.0f, 0.0f, 1.0f} : Vec3{1.0f, 0.0f, 0.0f};
+        right = project_onto_plane(seed, facing_normal);
     }
     right = normalize(right);
     Vec3 up = normalize(cross(facing_normal, right));
-    if (dot(up, camera.up) < 0.0f) {
+    Vec3 preferred_up = project_onto_plane(fallback_up, facing_normal);
+    if (dot(preferred_up, preferred_up) <= 1e-8f) {
+        preferred_up = project_onto_plane(camera.up, facing_normal);
+    }
+    if (dot(preferred_up, preferred_up) > 1e-8f && dot(up, preferred_up) < 0.0f) {
         right = mul(right, -1.0f);
         up = mul(up, -1.0f);
     }
     if (out_right) *out_right = right;
     if (out_up) *out_up = up;
     if (out_facing_normal) *out_facing_normal = facing_normal;
+}
+
+static Vec3 scene_point_to_vec3(const vicad::SceneVec3 &p) {
+    return {p.x, p.y, p.z};
+}
+
+static Vec2 contour_point_to_plane_local(const Vec3 &p,
+                                         const Vec3 &origin,
+                                         const Vec3 &axis_right,
+                                         const Vec3 &axis_up) {
+    const Vec3 d = sub(p, origin);
+    return {(float)dot(d, axis_right), (float)dot(d, axis_up)};
+}
+
+static Vec3 contour_point_from_plane_local(const Vec2 &p,
+                                           const Vec3 &origin,
+                                           const Vec3 &axis_right,
+                                           const Vec3 &axis_up) {
+    return add(origin, add(mul(axis_right, p.x), mul(axis_up, p.y)));
 }
 
 static float text_width_world(const char *text, float world_scale) {
@@ -1210,29 +1260,30 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
                                     const DimensionRenderContext &ctx,
                                     float alpha) {
     if (contour.points.size() < 2) return;
+    Vec3 text_right = {1.0f, 0.0f, 0.0f};
+    Vec3 text_up = {0.0f, 1.0f, 0.0f};
+    Vec3 plane_normal = {0.0f, 0.0f, 1.0f};
+    contour_plane_axes(contour, &text_right, &text_up, &plane_normal);
+    const Vec3 plane_origin = scene_point_to_vec3(contour.points.front());
+
     std::vector<Vec2> pts2;
     pts2.reserve(contour.points.size());
     for (const vicad::SceneVec3 &p : contour.points) {
-        pts2.push_back({p.x, p.y});
+        pts2.push_back(contour_point_to_plane_local(scene_point_to_vec3(p), plane_origin, text_right, text_up));
     }
-    const float z = contour.points.front().z;
     const Vec2 centroid = contour_centroid_mean(pts2);
     Vec2 bmin = {0.0f, 0.0f}, bmax = {0.0f, 0.0f};
     contour_bbox(pts2, &bmin, &bmax);
     const float bw = bmax.x - bmin.x;
     const float bh = bmax.y - bmin.y;
     const float bdiag = std::sqrt(bw * bw + bh * bh);
-    const Vec3 centroid3 = vec3_from_2d(centroid, z);
+    const Vec3 centroid3 = contour_point_from_plane_local(centroid, plane_origin, text_right, text_up);
     const float world_per_px = world_per_pixel_at_anchor(ctx, centroid3);
     float world_scale = (world_per_px * 27.0f) / (float)VICAD_BAKED_PIXEL_SIZE;
-    Vec3 text_right = {1.0f, 0.0f, 0.0f};
-    Vec3 text_up = {0.0f, 1.0f, 0.0f};
-    Vec3 plane_normal = {0.0f, 0.0f, 1.0f};
-    contour_plane_axes(contour, &text_right, &text_up, &plane_normal);
     Vec3 facing_right = text_right;
     Vec3 facing_up = text_up;
     Vec3 facing_normal = plane_normal;
-    orient_label_axes_for_camera(ctx.eye, ctx.camera, centroid3, plane_normal, text_right,
+    orient_label_axes_for_camera(ctx.eye, ctx.camera, centroid3, plane_normal, text_right, text_up,
                                  &facing_right, &facing_up, &facing_normal);
     const Vec3 label_lift = add(mul(facing_up, world_per_px * 10.0f),
                                 mul(facing_normal, world_per_px * 2.0f));
@@ -1273,8 +1324,8 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
     if (kind == SketchDimShapeKind::Circle || kind == SketchDimShapeKind::Point) {
         Vec2 a2 = {c_center.x - c_radius, c_center.y};
         Vec2 b2 = {c_center.x + c_radius, c_center.y};
-        const Vec3 a3 = add(vec3_from_2d(a2, z), dim_plane_lift);
-        const Vec3 b3 = add(vec3_from_2d(b2, z), dim_plane_lift);
+        const Vec3 a3 = add(contour_point_from_plane_local(a2, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 b3 = add(contour_point_from_plane_local(b2, plane_origin, text_right, text_up), dim_plane_lift);
         draw_world_line(a3, b3);
         const Vec3 mid = mul(add(a3, b3), 0.5f);
         draw_dimension_arrowheads_world(a3, b3, ctx.camera,
@@ -1290,10 +1341,10 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         draw_dimension_label_world(add(mid, label_lift), dim_dir, dim_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
         if (kind == SketchDimShapeKind::Point) {
             const float arm = (bdiag > 0.0f ? bdiag : 1.0f) * 0.06f + 0.04f;
-            draw_world_line(add(vec3_from_2d({c_center.x - arm, c_center.y}, z), dim_plane_lift),
-                            add(vec3_from_2d({c_center.x + arm, c_center.y}, z), dim_plane_lift));
-            draw_world_line(add(vec3_from_2d({c_center.x, c_center.y - arm}, z), dim_plane_lift),
-                            add(vec3_from_2d({c_center.x, c_center.y + arm}, z), dim_plane_lift));
+            draw_world_line(add(contour_point_from_plane_local({c_center.x - arm, c_center.y}, plane_origin, text_right, text_up), dim_plane_lift),
+                            add(contour_point_from_plane_local({c_center.x + arm, c_center.y}, plane_origin, text_right, text_up), dim_plane_lift));
+            draw_world_line(add(contour_point_from_plane_local({c_center.x, c_center.y - arm}, plane_origin, text_right, text_up), dim_plane_lift),
+                            add(contour_point_from_plane_local({c_center.x, c_center.y + arm}, plane_origin, text_right, text_up), dim_plane_lift));
         }
         return;
     }
@@ -1316,13 +1367,13 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const Vec2 w1 = add2(p1, mul2(n0, off));
         const Vec2 h0 = add2(p1, mul2(n1, off));
         const Vec2 h1 = add2(p2, mul2(n1, off));
-        const Vec3 w03 = add(vec3_from_2d(w0, z), dim_plane_lift);
-        const Vec3 w13 = add(vec3_from_2d(w1, z), dim_plane_lift);
-        const Vec3 h03 = add(vec3_from_2d(h0, z), dim_plane_lift);
-        const Vec3 h13 = add(vec3_from_2d(h1, z), dim_plane_lift);
-        const Vec3 p03 = add(vec3_from_2d(p0, z), dim_plane_lift);
-        const Vec3 p13 = add(vec3_from_2d(p1, z), dim_plane_lift);
-        const Vec3 p23 = add(vec3_from_2d(p2, z), dim_plane_lift);
+        const Vec3 w03 = add(contour_point_from_plane_local(w0, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 w13 = add(contour_point_from_plane_local(w1, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 h03 = add(contour_point_from_plane_local(h0, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 h13 = add(contour_point_from_plane_local(h1, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 p03 = add(contour_point_from_plane_local(p0, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 p13 = add(contour_point_from_plane_local(p1, plane_origin, text_right, text_up), dim_plane_lift);
+        const Vec3 p23 = add(contour_point_from_plane_local(p2, plane_origin, text_right, text_up), dim_plane_lift);
 
         draw_world_line(w03, w13);
         draw_world_line(h03, h13);
@@ -1352,11 +1403,11 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
 
     if (kind == SketchDimShapeKind::RegularPolygon) {
         const size_t n = pts2.size();
-        draw_world_line(add(vec3_from_2d(pts2[0], z), dim_plane_lift),
-                        add(vec3_from_2d(pts2[1], z), dim_plane_lift));
+        draw_world_line(add(contour_point_from_plane_local(pts2[0], plane_origin, text_right, text_up), dim_plane_lift),
+                        add(contour_point_from_plane_local(pts2[1], plane_origin, text_right, text_up), dim_plane_lift));
         const float across_flats = 2.0f * rp_radius * std::cos(3.1415926535f / (float)n);
         std::snprintf(text, sizeof(text), "N=%zu  S=%.3g  AF=%.3g", n, (double)rp_side, (double)across_flats);
-        draw_dimension_label_world(add(vec3_from_2d(rp_center, z), label_lift),
+        draw_dimension_label_world(add(contour_point_from_plane_local(rp_center, plane_origin, text_right, text_up), label_lift),
                                    facing_right, facing_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
         return;
     }
@@ -1367,8 +1418,8 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
             const Vec2 &a = pts2[i];
             const Vec2 &b = pts2[(i + 1) % n];
             const float e = length2(sub2v(b, a));
-            const Vec3 wa = add(vec3_from_2d(a, z), dim_plane_lift);
-            const Vec3 wb = add(vec3_from_2d(b, z), dim_plane_lift);
+            const Vec3 wa = add(contour_point_from_plane_local(a, plane_origin, text_right, text_up), dim_plane_lift);
+            const Vec3 wb = add(contour_point_from_plane_local(b, plane_origin, text_right, text_up), dim_plane_lift);
             const Vec3 mid = mul(add(wa, wb), 0.5f);
             format_dim(text, sizeof(text), "", e);
             Vec3 e_dir = normalize(sub(wb, wa));
@@ -1384,7 +1435,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         }
         const float area = std::fabs(contour_signed_area(pts2));
         std::snprintf(text, sizeof(text), "N=%zu  P=%.3g  A=%.3g", n, (double)perimeter, (double)area);
-        draw_dimension_label_world(add(vec3_from_2d(centroid, z), label_lift),
+        draw_dimension_label_world(add(contour_point_from_plane_local(centroid, plane_origin, text_right, text_up), label_lift),
                                    facing_right, facing_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
     }
 }
@@ -1421,7 +1472,7 @@ static void draw_sketch_dimension_model(const vicad::SketchDimensionModel &model
     Vec3 facing_right = {1.0f, 0.0f, 0.0f};
     Vec3 facing_up = {0.0f, 1.0f, 0.0f};
     Vec3 facing_normal = {0.0f, 0.0f, 1.0f};
-    orient_label_axes_for_camera(ctx.eye, ctx.camera, centroid3, facing_normal, facing_right,
+    orient_label_axes_for_camera(ctx.eye, ctx.camera, centroid3, facing_normal, facing_right, facing_up,
                                  &facing_right, &facing_up, &facing_normal);
     const Vec3 label_lift = add(mul(facing_up, world_per_px * 10.0f),
                                 mul(facing_normal, world_per_px * 2.0f));
@@ -1470,11 +1521,7 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
         float largest_area = -1.0f;
         for (size_t i = 0; i < obj.sketchContours.size(); ++i) {
             const vicad::ScriptSketchContour &c = obj.sketchContours[i];
-            if (c.points.size() < 3) continue;
-            std::vector<Vec2> pts;
-            pts.reserve(c.points.size());
-            for (const vicad::SceneVec3 &p : c.points) pts.push_back({p.x, p.y});
-            const float a = std::fabs(contour_signed_area(pts));
+            const float a = contour_projected_area3d(c);
             if (a > largest_area) {
                 largest_area = a;
                 largest_idx = i;
@@ -1742,21 +1789,21 @@ static int pick_scene_object_by_ray(const std::vector<vicad::ScriptSceneObject> 
     return best;
 }
 
-static void draw_orientation_cube(const CameraBasis &basis, i32 width, i32 height, int top_offset_px, float hud_scale) {
+static void draw_orientation_cube(const CameraBasis &basis, i32 width, i32 height, float hud_scale) {
     const float cube_scale = clampf(hud_scale / kHudLegacyScale, 0.5f, 2.0f);
-    int size = (int)std::lround((float)(width < height ? width : height) / 5.0f * cube_scale);
-    const int min_size = (int)std::lround(96.0f * cube_scale);
-    const int max_size = (int)std::lround(180.0f * cube_scale);
+    int size = (int)std::lround((float)(width < height ? width : height) / 5.8f * cube_scale);
+    const int min_size = (int)std::lround(86.0f * cube_scale);
+    const int max_size = (int)std::lround(148.0f * cube_scale);
     if (size < min_size) size = min_size;
     if (size > max_size) size = max_size;
     const int pad = (int)std::lround(16.0f * cube_scale);
     const int vx = width - size - pad;
-    const int vy = height - size - pad - top_offset_px;
+    const int vy = pad;
+    if (vx < 0 || vy < 0 || size <= 0) return;
 
     glEnable(GL_SCISSOR_TEST);
     glScissor(vx, vy, size, size);
-    glClearColor(0.12f, 0.14f, 0.17f, 1.0f);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glClear(GL_DEPTH_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
 
     glViewport(vx, vy, size, size);
@@ -1823,6 +1870,8 @@ static bool point_in_rect(int x, int y, int rx, int ry, int rw, int rh) {
 
 static const char *kRecentFilesPath = "build/vicad_recent_files.txt";
 static constexpr size_t kMaxRecentFiles = 8;
+static const char *kNewTabToken = "__vicad_new_tab__";
+static const char *kNewTabTitle = "New Tab";
 
 static bool file_exists_path(const std::string &path) {
     if (path.empty()) return false;
@@ -1884,6 +1933,7 @@ static void push_recent_file(std::vector<std::string> *recent_files, const std::
 
 static std::string recent_display_name(const std::string &path) {
     if (path.empty()) return "(untitled)";
+    if (path == kNewTabToken) return kNewTabTitle;
     std::filesystem::path p = std::filesystem::u8path(path);
     std::string file = p.filename().string();
     static const char *suffix = ".vicad.ts";
@@ -1894,6 +1944,178 @@ static std::string recent_display_name(const std::string &path) {
     if (file.empty()) file = path;
     return file;
 }
+
+static int find_tab_index_by_path(const std::vector<std::string> &tabs, const std::string &path) {
+    const std::string norm = normalize_path_lex(path);
+    if (norm.empty()) return -1;
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        if (tabs[i] == norm) return (int)i;
+    }
+    return -1;
+}
+
+static int add_or_activate_tab(std::vector<std::string> *tabs, const std::string &path) {
+    if (!tabs) return -1;
+    const std::string norm = normalize_path_lex(path);
+    if (norm.empty()) return -1;
+    const int existing = find_tab_index_by_path(*tabs, norm);
+    if (existing >= 0) return existing;
+    tabs->push_back(norm);
+    return (int)tabs->size() - 1;
+}
+
+static int find_new_tab_index(const std::vector<std::string> &tabs) {
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        if (tabs[i] == kNewTabToken) return (int)i;
+    }
+    return -1;
+}
+
+static int activate_or_add_new_tab(std::vector<std::string> *tabs) {
+    if (!tabs) return -1;
+    const int existing = find_new_tab_index(*tabs);
+    if (existing >= 0) return existing;
+    tabs->push_back(kNewTabToken);
+    return (int)tabs->size() - 1;
+}
+
+static int close_tab_at(std::vector<std::string> *tabs, int active_index, int close_index) {
+    if (!tabs) return active_index;
+    if (close_index < 0 || (size_t)close_index >= tabs->size()) return active_index;
+    tabs->erase(tabs->begin() + close_index);
+    if (tabs->empty()) return -1;
+    if (close_index < active_index) {
+        active_index -= 1;
+    } else if (close_index == active_index && active_index >= (int)tabs->size()) {
+        active_index = (int)tabs->size() - 1;
+    }
+    if (active_index < 0) active_index = 0;
+    if (active_index >= (int)tabs->size()) active_index = (int)tabs->size() - 1;
+    return active_index;
+}
+
+struct FileWatchStamp {
+    long long mtime_ns = -1;
+    long long ctime_ns = -1;
+    long long size_bytes = -1;
+    bool exists = false;
+};
+
+static FileWatchStamp read_file_watch_stamp(const std::string &path) {
+    FileWatchStamp stamp = {};
+    if (path.empty()) return stamp;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return stamp;
+    stamp.exists = true;
+#if defined(__APPLE__)
+    stamp.mtime_ns = (long long)st.st_mtimespec.tv_sec * 1000000000LL + (long long)st.st_mtimespec.tv_nsec;
+    stamp.ctime_ns = (long long)st.st_ctimespec.tv_sec * 1000000000LL + (long long)st.st_ctimespec.tv_nsec;
+#else
+    stamp.mtime_ns = (long long)st.st_mtime * 1000000000LL;
+    stamp.ctime_ns = (long long)st.st_ctime * 1000000000LL;
+#endif
+    stamp.size_bytes = (long long)st.st_size;
+    return stamp;
+}
+
+static bool file_watch_stamp_equal(const FileWatchStamp &a, const FileWatchStamp &b) {
+    return a.exists == b.exists &&
+           a.mtime_ns == b.mtime_ns &&
+           a.ctime_ns == b.ctime_ns &&
+           a.size_bytes == b.size_bytes;
+}
+
+class TabFileWatcher {
+  public:
+    TabFileWatcher() : stop_(false), thread_(&TabFileWatcher::RunLoop, this) {}
+
+    ~TabFileWatcher() { Stop(); }
+
+    void Stop() {
+        if (stop_.exchange(true)) return;
+        RGFW_stopCheckEvents();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    void SetWatchedPaths(const std::vector<std::string> &paths) {
+        std::vector<std::string> normalized;
+        normalized.reserve(paths.size());
+        for (const std::string &path : paths) {
+            if (path == kNewTabToken) continue;
+            const std::string norm = normalize_path_lex(path);
+            if (norm.empty()) continue;
+            if (std::find(normalized.begin(), normalized.end(), norm) != normalized.end()) continue;
+            normalized.push_back(norm);
+        }
+        std::sort(normalized.begin(), normalized.end());
+        std::lock_guard<std::mutex> lock(mutex_);
+        watched_paths_ = std::move(normalized);
+    }
+
+    void DrainChangedPaths(std::vector<std::string> *out_paths) {
+        if (!out_paths) return;
+        std::lock_guard<std::mutex> lock(mutex_);
+        while (!changed_paths_.empty()) {
+            const std::string path = changed_paths_.front();
+            changed_paths_.pop_front();
+            queued_paths_.erase(path);
+            out_paths->push_back(path);
+        }
+    }
+
+  private:
+    static constexpr int kPollIntervalMs = 12;
+
+    void RunLoop() {
+        std::map<std::string, FileWatchStamp> stamps;
+        while (!stop_.load()) {
+            bool notify_main_loop = false;
+            std::vector<std::string> paths;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                paths = watched_paths_;
+            }
+
+            for (auto it = stamps.begin(); it != stamps.end();) {
+                if (std::find(paths.begin(), paths.end(), it->first) == paths.end()) {
+                    it = stamps.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            for (const std::string &path : paths) {
+                const FileWatchStamp next = read_file_watch_stamp(path);
+                auto it = stamps.find(path);
+                if (it == stamps.end()) {
+                    stamps[path] = next;
+                    continue;
+                }
+                if (file_watch_stamp_equal(it->second, next)) continue;
+                it->second = next;
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (queued_paths_.insert(path).second) {
+                    changed_paths_.push_back(path);
+                    notify_main_loop = true;
+                }
+            }
+
+            if (notify_main_loop) {
+                RGFW_stopCheckEvents();
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+        }
+    }
+
+    std::atomic<bool> stop_;
+    std::thread thread_;
+    std::mutex mutex_;
+    std::vector<std::string> watched_paths_;
+    std::deque<std::string> changed_paths_;
+    std::set<std::string> queued_paths_;
+};
 
 static bool open_script_dialog(std::string *out_path, std::string *err) {
 #ifdef VICAD_HAS_NFD
@@ -2184,7 +2406,13 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                                              const std::string &export_status_line,
                                              bool export_status_ok,
                                              const std::vector<std::string> &recent_files,
-                                             bool file_menu_open) {
+                                             const std::vector<std::string> &open_editor_tabs,
+                                             int active_editor_tab,
+                                             bool show_status_hud,
+                                             bool show_info_hud,
+                                             bool show_export_hud,
+                                             bool show_new_tab_view,
+                                             int traffic_light_right_inset_px) {
     const float hud = vicad_render_ui::ClampHudScale(hud_scale);
     const int root_pad = (int)std::lround(16.0f * hud);
     int panel_w = (int)std::lround(320.0f * hud);
@@ -2198,6 +2426,13 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     const int body_font = (int)std::lround(15.0f * hud);
     const int small_font = (int)std::lround(14.0f * hud);
     const int stack_gap = (int)std::lround(8.0f * hud);
+    const int tab_close_font = (int)std::lround(12.0f * hud);
+    const int tab_hpad = (int)std::lround(9.0f * hud);
+    const int tab_min_w = (int)std::lround(120.0f * hud);
+    const int tab_max_w = (int)std::lround(280.0f * hud);
+    const int toolbar_w = width > 0 ? width : 1;
+    const int toolbar_h = header_h + body_gap;
+    const int mac_left_spacer = traffic_light_right_inset_px > 0 ? traffic_light_right_inset_px : 0;
 
     clay_init(width, height);
     Clay_SetCurrentContext(g_ui.ctx);
@@ -2284,6 +2519,11 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     for (size_t i = 0; i < recent_count; ++i) {
         recent_label_slots[i] = ui_text_slot(slot++, recent_display_name(recent_files[i]));
     }
+    std::vector<Clay_String> tab_label_slots;
+    tab_label_slots.reserve(open_editor_tabs.size());
+    for (size_t i = 0; i < open_editor_tabs.size(); ++i) {
+        tab_label_slots.push_back(ui_text_slot(slot++, recent_display_name(open_editor_tabs[i])));
+    }
 
     std::vector<std::string> info_lines;
     info_lines.reserve(24);
@@ -2327,75 +2567,136 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
         }
     }
 
+    CLAY(CLAY_ID("UiRoot"), {
+        .layout = {
+            .layoutDirection = CLAY_TOP_TO_BOTTOM,
+            .sizing = {.width = CLAY_SIZING_FIXED((float)toolbar_w), .height = CLAY_SIZING_GROW(0)},
+            .childGap = 0,
+        },
+    }) {
     CLAY(CLAY_ID("TopToolbarRoot"), {
         .layout = {
             .layoutDirection = CLAY_LEFT_TO_RIGHT,
-            .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)(header_h + body_gap))},
+            .sizing = {.width = CLAY_SIZING_FIXED((float)toolbar_w), .height = CLAY_SIZING_FIXED((float)toolbar_h)},
             .padding = {(uint16_t)root_pad, (uint16_t)root_pad, (uint16_t)(header_pad / 2), (uint16_t)(header_pad / 2)},
-            .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_TOP},
+            .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
             .childGap = (uint16_t)body_gap,
         },
         .backgroundColor = {238, 238, 238, 255},
     }) {
-        CLAY(CLAY_ID("FileMenuButton"), {
+        if (mac_left_spacer > 0) {
+            CLAY(CLAY_ID("MacTrafficLeftSpacer"), {
+                .layout = {
+                    .sizing = {.width = CLAY_SIZING_FIXED((float)mac_left_spacer), .height = CLAY_SIZING_FIXED((float)header_h)},
+                }
+            }) {}
+        }
+        CLAY(CLAY_ID("TabsStrip"), {
             .layout = {
                 .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                .sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIXED((float)header_h)},
-                .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad * 3 / 4), (uint16_t)(header_pad * 3 / 4)},
+                .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                .childGap = (uint16_t)body_gap,
+                .padding = {(uint16_t)1, (uint16_t)1, (uint16_t)1, (uint16_t)1},
                 .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
             },
-            .backgroundColor = file_menu_open ? (Clay_Color){216, 220, 226, 255} : (Clay_Color){232, 234, 238, 255},
-            .border = {.color = {190, 196, 204, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+            .clip = {.horizontal = true, .vertical = true},
         }) {
-            CLAY_TEXT(CLAY_STRING("File"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {34, 38, 44, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-        }
-        if (file_menu_open) {
-            CLAY(CLAY_ID("FileMenuDropdown"), {
-                .layout = {
-                    .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                    .sizing = {.width = CLAY_SIZING_FIXED((float)(panel_w * 0.5f)), .height = CLAY_SIZING_FIT(0)},
-                    .padding = CLAY_PADDING_ALL((uint16_t)header_pad),
-                    .childGap = (uint16_t)(body_gap + 1),
-                },
-                .floating = {
-                    .parentId = CLAY_ID("FileMenuButton").id,
-                    .attachPoints = {.element = CLAY_ATTACH_POINT_LEFT_TOP, .parent = CLAY_ATTACH_POINT_LEFT_BOTTOM},
-                    .offset = {0.0f, 2.0f},
-                    .zIndex = 2200,
-                    .attachTo = CLAY_ATTACH_TO_ELEMENT_WITH_ID,
-                    .clipTo = CLAY_CLIP_TO_NONE,
-                },
-                .backgroundColor = {248, 248, 248, 252},
-                .border = {.color = {188, 194, 201, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
-            }) {
-                CLAY(CLAY_ID("FileMenuOpenItem"), {
+            for (size_t i = 0; i < open_editor_tabs.size(); ++i) {
+                const bool tab_active = ((int)i == active_editor_tab);
+                const int tab_target_w = (int)text_width_for_cstr(tab_label_slots[i].chars, (float)small_font) +
+                                         tab_hpad * 2 + (int)std::lround(22.0f * hud);
+                int tab_w = tab_target_w;
+                if (tab_w < tab_min_w) tab_w = tab_min_w;
+                if (tab_w > tab_max_w) tab_w = tab_max_w;
+                CLAY(CLAY_IDI("EditorTab", (int)i), {
                     .layout = {
                         .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                        .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)(header_h - 2))},
-                        .padding = CLAY_PADDING_ALL((uint16_t)(header_pad - 1)),
+                        .sizing = {.width = CLAY_SIZING_FIXED((float)tab_w), .height = CLAY_SIZING_FIXED((float)header_h)},
+                        .padding = {(uint16_t)tab_hpad, (uint16_t)tab_hpad, (uint16_t)(header_pad / 2), (uint16_t)(header_pad / 2)},
+                        .childGap = (uint16_t)(header_pad / 2),
                         .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
                     },
-                    .backgroundColor = {241, 244, 248, 255},
-                    .border = {.color = {214, 218, 224, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+                    .backgroundColor = tab_active ? (Clay_Color){214, 220, 230, 255} : (Clay_Color){232, 234, 238, 255},
+                    .border = {.color = tab_active ? (Clay_Color){148, 158, 172, 255} : (Clay_Color){190, 196, 204, 255},
+                               .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
                 }) {
-                    CLAY_TEXT(CLAY_STRING("Open..."), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {34, 38, 44, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                }
-                CLAY_TEXT(CLAY_STRING("Recents"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {84, 92, 104, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-                for (size_t i = 0; i < recent_count; ++i) {
-                    CLAY(CLAY_IDI("FileMenuRecentItem", i), {
+                    CLAY(CLAY_IDI("EditorTabLabelWrap", (int)i), {
                         .layout = {
                             .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                            .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)(header_h - 4))},
-                            .padding = CLAY_PADDING_ALL((uint16_t)(header_pad - 2)),
+                            .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)},
                             .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
                         },
-                        .backgroundColor = {245, 247, 250, 255},
-                        .border = {.color = {220, 224, 230, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+                        .clip = {.horizontal = true, .vertical = true},
                     }) {
-                        CLAY_TEXT(recent_label_slots[i], CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {36, 42, 48, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                        CLAY_TEXT(tab_label_slots[i],
+                                  CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font,
+                                                    .textColor = {34, 38, 44, 255},
+                                                    .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    }
+                    CLAY(CLAY_IDI("EditorTabClose", (int)i), {
+                        .layout = {
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .sizing = {.width = CLAY_SIZING_FIXED((float)(header_h - 8)),
+                                       .height = CLAY_SIZING_FIXED((float)(header_h - 8))},
+                            .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+                        },
+                        .backgroundColor = tab_active ? (Clay_Color){201, 207, 216, 255} : (Clay_Color){222, 226, 232, 255},
+                    }) {
+                        CLAY_TEXT(CLAY_STRING("x"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)tab_close_font, .textColor = {58, 64, 72, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                     }
                 }
             }
+        }
+
+        CLAY(CLAY_ID("EditorTabPlus"), {
+            .layout = {
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .sizing = {.width = CLAY_SIZING_FIXED((float)header_h), .height = CLAY_SIZING_FIXED((float)header_h)},
+                .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+            },
+            .backgroundColor = {232, 234, 238, 255},
+            .border = {.color = {190, 196, 204, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY_TEXT(CLAY_STRING("+"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)title_font, .textColor = {34, 38, 44, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+        }
+
+        CLAY(CLAY_ID("ToggleStatusHud"), {
+            .layout = {
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad / 2), (uint16_t)(header_pad / 2)},
+                .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+            },
+            .backgroundColor = show_status_hud ? (Clay_Color){208, 220, 240, 255} : (Clay_Color){232, 234, 238, 255},
+            .border = {.color = {164, 176, 196, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY_TEXT(CLAY_STRING("Status"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {34, 38, 44, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+        }
+
+        CLAY(CLAY_ID("ToggleInfoHud"), {
+            .layout = {
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad / 2), (uint16_t)(header_pad / 2)},
+                .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+            },
+            .backgroundColor = show_info_hud ? (Clay_Color){208, 220, 240, 255} : (Clay_Color){232, 234, 238, 255},
+            .border = {.color = {164, 176, 196, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY_TEXT(CLAY_STRING("Info"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {34, 38, 44, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+        }
+
+        CLAY(CLAY_ID("ToggleExportHud"), {
+            .layout = {
+                .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                .sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad / 2), (uint16_t)(header_pad / 2)},
+                .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+            },
+            .backgroundColor = show_export_hud ? (Clay_Color){208, 220, 240, 255} : (Clay_Color){232, 234, 238, 255},
+            .border = {.color = {164, 176, 196, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY_TEXT(CLAY_STRING("Export"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {34, 38, 44, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
         }
     }
 
@@ -2408,7 +2709,8 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
             .childAlignment = {.x = CLAY_ALIGN_X_RIGHT, .y = CLAY_ALIGN_Y_TOP},
         }
     }) {
-        CLAY(CLAY_ID("StatusPanel"), {
+        if (show_status_hud) {
+            CLAY(CLAY_ID("StatusPanel"), {
             .layout = {
                 .layoutDirection = CLAY_TOP_TO_BOTTOM,
                 .sizing = {.width = CLAY_SIZING_FIXED((float)panel_w), .height = CLAY_SIZING_FIT(0)},
@@ -2475,9 +2777,11 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                     }
                 }
             }
+            }
         }
 
-        CLAY(CLAY_ID("InfoPanel"), {
+        if (show_info_hud) {
+            CLAY(CLAY_ID("InfoPanel"), {
             .layout = {
                 .layoutDirection = CLAY_TOP_TO_BOTTOM,
                 .sizing = {.width = CLAY_SIZING_FIXED((float)panel_w), .height = CLAY_SIZING_FIT(0)},
@@ -2509,54 +2813,117 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
                     CLAY_TEXT(s, CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {210, 222, 238, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                 }
             }
+            }
         }
 
-        CLAY(CLAY_ID("ExportPanel"), {
-            .layout = {
-                .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                .sizing = {.width = CLAY_SIZING_FIXED((float)panel_w), .height = CLAY_SIZING_FIT(0)},
-            },
-            .backgroundColor = {20, 25, 33, 235},
-            .border = {.color = {90, 100, 118, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
-        }) {
-            CLAY(CLAY_ID("ExportHeader"), {
-                .layout = {
-                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
-                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
-                    .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad * 3 / 4), (uint16_t)(header_pad * 3 / 4)},
-                    .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
-                },
-                .backgroundColor = {36, 44, 54, 250},
-            }) {
-                CLAY_TEXT(CLAY_STRING("EXPORT"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)title_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
-            }
-            CLAY(CLAY_ID_LOCAL("ExportBody"), {
+        if (show_export_hud) {
+            CLAY(CLAY_ID("ExportPanel"), {
                 .layout = {
                     .layoutDirection = CLAY_TOP_TO_BOTTOM,
-                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIT(0)},
-                    .padding = CLAY_PADDING_ALL((uint16_t)body_pad),
-                    .childGap = (uint16_t)body_gap,
-                }
+                    .sizing = {.width = CLAY_SIZING_FIXED((float)panel_w), .height = CLAY_SIZING_FIT(0)},
+                },
+                .backgroundColor = {20, 25, 33, 235},
+                .border = {.color = {90, 100, 118, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
             }) {
-                CLAY(CLAY_ID("Export3mfButton"), {
+                CLAY(CLAY_ID("ExportHeader"), {
                     .layout = {
                         .layoutDirection = CLAY_LEFT_TO_RIGHT,
                         .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
-                        .padding = CLAY_PADDING_ALL((uint16_t)header_pad),
-                        .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+                        .padding = {(uint16_t)header_pad, (uint16_t)header_pad, (uint16_t)(header_pad * 3 / 4), (uint16_t)(header_pad * 3 / 4)},
+                        .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
                     },
-                    .backgroundColor = {52, 84, 132, 255},
-                    .border = {.color = {120, 158, 214, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+                    .backgroundColor = {36, 44, 54, 250},
                 }) {
-                    CLAY_TEXT(CLAY_STRING("Export .3mf"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    CLAY_TEXT(CLAY_STRING("EXPORT"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)title_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
                 }
-                CLAY_TEXT(export_status_line_s,
-                          CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font,
-                                            .textColor = export_status_ok ? (Clay_Color){130, 230, 130, 255}
-                                                                          : (Clay_Color){255, 168, 140, 255},
-                                            .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+                CLAY(CLAY_ID_LOCAL("ExportBody"), {
+                    .layout = {
+                        .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                        .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIT(0)},
+                        .padding = CLAY_PADDING_ALL((uint16_t)body_pad),
+                        .childGap = (uint16_t)body_gap,
+                    }
+                }) {
+                    CLAY(CLAY_ID("Export3mfButton"), {
+                        .layout = {
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)header_h)},
+                            .padding = CLAY_PADDING_ALL((uint16_t)header_pad),
+                            .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+                        },
+                        .backgroundColor = {52, 84, 132, 255},
+                        .border = {.color = {120, 158, 214, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+                    }) {
+                        CLAY_TEXT(CLAY_STRING("Export .3mf"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    }
+                    CLAY_TEXT(export_status_line_s,
+                              CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font,
+                                                .textColor = export_status_ok ? (Clay_Color){130, 230, 130, 255}
+                                                                              : (Clay_Color){255, 168, 140, 255},
+                                                .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+                }
             }
         }
+    }
+
+    if (show_new_tab_view) {
+        int new_tab_w = toolbar_w - root_pad * 2;
+        if (new_tab_w > 680) new_tab_w = 680;
+        if (new_tab_w < 360) new_tab_w = 360;
+        CLAY(CLAY_ID("NewTabView"), {
+            .layout = {
+                .layoutDirection = CLAY_TOP_TO_BOTTOM,
+                .sizing = {.width = CLAY_SIZING_FIXED((float)new_tab_w), .height = CLAY_SIZING_FIT(0)},
+                .padding = CLAY_PADDING_ALL((uint16_t)(body_pad + header_pad)),
+                .childGap = (uint16_t)(body_gap + 4),
+            },
+            .floating = {
+                .parentId = CLAY_ID("UiRoot").id,
+                .attachPoints = {.element = CLAY_ATTACH_POINT_CENTER_CENTER, .parent = CLAY_ATTACH_POINT_CENTER_CENTER},
+                .zIndex = 2100,
+                .attachTo = CLAY_ATTACH_TO_ELEMENT_WITH_ID,
+                .clipTo = CLAY_CLIP_TO_NONE,
+            },
+            .backgroundColor = {247, 249, 252, 246},
+            .border = {.color = {182, 190, 203, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+        }) {
+            CLAY_TEXT(CLAY_STRING("Start a new tab"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)title_font, .textColor = {26, 31, 38, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+            CLAY_TEXT(CLAY_STRING("Open a script to begin, or jump into something recent."),
+                      CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {86, 96, 110, 255}, .wrapMode = CLAY_TEXT_WRAP_WORDS}));
+            CLAY(CLAY_ID("NewTabOpenFileButton"), {
+                .layout = {
+                    .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                    .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)(header_h + 2))},
+                    .padding = CLAY_PADDING_ALL((uint16_t)header_pad),
+                    .childAlignment = {.x = CLAY_ALIGN_X_CENTER, .y = CLAY_ALIGN_Y_CENTER},
+                },
+                .backgroundColor = {45, 114, 198, 255},
+                .border = {.color = {88, 142, 214, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+            }) {
+                CLAY_TEXT(CLAY_STRING("Open File"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)body_font, .textColor = {245, 248, 252, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+            }
+
+            CLAY_TEXT(CLAY_STRING("Recent"), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {84, 92, 104, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+            if (recent_count == 0) {
+                CLAY_TEXT(CLAY_STRING("No recent scripts yet."), CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {124, 132, 143, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+            } else {
+                for (size_t i = 0; i < recent_count; ++i) {
+                    CLAY(CLAY_IDI("NewTabRecentItem", (int)i), {
+                        .layout = {
+                            .layoutDirection = CLAY_LEFT_TO_RIGHT,
+                            .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED((float)(header_h + 4))},
+                            .padding = CLAY_PADDING_ALL((uint16_t)(header_pad - 1)),
+                            .childAlignment = {.x = CLAY_ALIGN_X_LEFT, .y = CLAY_ALIGN_Y_CENTER},
+                        },
+                        .backgroundColor = {237, 241, 247, 255},
+                        .border = {.color = {205, 213, 224, 255}, .width = {.left = 1, .right = 1, .top = 1, .bottom = 1}}
+                    }) {
+                        CLAY_TEXT(recent_label_slots[i], CLAY_TEXT_CONFIG({.fontSize = (uint16_t)small_font, .textColor = {30, 37, 46, 255}, .wrapMode = CLAY_TEXT_WRAP_NONE}));
+                    }
+                }
+            }
+        }
+    }
     }
 
     Clay_RenderCommandArray cmds = Clay_EndLayout();
@@ -2566,11 +2933,21 @@ static Clay_RenderCommandArray build_clay_ui(i32 width, i32 height, bool script_
     g_ui.exportPanelData = Clay_GetElementData(CLAY_ID("ExportPanel"));
     g_ui.exportButtonData = Clay_GetElementData(CLAY_ID("Export3mfButton"));
     g_ui.topToolbarData = Clay_GetElementData(CLAY_ID("TopToolbarRoot"));
-    g_ui.fileMenuButtonData = Clay_GetElementData(CLAY_ID("FileMenuButton"));
-    g_ui.fileMenuDropdownData = Clay_GetElementData(CLAY_ID("FileMenuDropdown"));
-    g_ui.fileMenuOpenData = Clay_GetElementData(CLAY_ID("FileMenuOpenItem"));
+    g_ui.tabsStripData = Clay_GetElementData(CLAY_ID("TabsStrip"));
+    g_ui.tabPlusData = Clay_GetElementData(CLAY_ID("EditorTabPlus"));
+    g_ui.toggleStatusData = Clay_GetElementData(CLAY_ID("ToggleStatusHud"));
+    g_ui.toggleInfoData = Clay_GetElementData(CLAY_ID("ToggleInfoHud"));
+    g_ui.toggleExportData = Clay_GetElementData(CLAY_ID("ToggleExportHud"));
+    g_ui.newTabViewData = Clay_GetElementData(CLAY_ID("NewTabView"));
+    g_ui.newTabOpenData = Clay_GetElementData(CLAY_ID("NewTabOpenFileButton"));
     for (size_t i = 0; i < kMaxRecentFiles; ++i) {
-        g_ui.fileMenuRecentData[i] = Clay_GetElementData(CLAY_IDI("FileMenuRecentItem", i));
+        g_ui.newTabRecentData[i] = Clay_GetElementData(CLAY_IDI("NewTabRecentItem", i));
+    }
+    g_ui.editorTabData.assign(open_editor_tabs.size(), {});
+    g_ui.editorTabCloseData.assign(open_editor_tabs.size(), {});
+    for (size_t i = 0; i < open_editor_tabs.size(); ++i) {
+        g_ui.editorTabData[i] = Clay_GetElementData(CLAY_IDI("EditorTab", (int)i));
+        g_ui.editorTabCloseData[i] = Clay_GetElementData(CLAY_IDI("EditorTabClose", (int)i));
     }
     return cmds;
 }
@@ -2598,6 +2975,10 @@ static int AppRunLoop() {
         push_recent_file(&recent_files, scene_session.script_path);
         save_recent_files(recent_files);
     }
+    std::vector<std::string> open_editor_tabs;
+    open_editor_tabs.push_back(normalize_path_lex(scene_session.script_path));
+    int active_editor_tab = 0;
+    scene_session.script_path = open_editor_tabs[0];
     std::vector<vicad::ScriptSceneObject> &script_scene = scene_session.scene_objects;
     std::string script_error;
 
@@ -2705,82 +3086,135 @@ static int AppRunLoop() {
     i32 last_mouse_y = 0;
     bool have_last_mouse = false;
     bool pick_debug_overlay = true;
-    bool file_menu_open = false;
+    bool show_status_hud = true;
+    bool show_info_hud = true;
+    bool show_export_hud = true;
     std::string export_status_line = "Ready (uses Export3MF LOD profile)";
     bool export_status_ok = true;
+    int traffic_light_right_inset_px = 0;
     bool needs_redraw = true;
-    auto activate_script_path = [&](const std::string &path) {
+    bool watch_paths_dirty = true;
+    bool active_script_reload_requested = true;
+    const auto frame_interval = std::chrono::milliseconds(16);
+    auto next_frame_deadline = std::chrono::steady_clock::now();
+    auto active_tab_is_new_tab = [&]() -> bool {
+        return active_editor_tab >= 0 &&
+               (size_t)active_editor_tab < open_editor_tabs.size() &&
+               open_editor_tabs[(size_t)active_editor_tab] == kNewTabToken;
+    };
+    auto activate_script_path = [&](const std::string &path, bool add_to_tabs) {
         const std::string norm = normalize_path_lex(path);
-        if (norm.empty()) return;
+        if (norm.empty()) return false;
         if (!file_exists_path(norm)) {
             export_status_ok = false;
             export_status_line = std::string("Missing file: ") + norm;
             needs_redraw = true;
-            return;
+            return false;
+        }
+        if (add_to_tabs) {
+            if (active_tab_is_new_tab()) {
+                open_editor_tabs[(size_t)active_editor_tab] = norm;
+                watch_paths_dirty = true;
+            } else {
+                const size_t prev_tab_count = open_editor_tabs.size();
+                const int tab_index = add_or_activate_tab(&open_editor_tabs, norm);
+                if (tab_index >= 0) active_editor_tab = tab_index;
+                if (open_editor_tabs.size() != prev_tab_count) watch_paths_dirty = true;
+            }
+        } else {
+            const int tab_index = find_tab_index_by_path(open_editor_tabs, norm);
+            if (tab_index >= 0) active_editor_tab = tab_index;
         }
         scene_session.script_path = norm;
         scene_session.last_mtime_ns = -1;
+        scene_session.last_ctime_ns = -1;
+        scene_session.last_size_bytes = -1;
         push_recent_file(&recent_files, norm);
         save_recent_files(recent_files);
         export_status_ok = true;
         export_status_line = std::string("Opened: ") + recent_display_name(norm);
+        active_script_reload_requested = true;
         needs_redraw = true;
+        return true;
     };
 
-    using Clock = std::chrono::steady_clock;
-    constexpr int kScriptPollIntervalMs = 250;
-    constexpr int kIdleWaitMaxMs = 50;
-    auto last_script_poll = Clock::now() - std::chrono::milliseconds(kScriptPollIntervalMs);
+    auto reload_active_script_if_changed = [&]() -> bool {
+        const long long prev_mtime = scene_session.last_mtime_ns;
+        const long long prev_ctime = scene_session.last_ctime_ns;
+        const long long prev_size = scene_session.last_size_bytes;
+        std::string reload_err;
+        vicad::ReplayLodPolicy lod_policy = {};
+        lod_policy.profile = vicad::LodProfile::Model;
+        const bool loaded = vicad_scene::SceneSessionReloadIfChanged(
+            &scene_session, &worker_client, lod_policy, &reload_err);
+        const bool changed =
+            scene_session.last_mtime_ns != prev_mtime ||
+            scene_session.last_ctime_ns != prev_ctime ||
+            scene_session.last_size_bytes != prev_size;
+        if (!changed) return false;
+        if (loaded) {
+            base_mesh = scene_session.merged_mesh;
+            mesh = base_mesh;
+            mesh_bmin = scene_session.bounds_min;
+            mesh_bmax = scene_session.bounds_max;
+            object_selected = false;
+            selected_object_index = -1;
+            hovered_object_index = -1;
+            face_select.dirty = true;
+            face_select.hoveredRegion = -1;
+            face_select.selectedRegion = -1;
+            edge_select.dirtyTopology = true;
+            edge_select.dirtySilhouette = true;
+            edge_select.hoveredEdge = -1;
+            edge_select.selectedEdge = -1;
+            edge_select.hoveredChain = -1;
+            edge_select.selectedChain = -1;
+            script_error.clear();
+            std::fprintf(stderr, "[vicad] script loaded: %s (ipc)\n", scene_session.script_path.c_str());
+        } else {
+            script_error = reload_err;
+            std::fprintf(stderr, "[vicad] script error:\n%s\n", script_error.c_str());
+        }
+        return true;
+    };
+
+    TabFileWatcher tab_file_watcher;
+    if (!active_tab_is_new_tab()) {
+        tab_file_watcher.SetWatchedPaths({scene_session.script_path});
+    } else {
+        tab_file_watcher.SetWatchedPaths({});
+    }
+    watch_paths_dirty = false;
 
     while (!RGFW_window_shouldClose(win)) {
-        const auto now = Clock::now();
-        const int since_script_poll_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_script_poll).count();
-        if (!needs_redraw && since_script_poll_ms < kScriptPollIntervalMs) {
-            int wait_ms = kScriptPollIntervalMs - since_script_poll_ms;
-            if (wait_ms > kIdleWaitMaxMs) wait_ms = kIdleWaitMaxMs;
-            if (wait_ms < 1) wait_ms = 1;
-            RGFW_waitForEvent(wait_ms);
+        if (watch_paths_dirty) {
+            if (!active_tab_is_new_tab()) {
+                tab_file_watcher.SetWatchedPaths({scene_session.script_path});
+            } else {
+                tab_file_watcher.SetWatchedPaths({});
+            }
+            watch_paths_dirty = false;
         }
 
-        const auto poll_now = Clock::now();
-        const int script_poll_elapsed_ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(
-            poll_now - last_script_poll).count();
-        if (script_poll_elapsed_ms >= kScriptPollIntervalMs) {
-            last_script_poll = poll_now;
-            const long long prev_mtime = scene_session.last_mtime_ns;
-            std::string reload_err;
-            vicad::ReplayLodPolicy lod_policy = {};
-            lod_policy.profile = vicad::LodProfile::Model;
-            const bool loaded = vicad_scene::SceneSessionReloadIfChanged(
-                &scene_session, &worker_client, lod_policy, &reload_err);
-            const bool changed = scene_session.last_mtime_ns != prev_mtime;
-            if (changed) {
-                if (loaded) {
-                    base_mesh = scene_session.merged_mesh;
-                    mesh = base_mesh;
-                    mesh_bmin = scene_session.bounds_min;
-                    mesh_bmax = scene_session.bounds_max;
-                    object_selected = false;
-                    selected_object_index = -1;
-                    hovered_object_index = -1;
-                    face_select.dirty = true;
-                    face_select.hoveredRegion = -1;
-                    face_select.selectedRegion = -1;
-                    edge_select.dirtyTopology = true;
-                    edge_select.dirtySilhouette = true;
-                    edge_select.hoveredEdge = -1;
-                    edge_select.selectedEdge = -1;
-                    edge_select.hoveredChain = -1;
-                    edge_select.selectedChain = -1;
-                    script_error.clear();
-                    std::fprintf(stderr, "[vicad] script loaded: %s (ipc)\n", scene_session.script_path.c_str());
-                } else {
-                    script_error = reload_err;
-                    std::fprintf(stderr, "[vicad] script error:\n%s\n", script_error.c_str());
+        std::vector<std::string> changed_paths;
+        tab_file_watcher.DrainChangedPaths(&changed_paths);
+        bool active_file_changed = false;
+        if (!active_tab_is_new_tab()) {
+            for (const std::string &path : changed_paths) {
+                if (path == scene_session.script_path) {
+                    active_file_changed = true;
+                    break;
                 }
-                needs_redraw = true;
             }
+        }
+        if (active_file_changed) active_script_reload_requested = true;
+        if (active_script_reload_requested && !active_tab_is_new_tab()) {
+            active_script_reload_requested = false;
+            if (reload_active_script_if_changed()) needs_redraw = true;
+        }
+
+        if (!needs_redraw) {
+            RGFW_waitForEvent(16);
         }
 
         while (RGFW_window_checkEvent(win, &event)) {
@@ -2925,25 +3359,6 @@ static int AppRunLoop() {
                     target = add(target, mul(basis.right, -(float)dx * world_per_pixel));
                     target = add(target, mul(basis.up, (float)dy * world_per_pixel));
                 }
-                i32 mouse_px_x = 0;
-                i32 mouse_px_y = 0;
-                vicad_picking::WindowMouseToPixel(event.mouse.x, event.mouse.y, window_w, window_h, width, height,
-                                                  &mouse_px_x, &mouse_px_y);
-                const bool over_file_button =
-                    g_ui.fileMenuButtonData.found &&
-                    point_in_rect(mouse_px_x, mouse_px_y,
-                                  (int)g_ui.fileMenuButtonData.boundingBox.x, (int)g_ui.fileMenuButtonData.boundingBox.y,
-                                  (int)g_ui.fileMenuButtonData.boundingBox.width, (int)g_ui.fileMenuButtonData.boundingBox.height);
-                const bool over_dropdown =
-                    g_ui.fileMenuDropdownData.found &&
-                    point_in_rect(mouse_px_x, mouse_px_y,
-                                  (int)g_ui.fileMenuDropdownData.boundingBox.x, (int)g_ui.fileMenuDropdownData.boundingBox.y,
-                                  (int)g_ui.fileMenuDropdownData.boundingBox.width, (int)g_ui.fileMenuDropdownData.boundingBox.height);
-                if (over_file_button || over_dropdown) {
-                    file_menu_open = true;
-                } else {
-                    file_menu_open = false;
-                }
             }
             if (event.type == RGFW_mouseButtonPressed && event.button.value == RGFW_mouseLeft) {
                 const bool alt_down = RGFW_window_isKeyDown(win, RGFW_altL) ||
@@ -2959,57 +3374,138 @@ static int AppRunLoop() {
                     i32 mouse_ui_x = mouse_px_x;
                     i32 mouse_ui_y = mouse_px_y;
 
-                    if (g_ui.fileMenuOpenData.found &&
+                    if (g_ui.newTabOpenData.found &&
                         point_in_rect(mouse_ui_x, mouse_ui_y,
-                                      (int)g_ui.fileMenuOpenData.boundingBox.x, (int)g_ui.fileMenuOpenData.boundingBox.y,
-                                      (int)g_ui.fileMenuOpenData.boundingBox.width, (int)g_ui.fileMenuOpenData.boundingBox.height)) {
+                                      (int)g_ui.newTabOpenData.boundingBox.x, (int)g_ui.newTabOpenData.boundingBox.y,
+                                      (int)g_ui.newTabOpenData.boundingBox.width, (int)g_ui.newTabOpenData.boundingBox.height)) {
                         std::string opened_path;
                         std::string open_err;
                         if (open_script_dialog(&opened_path, &open_err)) {
-                            activate_script_path(opened_path);
+                            activate_script_path(opened_path, true);
                         } else if (!open_err.empty()) {
                             export_status_ok = false;
                             export_status_line = open_err;
                         }
-                        file_menu_open = false;
                         continue;
                     }
                     bool picked_recent = false;
                     for (size_t i = 0; i < recent_files.size() && i < kMaxRecentFiles; ++i) {
-                        if (!g_ui.fileMenuRecentData[i].found) continue;
+                        if (!g_ui.newTabRecentData[i].found) continue;
                         if (!point_in_rect(mouse_ui_x, mouse_ui_y,
-                                           (int)g_ui.fileMenuRecentData[i].boundingBox.x,
-                                           (int)g_ui.fileMenuRecentData[i].boundingBox.y,
-                                           (int)g_ui.fileMenuRecentData[i].boundingBox.width,
-                                           (int)g_ui.fileMenuRecentData[i].boundingBox.height)) {
+                                           (int)g_ui.newTabRecentData[i].boundingBox.x,
+                                           (int)g_ui.newTabRecentData[i].boundingBox.y,
+                                           (int)g_ui.newTabRecentData[i].boundingBox.width,
+                                           (int)g_ui.newTabRecentData[i].boundingBox.height)) {
                             continue;
                         }
-                        activate_script_path(recent_files[i]);
-                        file_menu_open = false;
+                        activate_script_path(recent_files[i], true);
                         picked_recent = true;
                         break;
                     }
                     if (picked_recent) continue;
-                    if (g_ui.fileMenuButtonData.found &&
+
+                    bool tab_close_clicked = false;
+                    for (size_t i = 0; i < g_ui.editorTabCloseData.size() && i < open_editor_tabs.size(); ++i) {
+                        if (!g_ui.editorTabCloseData[i].found) continue;
+                        if (!point_in_rect(mouse_ui_x, mouse_ui_y,
+                                           (int)g_ui.editorTabCloseData[i].boundingBox.x,
+                                           (int)g_ui.editorTabCloseData[i].boundingBox.y,
+                                           (int)g_ui.editorTabCloseData[i].boundingBox.width,
+                                           (int)g_ui.editorTabCloseData[i].boundingBox.height)) {
+                            continue;
+                        }
+                        if (open_editor_tabs.size() > 1) {
+                            active_editor_tab = close_tab_at(&open_editor_tabs, active_editor_tab, (int)i);
+                            watch_paths_dirty = true;
+                            if (active_editor_tab >= 0 && (size_t)active_editor_tab < open_editor_tabs.size()) {
+                                if (open_editor_tabs[(size_t)active_editor_tab] != kNewTabToken) {
+                                    activate_script_path(open_editor_tabs[(size_t)active_editor_tab], false);
+                                } else {
+                                    active_script_reload_requested = false;
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
+                        tab_close_clicked = true;
+                        break;
+                    }
+                    if (tab_close_clicked) continue;
+
+                    bool tab_switch_clicked = false;
+                    for (size_t i = 0; i < g_ui.editorTabData.size() && i < open_editor_tabs.size(); ++i) {
+                        if (!g_ui.editorTabData[i].found) continue;
+                        if (!point_in_rect(mouse_ui_x, mouse_ui_y,
+                                           (int)g_ui.editorTabData[i].boundingBox.x,
+                                           (int)g_ui.editorTabData[i].boundingBox.y,
+                                           (int)g_ui.editorTabData[i].boundingBox.width,
+                                           (int)g_ui.editorTabData[i].boundingBox.height)) {
+                            continue;
+                        }
+                        if ((int)i != active_editor_tab) {
+                            active_editor_tab = (int)i;
+                            if (open_editor_tabs[i] != kNewTabToken) {
+                                activate_script_path(open_editor_tabs[i], false);
+                            } else {
+                                active_script_reload_requested = false;
+                                needs_redraw = true;
+                            }
+                        }
+                        tab_switch_clicked = true;
+                        break;
+                    }
+                    if (tab_switch_clicked) continue;
+
+                    if (g_ui.tabPlusData.found &&
                         point_in_rect(mouse_ui_x, mouse_ui_y,
-                                      (int)g_ui.fileMenuButtonData.boundingBox.x, (int)g_ui.fileMenuButtonData.boundingBox.y,
-                                      (int)g_ui.fileMenuButtonData.boundingBox.width, (int)g_ui.fileMenuButtonData.boundingBox.height)) {
-                        file_menu_open = !file_menu_open;
+                                      (int)g_ui.tabPlusData.boundingBox.x, (int)g_ui.tabPlusData.boundingBox.y,
+                                      (int)g_ui.tabPlusData.boundingBox.width, (int)g_ui.tabPlusData.boundingBox.height)) {
+                        const size_t prev_tab_count = open_editor_tabs.size();
+                        const int new_tab_index = activate_or_add_new_tab(&open_editor_tabs);
+                        if (new_tab_index >= 0) {
+                            active_editor_tab = new_tab_index;
+                            active_script_reload_requested = false;
+                            if (open_editor_tabs.size() != prev_tab_count) {
+                                watch_paths_dirty = true;
+                            }
+                            needs_redraw = true;
+                        }
                         continue;
                     }
-                    if (g_ui.fileMenuDropdownData.found &&
+
+                    if (g_ui.toggleStatusData.found &&
                         point_in_rect(mouse_ui_x, mouse_ui_y,
-                                      (int)g_ui.fileMenuDropdownData.boundingBox.x, (int)g_ui.fileMenuDropdownData.boundingBox.y,
-                                      (int)g_ui.fileMenuDropdownData.boundingBox.width, (int)g_ui.fileMenuDropdownData.boundingBox.height)) {
+                                      (int)g_ui.toggleStatusData.boundingBox.x, (int)g_ui.toggleStatusData.boundingBox.y,
+                                      (int)g_ui.toggleStatusData.boundingBox.width, (int)g_ui.toggleStatusData.boundingBox.height)) {
+                        show_status_hud = !show_status_hud;
                         continue;
                     }
+                    if (g_ui.toggleInfoData.found &&
+                        point_in_rect(mouse_ui_x, mouse_ui_y,
+                                      (int)g_ui.toggleInfoData.boundingBox.x, (int)g_ui.toggleInfoData.boundingBox.y,
+                                      (int)g_ui.toggleInfoData.boundingBox.width, (int)g_ui.toggleInfoData.boundingBox.height)) {
+                        show_info_hud = !show_info_hud;
+                        continue;
+                    }
+                    if (g_ui.toggleExportData.found &&
+                        point_in_rect(mouse_ui_x, mouse_ui_y,
+                                      (int)g_ui.toggleExportData.boundingBox.x, (int)g_ui.toggleExportData.boundingBox.y,
+                                      (int)g_ui.toggleExportData.boundingBox.width, (int)g_ui.toggleExportData.boundingBox.height)) {
+                        show_export_hud = !show_export_hud;
+                        continue;
+                    }
+
                     if (g_ui.topToolbarData.found &&
                         point_in_rect(mouse_ui_x, mouse_ui_y,
                                       (int)g_ui.topToolbarData.boundingBox.x, (int)g_ui.topToolbarData.boundingBox.y,
                                       (int)g_ui.topToolbarData.boundingBox.width, (int)g_ui.topToolbarData.boundingBox.height)) {
                         continue;
                     }
-                    if (file_menu_open) file_menu_open = false;
+                    if (g_ui.newTabViewData.found &&
+                        point_in_rect(mouse_ui_x, mouse_ui_y,
+                                      (int)g_ui.newTabViewData.boundingBox.x, (int)g_ui.newTabViewData.boundingBox.y,
+                                      (int)g_ui.newTabViewData.boundingBox.width, (int)g_ui.newTabViewData.boundingBox.height)) {
+                        continue;
+                    }
 
                     if (g_ui.headerData.found &&
                         point_in_rect(mouse_ui_x, mouse_ui_y,
@@ -3053,6 +3549,9 @@ static int AppRunLoop() {
                         point_in_rect(mouse_ui_x, mouse_ui_y,
                                       (int)g_ui.exportPanelData.boundingBox.x, (int)g_ui.exportPanelData.boundingBox.y,
                                       (int)g_ui.exportPanelData.boundingBox.width, (int)g_ui.exportPanelData.boundingBox.height)) {
+                        continue;
+                    }
+                    if (active_tab_is_new_tab()) {
                         continue;
                     }
 
@@ -3120,12 +3619,32 @@ static int AppRunLoop() {
             }
         }
 
+        if (active_script_reload_requested && !active_tab_is_new_tab()) {
+            active_script_reload_requested = false;
+            if (reload_active_script_if_changed()) needs_redraw = true;
+        }
+
         if (!needs_redraw) continue;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_frame_deadline) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                next_frame_deadline - now);
+            const int wait_ms = (int)std::max<long long>(
+                1LL, std::min<long long>(16LL, remaining.count()));
+            RGFW_waitForEvent(wait_ms);
+            continue;
+        }
 
         if (height <= 0) height = 1;
         if (ui_height <= 0) ui_height = 1;
         const float display_scale = vicad_input::ComputeDisplayScale(width, height, window_w, window_h);
         const float hud_scale = kHudBaseScale * display_scale;
+#if defined(__APPLE__)
+        traffic_light_right_inset_px = (int)std::lround(84.0f * display_scale);
+#else
+        traffic_light_right_inset_px = 0;
+#endif
         ui_scale = 1.0f;
         glViewport(0, 0, width, height);
 
@@ -3169,7 +3688,13 @@ static int AppRunLoop() {
         ui_scroll_x = 0.0f;
         ui_scroll_y = 0.0f;
 
-        if (edge_select.enabled) {
+        if (active_tab_is_new_tab()) {
+            edge_select.hoveredEdge = -1;
+            edge_select.hoveredChain = -1;
+            face_select.hoveredRegion = -1;
+            hovered_object_index = -1;
+            object_selected = false;
+        } else if (edge_select.enabled) {
             if (edge_select.dirtyTopology) {
                 edge_select.edges = vicad::BuildEdgeTopology(mesh, edge_select.sharpAngleDeg);
                 edge_select.dirtyTopology = false;
@@ -3248,8 +3773,10 @@ static int AppRunLoop() {
         }
 
         const size_t scene_sketch_count = count_scene_sketches(script_scene);
+        const bool show_new_tab_view = active_tab_is_new_tab();
         const vicad::ScriptSceneObject *info_object = nullptr;
-        if (selected_object_index >= 0 &&
+        if (!show_new_tab_view &&
+            selected_object_index >= 0 &&
             (size_t)selected_object_index < script_scene.size()) {
             info_object = &script_scene[(size_t)selected_object_index];
         }
@@ -3269,88 +3796,78 @@ static int AppRunLoop() {
             hud_scale,
             face_select, edge_select,
             export_status_line, export_status_ok,
-            recent_files, file_menu_open);
+            recent_files,
+            open_editor_tabs, active_editor_tab,
+            show_status_hud, show_info_hud, show_export_hud, show_new_tab_view,
+            traffic_light_right_inset_px);
 
-        draw_grid(target, distance, fov_degrees, width, height);
-        draw_mesh(mesh);
-        draw_script_sketches(script_scene, selected_object_index, hovered_object_index);
-        if (feature_detection_enabled && edge_select.enabled) {
-            draw_feature_edges(mesh, edge_select.edges);
-            draw_silhouette_edges(mesh, edge_select.edges, edge_select.silhouette);
-            if (edge_select.hoveredChain >= 0 &&
-                edge_select.hoveredChain != edge_select.selectedChain) {
-                draw_chain_overlay(mesh, edge_select.edges, edge_select.hoveredChain,
-                                   4.0f, 0.38f, 0.73f, 1.0f, 0.96f);
-            } else if (edge_select.hoveredEdge >= 0 &&
-                       edge_select.hoveredEdge != edge_select.selectedEdge) {
-                draw_hovered_edge(mesh, edge_select.edges, edge_select.hoveredEdge);
-            }
-            if (edge_select.selectedChain >= 0) {
-                draw_chain_overlay(mesh, edge_select.edges, edge_select.selectedChain,
-                                   5.2f, 1.0f, 0.90f, 0.16f, 1.0f);
-            } else if (edge_select.selectedEdge >= 0) {
-                draw_selected_edge(mesh, edge_select.edges, edge_select.selectedEdge);
-            }
-        }
-        if (feature_detection_enabled && face_select.enabled) {
-            if (face_select.hoveredRegion >= 0 &&
-                face_select.hoveredRegion != face_select.selectedRegion) {
-                draw_face_region_overlay(mesh, face_select.faces, face_select.hoveredRegion,
-                                         0.34f, 0.66f, 1.00f, 0.18f);
-            }
-            if (face_select.selectedRegion >= 0) {
-                draw_face_region_overlay(mesh, face_select.faces, face_select.selectedRegion,
-                                         0.22f, 0.52f, 0.98f, 0.32f);
-            }
-        }
-        if (object_selected && !face_select.enabled && !edge_select.enabled) {
-            if (selected_object_index >= 0 &&
-                (size_t)selected_object_index < script_scene.size()) {
-                const vicad::ScriptSceneObject &obj = script_scene[(size_t)selected_object_index];
-                if (scene_object_is_manifold(obj)) {
-                    draw_mesh_selection_overlay(obj.mesh, 0.22f, 0.52f, 0.98f, 0.28f);
+        if (!show_new_tab_view) {
+            draw_grid(target, distance, fov_degrees, width, height);
+            draw_mesh(mesh);
+            draw_script_sketches(script_scene, selected_object_index, hovered_object_index);
+            if (feature_detection_enabled && edge_select.enabled) {
+                draw_feature_edges(mesh, edge_select.edges);
+                draw_silhouette_edges(mesh, edge_select.edges, edge_select.silhouette);
+                if (edge_select.hoveredChain >= 0 &&
+                    edge_select.hoveredChain != edge_select.selectedChain) {
+                    draw_chain_overlay(mesh, edge_select.edges, edge_select.hoveredChain,
+                                       4.0f, 0.38f, 0.73f, 1.0f, 0.96f);
+                } else if (edge_select.hoveredEdge >= 0 &&
+                           edge_select.hoveredEdge != edge_select.selectedEdge) {
+                    draw_hovered_edge(mesh, edge_select.edges, edge_select.hoveredEdge);
                 }
-            } else if (hovered_object_index >= 0 &&
-                       (size_t)hovered_object_index < script_scene.size()) {
-                const vicad::ScriptSceneObject &obj = script_scene[(size_t)hovered_object_index];
-                if (scene_object_is_manifold(obj)) {
-                    draw_mesh_selection_overlay(obj.mesh, 0.34f, 0.66f, 1.00f, 0.16f);
+                if (edge_select.selectedChain >= 0) {
+                    draw_chain_overlay(mesh, edge_select.edges, edge_select.selectedChain,
+                                       5.2f, 1.0f, 0.90f, 0.16f, 1.0f);
+                } else if (edge_select.selectedEdge >= 0) {
+                    draw_selected_edge(mesh, edge_select.edges, edge_select.selectedEdge);
                 }
-            } else {
-                draw_mesh_selection_overlay(mesh, 0.22f, 0.52f, 0.98f, 0.28f);
             }
+            if (feature_detection_enabled && face_select.enabled) {
+                if (face_select.hoveredRegion >= 0 &&
+                    face_select.hoveredRegion != face_select.selectedRegion) {
+                    draw_face_region_overlay(mesh, face_select.faces, face_select.hoveredRegion,
+                                             0.34f, 0.66f, 1.00f, 0.18f);
+                }
+                if (face_select.selectedRegion >= 0) {
+                    draw_face_region_overlay(mesh, face_select.faces, face_select.selectedRegion,
+                                             0.22f, 0.52f, 0.98f, 0.32f);
+                }
+            }
+            if (object_selected && !face_select.enabled && !edge_select.enabled) {
+                if (selected_object_index >= 0 &&
+                    (size_t)selected_object_index < script_scene.size()) {
+                    const vicad::ScriptSceneObject &obj = script_scene[(size_t)selected_object_index];
+                    if (scene_object_is_manifold(obj)) {
+                        draw_mesh_selection_overlay(obj.mesh, 0.22f, 0.52f, 0.98f, 0.28f);
+                    }
+                } else if (hovered_object_index >= 0 &&
+                           (size_t)hovered_object_index < script_scene.size()) {
+                    const vicad::ScriptSceneObject &obj = script_scene[(size_t)hovered_object_index];
+                    if (scene_object_is_manifold(obj)) {
+                        draw_mesh_selection_overlay(obj.mesh, 0.34f, 0.66f, 1.00f, 0.16f);
+                    }
+                } else {
+                    draw_mesh_selection_overlay(mesh, 0.22f, 0.52f, 0.98f, 0.28f);
+                }
+            }
+            DimensionRenderContext dim_ctx = {};
+            dim_ctx.eye = eye;
+            dim_ctx.camera = basis;
+            dim_ctx.fovDegrees = fov_degrees;
+            dim_ctx.viewportHeight = height;
+            dim_ctx.arrowPixels = 4.0f;
+            draw_script_sketch_dimensions(script_scene, selected_object_index, dim_ctx, show_sketch_dimensions);
+            if (pick_debug_overlay) {
+                draw_pick_debug_overlay(width, height, window_w, window_h,
+                                        mouse_x, mouse_y, mouse_px_x, mouse_px_y);
+            }
+            draw_orientation_cube(basis, width, height, hud_scale);
         }
-        DimensionRenderContext dim_ctx = {};
-        dim_ctx.eye = eye;
-        dim_ctx.camera = basis;
-        dim_ctx.fovDegrees = fov_degrees;
-        dim_ctx.viewportHeight = height;
-        dim_ctx.arrowPixels = 4.0f;
-        draw_script_sketch_dimensions(script_scene, selected_object_index, dim_ctx, show_sketch_dimensions);
-        if (pick_debug_overlay) {
-            draw_pick_debug_overlay(width, height, window_w, window_h,
-                                    mouse_x, mouse_y, mouse_px_x, mouse_px_y);
-        }
-        const int status_bottom = g_ui.panelData.found
-            ? (int)std::lround(g_ui.panelData.boundingBox.y + g_ui.panelData.boundingBox.height)
-            : 0;
-        const int info_bottom = g_ui.infoPanelData.found
-            ? (int)std::lround(g_ui.infoPanelData.boundingBox.y + g_ui.infoPanelData.boundingBox.height)
-            : 0;
-        const int export_bottom = g_ui.exportPanelData.found
-            ? (int)std::lround(g_ui.exportPanelData.boundingBox.y + g_ui.exportPanelData.boundingBox.height)
-            : 0;
-        const int toolbar_bottom = g_ui.topToolbarData.found
-            ? (int)std::lround(g_ui.topToolbarData.boundingBox.y + g_ui.topToolbarData.boundingBox.height)
-            : 0;
-        int top_right_offset = status_bottom > info_bottom ? status_bottom : info_bottom;
-        if (export_bottom > top_right_offset) top_right_offset = export_bottom;
-        if (toolbar_bottom > top_right_offset) top_right_offset = toolbar_bottom;
-        top_right_offset += 8;
-        draw_orientation_cube(basis, width, height, top_right_offset, hud_scale);
         clay_render_commands(ui_cmds, width, height, ui_scale);
 
         RGFW_window_swapBuffers_OpenGL(win);
+        next_frame_deadline = std::chrono::steady_clock::now() + frame_interval;
         needs_redraw = false;
     }
 

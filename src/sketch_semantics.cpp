@@ -219,7 +219,8 @@ bool eval_sketch_node(const ReplayTables &tables,
     case OpCode::CrossTranslate:
     case OpCode::CrossRotate:
     case OpCode::CrossFillet:
-    case OpCode::CrossOffsetClone: {
+    case OpCode::CrossOffsetClone:
+    case OpCode::CrossPlane: {
       if (node.inputs.empty()) {
         *error = "Replay failed: malformed cross transform semantic node.";
         visiting->erase(id);
@@ -258,8 +259,10 @@ bool eval_sketch_node(const ReplayTables &tables,
         }
         res.has_fillet = true;
         res.fillet_radius = std::fabs(node.params_f64[0]);
-      } else {
+      } else if ((OpCode)node.opcode == OpCode::CrossOffsetClone) {
         res.fallback_only = true;
+      } else if ((OpCode)node.opcode == OpCode::CrossPlane) {
+        // Plane remapping preserves local 2D sketch semantics.
       }
     } break;
     default:

@@ -33,6 +33,7 @@ const char *op_name(uint16_t opcode) {
     case OpCode::CrossPolygons: return "CrossPolygons";
     case OpCode::CrossFillet: return "CrossFillet";
     case OpCode::CrossOffsetClone: return "CrossOffsetClone";
+    case OpCode::CrossPlane: return "CrossPlane";
     default: return "Unknown";
   }
 }

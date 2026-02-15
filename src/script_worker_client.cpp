@@ -118,6 +118,15 @@ bool compute_sketch_bounds(const std::vector<ScriptSketchContour> &contours,
   return true;
 }
 
+SceneVec3 map_sketch_point_to_world(double x, double y, const SketchPlane &plane) {
+  switch (plane.kind) {
+    case SketchPlaneKind::XY: return {(float)x, (float)y, (float)plane.offset};
+    case SketchPlaneKind::XZ: return {(float)x, (float)plane.offset, (float)-y};
+    case SketchPlaneKind::YZ: return {(float)plane.offset, (float)x, (float)y};
+  }
+  return {(float)x, (float)y, (float)plane.offset};
+}
+
 bool write_all(int fd, const void *buf, size_t len) {
   const uint8_t *p = (const uint8_t *)buf;
   size_t off = 0;
@@ -470,11 +479,14 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
     } else if (rec.root_kind == (uint32_t)NodeKind::CrossSection) {
       manifold::CrossSection cs;
       if (!ResolveReplayCrossSection(tables, rec.root_kind, rec.root_id, &cs, error)) return false;
+      SketchPlane plane;
+      if (!ResolveReplayCrossSectionPlane(tables, rec.root_kind, rec.root_id, &plane, error)) return false;
       obj.kind = ScriptSceneObjectKind::CrossSection;
       obj.mesh.numProp = 3;
       SketchDimensionModel dims;
       std::string dim_error;
-      if (BuildSketchDimensionModelForRoot(tables, rec.root_id, &dims, &dim_error)) {
+      if (plane.kind == SketchPlaneKind::XY &&
+          BuildSketchDimensionModelForRoot(tables, rec.root_id, &dims, &dim_error)) {
         obj.sketchDims = std::move(dims);
       } else {
         obj.sketchDims.reset();
@@ -486,7 +498,7 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
         ScriptSketchContour contour;
         contour.points.reserve(poly.size());
         for (const manifold::vec2 &p : poly) {
-          contour.points.push_back({(float)p.x, (float)p.y, 0.0f});
+          contour.points.push_back(map_sketch_point_to_world(p.x, p.y, plane));
         }
         obj.sketchContours.push_back(std::move(contour));
       }

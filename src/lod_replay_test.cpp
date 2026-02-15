@@ -1,5 +1,6 @@
 #include "op_decoder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -108,6 +109,26 @@ std::vector<uint8_t> payload_cross_offset_clone(uint32_t out_id, uint32_t in_id,
   return out;
 }
 
+std::vector<uint8_t> payload_cross_plane(uint32_t out_id, uint32_t in_id,
+                                         uint32_t kind, double offset) {
+  std::vector<uint8_t> out;
+  append_pod(&out, out_id);
+  append_pod(&out, in_id);
+  append_pod(&out, kind);
+  append_pod(&out, offset);
+  return out;
+}
+
+std::vector<uint8_t> payload_cross_translate(uint32_t out_id, uint32_t in_id,
+                                             double x, double y) {
+  std::vector<uint8_t> out;
+  append_pod(&out, out_id);
+  append_pod(&out, in_id);
+  append_pod(&out, x);
+  append_pod(&out, y);
+  return out;
+}
+
 std::vector<uint8_t> payload_extrude(uint32_t out_id, uint32_t cs_id, double h,
                                      uint32_t divisions, double twist) {
   std::vector<uint8_t> out;
@@ -136,6 +157,30 @@ bool require(bool cond, const char* msg) {
   if (cond) return true;
   std::cerr << "[lod_replay_test] FAIL: " << msg << "\n";
   return false;
+}
+
+bool mesh_bounds(const manifold::MeshGL &mesh, manifold::vec3 *out_min, manifold::vec3 *out_max) {
+  if (!out_min || !out_max) return false;
+  if (mesh.numProp < 3 || mesh.vertProperties.empty()) return false;
+  const size_t count = mesh.vertProperties.size() / mesh.numProp;
+  if (count == 0) return false;
+  manifold::vec3 bmin(1e30, 1e30, 1e30);
+  manifold::vec3 bmax(-1e30, -1e30, -1e30);
+  for (size_t i = 0; i < count; ++i) {
+    const size_t at = i * mesh.numProp;
+    const double x = mesh.vertProperties[at + 0];
+    const double y = mesh.vertProperties[at + 1];
+    const double z = mesh.vertProperties[at + 2];
+    bmin.x = std::min(bmin.x, x);
+    bmin.y = std::min(bmin.y, y);
+    bmin.z = std::min(bmin.z, z);
+    bmax.x = std::max(bmax.x, x);
+    bmax.y = std::max(bmax.y, y);
+    bmax.z = std::max(bmax.z, z);
+  }
+  *out_min = bmin;
+  *out_max = bmax;
+  return true;
 }
 
 }  // namespace
@@ -272,6 +317,80 @@ int main() {
                        "offset clone export");
     ok = ok && require(d.NumTri() == m.NumTri() && m.NumTri() == e.NumTri(),
                        "offset clone tri count unchanged across profiles");
+  }
+
+  {
+    // XZ plane extrude should advance along +Y.
+    std::vector<uint8_t> rec;
+    append_record(&rec, vicad::OpCode::CrossSquare,
+                  payload_cross_square(1, 10.0, 10.0, 1));
+    append_record(&rec, vicad::OpCode::CrossPlane,
+                  payload_cross_plane(2, 1, 1, 0.0));
+    append_record(&rec, vicad::OpCode::Extrude,
+                  payload_extrude(3, 2, 10.0, 0, 0.0));
+
+    manifold::MeshGL mesh;
+    std::string err;
+    ok = ok && require(replay_to_mesh(rec, 3, 3, vicad::LodProfile::Model, &mesh, &err),
+                       "xz extrude replay");
+    manifold::vec3 bmin, bmax;
+    ok = ok && require(mesh_bounds(mesh, &bmin, &bmax), "xz extrude bounds");
+    ok = ok && require(std::fabs(bmin.y - 0.0) < 1e-6 && std::fabs(bmax.y - 10.0) < 1e-6,
+                       "xz extrude maps height to +Y");
+    ok = ok && require(std::fabs((bmax.x - bmin.x) - 10.0) < 1e-6 &&
+                       std::fabs((bmax.z - bmin.z) - 10.0) < 1e-6,
+                       "xz extrude keeps profile extents in X/Z");
+  }
+
+  {
+    // YZ plane extrude should advance along +X from offset.
+    std::vector<uint8_t> rec;
+    append_record(&rec, vicad::OpCode::CrossSquare,
+                  payload_cross_square(1, 8.0, 6.0, 1));
+    append_record(&rec, vicad::OpCode::CrossPlane,
+                  payload_cross_plane(2, 1, 2, 7.0));
+    append_record(&rec, vicad::OpCode::Extrude,
+                  payload_extrude(3, 2, 5.0, 0, 0.0));
+
+    manifold::MeshGL mesh;
+    std::string err;
+    ok = ok && require(replay_to_mesh(rec, 3, 3, vicad::LodProfile::Model, &mesh, &err),
+                       "yz extrude replay");
+    manifold::vec3 bmin, bmax;
+    ok = ok && require(mesh_bounds(mesh, &bmin, &bmax), "yz extrude bounds");
+    ok = ok && require(std::fabs(bmin.x - 7.0) < 1e-6 && std::fabs(bmax.x - 12.0) < 1e-6,
+                       "yz extrude maps height to +X with offset");
+    ok = ok && require(std::fabs((bmax.y - bmin.y) - 8.0) < 1e-6 &&
+                       std::fabs((bmax.z - bmin.z) - 6.0) < 1e-6,
+                       "yz extrude keeps profile extents in Y/Z");
+  }
+
+  {
+    // CrossPlane metadata should propagate through cross transforms.
+    std::vector<uint8_t> rec;
+    append_record(&rec, vicad::OpCode::CrossSquare,
+                  payload_cross_square(1, 20.0, 20.0, 1));
+    append_record(&rec, vicad::OpCode::CrossPlane,
+                  payload_cross_plane(2, 1, 1, 3.0));
+    append_record(&rec, vicad::OpCode::CrossTranslate,
+                  payload_cross_translate(3, 2, 4.0, 0.0));
+    append_record(&rec, vicad::OpCode::CrossFillet,
+                  payload_cross_fillet(4, 3, 2.0));
+    append_record(&rec, vicad::OpCode::CrossOffsetClone,
+                  payload_cross_offset_clone(5, 4, 1.0));
+
+    vicad::ReplayTables tables;
+    std::string err;
+    vicad::ReplayLodPolicy lod_policy = {};
+    lod_policy.profile = vicad::LodProfile::Model;
+    ok = ok && require(vicad::ReplayOpsToTables(rec.data(), rec.size(), 5, lod_policy, &tables, &err),
+                       "cross plane replay tables");
+    vicad::SketchPlane plane;
+    ok = ok && require(vicad::ResolveReplayCrossSectionPlane(
+                           tables, (uint32_t)vicad::NodeKind::CrossSection, 5, &plane, &err),
+                       "resolve propagated cross plane");
+    ok = ok && require((uint32_t)plane.kind == 1 && std::fabs(plane.offset - 3.0) < 1e-9,
+                       "cross plane metadata propagated");
   }
 
   if (!ok) return 1;

@@ -13,6 +13,12 @@ type SceneEntry = {
   name: string;
 };
 
+enum PlaneKind {
+  XY = 0,
+  XZ = 1,
+  YZ = 2,
+}
+
 const FNV64_OFFSET = 0xcbf29ce484222325n;
 const FNV64_PRIME = 0x100000001b3n;
 const U64_MASK = 0xffffffffffffffffn;
@@ -46,7 +52,7 @@ function hashCombine64(parts: bigint[]) {
 
 function makePayload(parts: Part[]) {
   let bytes = 0;
-  for (const p of parts) bytes += p.t === "u32" ? 4 : p.t === "u64" ? 8 : 8;
+  for (const p of parts) bytes += p.t === "u32" ? 4 : 8;
   const out = new Uint8Array(bytes);
   const view = new DataView(out.buffer);
   let off = 0;
@@ -66,10 +72,10 @@ function makePayload(parts: Part[]) {
 }
 
 function makePolygonsPayload(outId: number, contours: [number, number][][]) {
-  let bytes = 8; // outId + contour count
+  let bytes = 8;
   for (const contour of contours) {
-    bytes += 4; // point count
-    bytes += contour.length * 16; // x,y per point
+    bytes += 4;
+    bytes += contour.length * 16;
   }
   const out = new Uint8Array(bytes);
   const view = new DataView(out.buffer);
@@ -116,7 +122,7 @@ function regularPolygonFromParallelDistance(sides: number, parallelDistance: num
   }
   const apothem = d * 0.5;
   const radius = apothem / Math.cos(Math.PI / n);
-  const start = Math.PI * 0.5 - Math.PI / n; // keep one side horizontal in the default orientation
+  const start = Math.PI * 0.5 - Math.PI / n;
   const pts: [number, number][] = [];
   let minX = Number.POSITIVE_INFINITY;
   let minY = Number.POSITIVE_INFINITY;
@@ -231,6 +237,85 @@ function toAnyRoot(value: unknown) {
 
 const _crossSections = new Set<CrossSection>();
 const _manifolds = new Set<Manifold>();
+
+function applyCrossPlane(crossSection: CrossSection, planeKind: PlaneKind, planeOffset: number, opName: string) {
+  crossSection.assertValid(opName);
+  if (planeKind === PlaneKind.XY && planeOffset === 0) {
+    return crossSection;
+  }
+  const out = reg.allocNodeId();
+  reg.push(OP.CROSS_PLANE, makePayload([
+    { t: "u32", v: out },
+    { t: "u32", v: crossSection.nodeId },
+    { t: "u32", v: planeKind },
+    { t: "f64", v: planeOffset },
+  ]));
+  crossSection.consume(opName);
+  return new CrossSection(out);
+}
+
+class PlaneHandle {
+  readonly kind: PlaneKind;
+  readonly distance: number;
+
+  constructor(kind: PlaneKind, distance = 0) {
+    if (!Number.isFinite(distance)) {
+      throw new Error("Plane.offset requires a finite distance.");
+    }
+    this.kind = kind;
+    this.distance = Number(distance);
+  }
+
+  offset(distance: number) {
+    const d = Number(distance);
+    if (!Number.isFinite(d)) {
+      throw new Error("Plane.offset requires a finite distance.");
+    }
+    return new PlaneHandle(this.kind, this.distance + d);
+  }
+
+  private withPlane(crossSection: CrossSection, opName: string) {
+    return applyCrossPlane(crossSection, this.kind, this.distance, opName);
+  }
+
+  rectangle(sizeOrWidth: number | Vec2Like = [1, 1], heightOrCenter?: number | boolean, centerArg = false) {
+    return this.withPlane(CrossSection.rectangle(sizeOrWidth, heightOrCenter, centerArg), "Plane.rectangle");
+  }
+
+  square(size: number | Vec2Like = [1, 1], center = false) {
+    return this.withPlane(CrossSection.square(size, center), "Plane.square");
+  }
+
+  circle(radius = 1) {
+    return this.withPlane(CrossSection.circle(radius), "Plane.circle");
+  }
+
+  point(position: Vec2Like = [0, 0], radius = 0.1) {
+    return this.withPlane(CrossSection.point(position, radius), "Plane.point");
+  }
+
+  polygons(contours: Vec2Like[][]) {
+    return this.withPlane(CrossSection.polygons(contours), "Plane.polygons");
+  }
+
+  polygon(points: Vec2Like[]) {
+    return this.withPlane(CrossSection.polygon(points), "Plane.polygon");
+  }
+
+  regularPolygon(sides: number, parallelDistance: number, center = true) {
+    return this.withPlane(CrossSection.regularPolygon(sides, parallelDistance, center), "Plane.regularPolygon");
+  }
+}
+
+export class Plane {
+  static XY() { return new PlaneHandle(PlaneKind.XY, 0); }
+  static XZ() { return new PlaneHandle(PlaneKind.XZ, 0); }
+  static YZ() { return new PlaneHandle(PlaneKind.YZ, 0); }
+}
+
+export const XY = Plane.XY();
+export const XZ = Plane.XZ();
+export const YZ = Plane.YZ();
 
 export class CrossSection {
   readonly nodeId: number;

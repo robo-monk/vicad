@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { NODE_KIND, OP } from "./ipc_protocol";
-import { __vicadBeginRun, __vicadEncodeScene, CrossSection, Manifold, vicad } from "./proxy-manifold";
+import { __vicadBeginRun, __vicadEncodeScene, CrossSection, Manifold, Plane, XY, XZ, vicad } from "./proxy-manifold";
 
 type DecodedOp = {
   opcode: number;
@@ -219,5 +219,54 @@ describe("Auto-add lifecycle", () => {
     const ids = scene.sceneEntries.map((e) => e.rootId);
     expect(ids.includes(sketch.nodeId)).toBe(true);
     expect(ids.includes(solid.nodeId)).toBe(true);
+  });
+});
+
+describe("Plane primitives", () => {
+  it("XY.rectangle parity with CrossSection.rectangle", () => {
+    __vicadBeginRun();
+    const plain = CrossSection.rectangle(10, 10);
+    const onXY = XY.rectangle(10, 10);
+    vicad.addSketch(plain, { name: "plain" });
+    vicad.addSketch(onXY, { name: "xy" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(2);
+    expect(ops[0].opcode).toBe(OP.CROSS_RECT);
+    expect(ops[1].opcode).toBe(OP.CROSS_RECT);
+  });
+
+  it("encodes CrossPlane for XZ offset circle", () => {
+    __vicadBeginRun();
+    const cs = XZ.offset(10).circle(1);
+    vicad.addSketch(cs, { name: "xz-circle" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(2);
+    expect(ops[0].opcode).toBe(OP.CROSS_CIRCLE);
+    expect(ops[1].opcode).toBe(OP.CROSS_PLANE);
+
+    const circleView = new DataView(ops[0].payload.buffer, ops[0].payload.byteOffset, ops[0].payload.byteLength);
+    const circleOutId = circleView.getUint32(0, true);
+    const view = new DataView(ops[1].payload.buffer, ops[1].payload.byteOffset, ops[1].payload.byteLength);
+    expect(view.getUint32(4, true)).toBe(circleOutId);
+    expect(view.getUint32(8, true)).toBe(1);
+    expect(view.getFloat64(12, true)).toBe(10);
+  });
+
+  it("plane-generated cross section supports standard chaining", () => {
+    __vicadBeginRun();
+    const cs = Plane.YZ().offset(5).rectangle(10, 8).translate(2, 3).fillet(1);
+    const solid = Manifold.extrude(cs, 4);
+    vicad.addToScene(solid, { name: "plane-chain" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.some((op) => op.opcode === OP.CROSS_PLANE)).toBe(true);
+    expect(ops.some((op) => op.opcode === OP.CROSS_TRANSLATE)).toBe(true);
+    expect(ops.some((op) => op.opcode === OP.CROSS_FILLET)).toBe(true);
+    expect(ops.some((op) => op.opcode === OP.EXTRUDE)).toBe(true);
   });
 });

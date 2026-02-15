@@ -33,6 +33,7 @@ bool ensure_node(std::vector<manifold::Manifold> *m_nodes,
                  std::vector<bool> *has_m,
                  std::vector<manifold::CrossSection> *c_nodes,
                  std::vector<bool> *has_c,
+                 std::vector<SketchPlane> *cross_plane,
                  std::vector<ReplayNodeSemantic> *sem,
                  uint32_t id) {
   const size_t need = (size_t)id + 1;
@@ -41,6 +42,7 @@ bool ensure_node(std::vector<manifold::Manifold> *m_nodes,
   has_m->resize(need, false);
   c_nodes->resize(need);
   has_c->resize(need, false);
+  cross_plane->resize(need);
   sem->resize(need);
   return true;
 }
@@ -93,6 +95,36 @@ double revolve_effective_radius(const manifold::Polygons &cross_section) {
   return radius;
 }
 
+bool valid_plane_kind(uint32_t kind) {
+  return kind <= (uint32_t)SketchPlaneKind::YZ;
+}
+
+SketchPlane default_sketch_plane() {
+  return SketchPlane{};
+}
+
+manifold::vec3 map_plane_local_to_world(const SketchPlane &plane, const manifold::vec3 &p) {
+  switch (plane.kind) {
+    case SketchPlaneKind::XY:
+      return manifold::vec3(p.x, p.y, p.z + plane.offset);
+    case SketchPlaneKind::XZ:
+      // Keep right-handed basis while preserving +extrude along +Y.
+      return manifold::vec3(p.x, p.z + plane.offset, -p.y);
+    case SketchPlaneKind::YZ:
+      return manifold::vec3(p.z + plane.offset, p.x, p.y);
+  }
+  return manifold::vec3(p.x, p.y, p.z + plane.offset);
+}
+
+manifold::Manifold apply_plane_to_manifold(const manifold::Manifold &in_m, const SketchPlane &plane) {
+  if (plane.kind == SketchPlaneKind::XY && std::abs(plane.offset) <= 1e-12) {
+    return in_m;
+  }
+  return in_m.Warp([plane](manifold::vec3 &v) {
+    v = map_plane_local_to_world(plane, v);
+  });
+}
+
 // Sketch semantic derivation and operation trace construction are implemented in
 // sketch_semantics.cpp and op_trace.cpp.
 
@@ -105,12 +137,14 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
   tables->has_manifold.clear();
   tables->cross_nodes.clear();
   tables->has_cross.clear();
+  tables->cross_plane.clear();
   tables->node_semantics.clear();
 
   std::vector<manifold::Manifold> &m_nodes = tables->manifold_nodes;
   std::vector<bool> &has_m = tables->has_manifold;
   std::vector<manifold::CrossSection> &c_nodes = tables->cross_nodes;
   std::vector<bool> &has_c = tables->has_cross;
+  std::vector<SketchPlane> &cross_plane = tables->cross_plane;
   std::vector<ReplayNodeSemantic> &semantics = tables->node_semantics;
 
   Reader ops = {records, records_size, 0};
@@ -135,7 +169,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
       *error = "Replay failed: missing out node id.";
       return false;
     }
-    ensure_node(&m_nodes, &has_m, &c_nodes, &has_c, &semantics, out_id);
+    ensure_node(&m_nodes, &has_m, &c_nodes, &has_c, &cross_plane, &semantics, out_id);
 
     ReplayNodeSemantic sem = {};
     sem.opcode = hdr.opcode;
@@ -269,6 +303,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         const uint32_t seg = (uint32_t)AutoCircularSegments(radius, lod_policy.profile);
         c_nodes[out_id] = manifold::CrossSection::Circle(radius, (int)seg);
         has_c[out_id] = true;
+        cross_plane[out_id] = default_sketch_plane();
         sem.params_f64 = {radius};
         sem.params_u32 = {seg};
       } break;
@@ -281,6 +316,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         }
         c_nodes[out_id] = manifold::CrossSection::Square(manifold::vec2(x, y), center != 0);
         has_c[out_id] = true;
+        cross_plane[out_id] = default_sketch_plane();
         sem.params_f64 = {x, y};
         sem.params_u32 = {center};
       } break;
@@ -293,6 +329,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         }
         c_nodes[out_id] = manifold::CrossSection::Square(manifold::vec2(x, y), center != 0);
         has_c[out_id] = true;
+        cross_plane[out_id] = default_sketch_plane();
         sem.params_f64 = {x, y};
         sem.params_u32 = {center};
       } break;
@@ -308,6 +345,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         c_nodes[out_id] =
             manifold::CrossSection::Circle(radius, (int)seg).Translate(manifold::vec2(x, y));
         has_c[out_id] = true;
+        cross_plane[out_id] = default_sketch_plane();
         sem.params_f64 = {x, y, radius};
         sem.params_u32 = {seg};
       } break;
@@ -339,6 +377,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         }
         c_nodes[out_id] = manifold::CrossSection(polys, manifold::CrossSection::FillRule::Positive);
         has_c[out_id] = true;
+        cross_plane[out_id] = default_sketch_plane();
         sem.has_polygons = true;
         sem.polygons = polys;
       } break;
@@ -353,6 +392,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
         c_nodes[out_id] = in_c.Translate(manifold::vec2(x, y));
         has_c[out_id] = true;
+        cross_plane[out_id] = ((size_t)in_id < cross_plane.size()) ? cross_plane[in_id] : default_sketch_plane();
         sem.inputs = {in_id};
         sem.params_f64 = {x, y};
       } break;
@@ -367,6 +407,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
         c_nodes[out_id] = in_c.Rotate(deg);
         has_c[out_id] = true;
+        cross_plane[out_id] = ((size_t)in_id < cross_plane.size()) ? cross_plane[in_id] : default_sketch_plane();
         sem.inputs = {in_id};
         sem.params_f64 = {deg};
       } break;
@@ -404,6 +445,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
           c_nodes[out_id] = std::move(rounded);
           has_c[out_id] = true;
         }
+        cross_plane[out_id] = ((size_t)in_id < cross_plane.size()) ? cross_plane[in_id] : default_sketch_plane();
         sem.inputs = {in_id};
         sem.params_f64 = {radius};
       } break;
@@ -423,8 +465,34 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         }
         c_nodes[out_id] = std::move(out_c);
         has_c[out_id] = true;
+        cross_plane[out_id] = ((size_t)in_id < cross_plane.size()) ? cross_plane[in_id] : default_sketch_plane();
         sem.inputs = {in_id};
         sem.params_f64 = {delta};
+      } break;
+      case OpCode::CrossPlane: {
+        uint32_t in_id = 0;
+        uint32_t kind_u32 = 0;
+        double offset = 0.0;
+        if (!read_u32(&payload, &in_id) || !read_u32(&payload, &kind_u32) || !read_f64(&payload, &offset)) {
+          *error = "Replay failed: invalid cross plane payload.";
+          return false;
+        }
+        if (!valid_plane_kind(kind_u32)) {
+          *error = "Replay failed: invalid cross plane kind.";
+          return false;
+        }
+        if (!std::isfinite(offset)) {
+          *error = "Replay failed: invalid cross plane offset.";
+          return false;
+        }
+        manifold::CrossSection in_c;
+        if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
+        c_nodes[out_id] = in_c;
+        has_c[out_id] = true;
+        cross_plane[out_id] = {static_cast<SketchPlaneKind>(kind_u32), offset};
+        sem.inputs = {in_id};
+        sem.params_u32 = {kind_u32};
+        sem.params_f64 = {offset};
       } break;
       case OpCode::Extrude: {
         uint32_t cs_id = 0;
@@ -438,6 +506,9 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         manifold::CrossSection cs;
         if (!need_c(c_nodes, has_c, cs_id, &cs, error)) return false;
         manifold::Manifold m = manifold::Manifold::Extrude(cs.ToPolygons(), h, (int)div, twist);
+        const SketchPlane plane =
+            ((size_t)cs_id < cross_plane.size()) ? cross_plane[cs_id] : default_sketch_plane();
+        m = apply_plane_to_manifold(m, plane);
         if (!check_status(m, "extrude", error)) return false;
         m_nodes[out_id] = std::move(m);
         has_m[out_id] = true;
@@ -459,6 +530,9 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         const uint32_t seg =
             (uint32_t)AutoCircularSegmentsForRevolve(radius, deg, lod_policy.profile);
         manifold::Manifold m = manifold::Manifold::Revolve(polys, (int)seg, deg);
+        const SketchPlane plane =
+            ((size_t)cs_id < cross_plane.size()) ? cross_plane[cs_id] : default_sketch_plane();
+        m = apply_plane_to_manifold(m, plane);
         if (!check_status(m, "revolve", error)) return false;
         m_nodes[out_id] = std::move(m);
         has_m[out_id] = true;
@@ -478,6 +552,7 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         c_nodes[out_id] =
             manifold::CrossSection(in_m.Slice(z), manifold::CrossSection::FillRule::Positive);
         has_c[out_id] = true;
+        cross_plane[out_id] = default_sketch_plane();
         sem.inputs = {in_id};
         sem.params_f64 = {z};
       } break;
@@ -532,6 +607,28 @@ bool ResolveReplayCrossSection(const ReplayTables &tables, uint32_t root_kind, u
     return false;
   }
   *out = tables.cross_nodes[root_id];
+  return true;
+}
+
+bool ResolveReplayCrossSectionPlane(const ReplayTables &tables, uint32_t root_kind, uint32_t root_id,
+                                    SketchPlane *out, std::string *error) {
+  if (!out) {
+    *error = "Replay failed: null cross-section plane output.";
+    return false;
+  }
+  if (root_kind != (uint32_t)NodeKind::CrossSection) {
+    *error = "Replay failed: root node is not a cross-section.";
+    return false;
+  }
+  if ((size_t)root_id >= tables.cross_nodes.size() || !tables.has_cross[root_id]) {
+    *error = "Replay failed: root cross-section node missing.";
+    return false;
+  }
+  if ((size_t)root_id >= tables.cross_plane.size()) {
+    *out = default_sketch_plane();
+    return true;
+  }
+  *out = tables.cross_plane[root_id];
   return true;
 }
 

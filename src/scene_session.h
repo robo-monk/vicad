@@ -13,6 +13,8 @@ namespace vicad_scene {
 struct SceneSessionState {
     std::string script_path;
     long long last_mtime_ns = -1;
+    long long last_ctime_ns = -1;
+    long long last_size_bytes = -1;
     std::string error_text;
     manifold::MeshGL merged_mesh;
     std::vector<vicad::ScriptSceneObject> scene_objects;

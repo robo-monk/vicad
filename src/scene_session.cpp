@@ -11,14 +11,26 @@ namespace vicad_scene {
 
 namespace {
 
-long long file_mtime_ns(const char *path) {
+struct FileStamp {
+    long long mtime_ns;
+    long long ctime_ns;
+    long long size_bytes;
+};
+
+bool read_file_stamp(const char *path, FileStamp *out) {
     struct stat st;
-    if (!path || stat(path, &st) != 0) return -1;
+    if (!out || !path || stat(path, &st) != 0) return false;
+    FileStamp stamp = {};
 #if defined(__APPLE__)
-    return (long long)st.st_mtimespec.tv_sec * 1000000000LL + (long long)st.st_mtimespec.tv_nsec;
+    stamp.mtime_ns = (long long)st.st_mtimespec.tv_sec * 1000000000LL + (long long)st.st_mtimespec.tv_nsec;
+    stamp.ctime_ns = (long long)st.st_ctimespec.tv_sec * 1000000000LL + (long long)st.st_ctimespec.tv_nsec;
 #else
-    return (long long)st.st_mtime * 1000000000LL;
+    stamp.mtime_ns = (long long)st.st_mtime * 1000000000LL;
+    stamp.ctime_ns = (long long)st.st_ctime * 1000000000LL;
 #endif
+    stamp.size_bytes = (long long)st.st_size;
+    *out = stamp;
+    return true;
 }
 
 bool compute_mesh_bounds(const manifold::MeshGL &mesh, vicad_app::Vec3 *bmin, vicad_app::Vec3 *bmax) {
@@ -124,9 +136,16 @@ bool SceneSessionReloadIfChanged(SceneSessionState *state,
         return false;
     }
 
-    const long long mt = file_mtime_ns(state->script_path.c_str());
-    if (mt < 0 || mt == state->last_mtime_ns) return true;
-    state->last_mtime_ns = mt;
+    FileStamp stamp = {};
+    if (!read_file_stamp(state->script_path.c_str(), &stamp)) return true;
+    if (stamp.mtime_ns == state->last_mtime_ns &&
+        stamp.ctime_ns == state->last_ctime_ns &&
+        stamp.size_bytes == state->last_size_bytes) {
+        return true;
+    }
+    state->last_mtime_ns = stamp.mtime_ns;
+    state->last_ctime_ns = stamp.ctime_ns;
+    state->last_size_bytes = stamp.size_bytes;
 
     std::string local_err;
     std::vector<vicad::ScriptSceneObject> next_scene;

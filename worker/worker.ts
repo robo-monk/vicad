@@ -19,6 +19,10 @@ import {
   GLTFNode,
   Manifold,
   Mesh,
+  Plane,
+  XY,
+  XZ,
+  YZ,
   vicad,
 } from "./proxy-manifold";
 
@@ -173,6 +177,10 @@ async function executeScript(scriptPath: string) {
   (globalThis as any).CrossSection = CrossSection;
   (globalThis as any).GLTFNode = GLTFNode;
   (globalThis as any).Mesh = Mesh;
+  (globalThis as any).Plane = Plane;
+  (globalThis as any).XY = XY;
+  (globalThis as any).XZ = XZ;
+  (globalThis as any).YZ = YZ;
   (globalThis as any).vicad = vicad;
   const loaded = await import(`file://${abs}?t=${Date.now()}`);
   if (loaded.default !== undefined) {
