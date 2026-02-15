@@ -452,7 +452,7 @@ static void draw_grid(const Vec3 &target, float distance, float fov_degrees, i32
 
 static void draw_mesh(const manifold::MeshGL &mesh) {
     glEnable(GL_LIGHTING);
-    glColor3f(0.82f, 0.84f, 0.87f);
+    glColor3f(0.68f, 0.65f, 0.61f);
     glBegin(GL_TRIANGLES);
     for (size_t tri = 0; tri < mesh.NumTri(); ++tri) {
         const size_t i0 = mesh.triVerts[tri * 3 + 0];
@@ -819,6 +819,7 @@ static void draw_script_sketch_object(const vicad::ScriptSceneObject &obj,
 static void draw_script_sketches(const std::vector<vicad::ScriptSceneObject> &scene,
                                  int selected_object_index,
                                  int hovered_object_index) {
+    glDisable(GL_DEPTH_TEST);
     for (size_t i = 0; i < scene.size(); ++i) {
         if (!scene_object_is_sketch(scene[i])) continue;
         const bool selected = ((int)i == selected_object_index);
@@ -826,11 +827,12 @@ static void draw_script_sketches(const std::vector<vicad::ScriptSceneObject> &sc
         if (selected) {
             draw_script_sketch_object(scene[i], 4.0f, 1.0f, 0.86f, 0.18f, 1.0f);
         } else if (hovered) {
-            draw_script_sketch_object(scene[i], 3.2f, 0.34f, 0.76f, 1.0f, 0.96f);
+            draw_script_sketch_object(scene[i], 3.2f, 0.20f, 0.22f, 0.24f, 0.98f);
         } else {
-            draw_script_sketch_object(scene[i], 2.2f, 0.24f, 0.70f, 0.96f, 0.92f);
+            draw_script_sketch_object(scene[i], 2.2f, 0.26f, 0.27f, 0.29f, 0.92f);
         }
     }
+    glEnable(GL_DEPTH_TEST);
 }
 
 enum class SketchDimShapeKind {
@@ -1258,7 +1260,8 @@ static float arrow_world_size_at_anchor(const DimensionRenderContext &ctx,
 
 static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
                                     const DimensionRenderContext &ctx,
-                                    float alpha) {
+                                    float alpha,
+                                    float ink) {
     if (contour.points.size() < 2) return;
     Vec3 text_right = {1.0f, 0.0f, 0.0f};
     Vec3 text_up = {0.0f, 1.0f, 0.0f};
@@ -1318,7 +1321,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         kind = SketchDimShapeKind::Polygon;
     }
 
-    glColor4f(0.0f, 0.0f, 0.0f, alpha);
+    glColor4f(ink, ink, ink, alpha);
     char text[128];
 
     if (kind == SketchDimShapeKind::Circle || kind == SketchDimShapeKind::Point) {
@@ -1338,7 +1341,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         Vec3 dim_dir = normalize(sub(b3, a3));
         if (dot(dim_dir, facing_right) < 0.0f) dim_dir = mul(dim_dir, -1.0f);
         const Vec3 dim_up = normalize(cross(facing_normal, dim_dir));
-        draw_dimension_label_world(add(mid, label_lift), dim_dir, dim_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
+        draw_dimension_label_world(add(mid, label_lift), dim_dir, dim_up, world_scale, text, ink, ink, ink, alpha, true);
         if (kind == SketchDimShapeKind::Point) {
             const float arm = (bdiag > 0.0f ? bdiag : 1.0f) * 0.06f + 0.04f;
             draw_world_line(add(contour_point_from_plane_local({c_center.x - arm, c_center.y}, plane_origin, text_right, text_up), dim_plane_lift),
@@ -1391,13 +1394,13 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         if (dot(w_dir, facing_right) < 0.0f) w_dir = mul(w_dir, -1.0f);
         const Vec3 w_up = normalize(cross(facing_normal, w_dir));
         draw_dimension_label_world(add(mul(add(w03, w13), 0.5f), label_lift),
-                                   w_dir, w_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
+                                   w_dir, w_up, world_scale, text, ink, ink, ink, alpha, true);
         format_dim(text, sizeof(text), "", rect_h);
         Vec3 h_dir = normalize(sub(h13, h03));
         if (dot(h_dir, facing_right) < 0.0f) h_dir = mul(h_dir, -1.0f);
         const Vec3 h_up = normalize(cross(facing_normal, h_dir));
         draw_dimension_label_world(add(mul(add(h03, h13), 0.5f), label_lift),
-                                   h_dir, h_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
+                                   h_dir, h_up, world_scale, text, ink, ink, ink, alpha, true);
         return;
     }
 
@@ -1408,7 +1411,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const float across_flats = 2.0f * rp_radius * std::cos(3.1415926535f / (float)n);
         std::snprintf(text, sizeof(text), "N=%zu  S=%.3g  AF=%.3g", n, (double)rp_side, (double)across_flats);
         draw_dimension_label_world(add(contour_point_from_plane_local(rp_center, plane_origin, text_right, text_up), label_lift),
-                                   facing_right, facing_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
+                                   facing_right, facing_up, world_scale, text, ink, ink, ink, alpha, true);
         return;
     }
 
@@ -1426,7 +1429,7 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
             if (dot(e_dir, facing_right) < 0.0f) e_dir = mul(e_dir, -1.0f);
             const Vec3 e_up = normalize(cross(facing_normal, e_dir));
             draw_dimension_label_world(add(mid, label_lift), e_dir, e_up, world_scale, text,
-                                       0.0f, 0.0f, 0.0f, alpha, true);
+                                       ink, ink, ink, alpha, true);
         }
     } else {
         float perimeter = 0.0f;
@@ -1436,14 +1439,15 @@ static void draw_contour_dimensions(const vicad::ScriptSketchContour &contour,
         const float area = std::fabs(contour_signed_area(pts2));
         std::snprintf(text, sizeof(text), "N=%zu  P=%.3g  A=%.3g", n, (double)perimeter, (double)area);
         draw_dimension_label_world(add(contour_point_from_plane_local(centroid, plane_origin, text_right, text_up), label_lift),
-                                   facing_right, facing_up, world_scale, text, 0.0f, 0.0f, 0.0f, alpha, true);
+                                   facing_right, facing_up, world_scale, text, ink, ink, ink, alpha, true);
     }
 }
 
 static void draw_sketch_dimension_model(const vicad::SketchDimensionModel &model,
                                         float z,
                                         const DimensionRenderContext &ctx,
-                                        float alpha) {
+                                        float alpha,
+                                        float ink) {
     if (model.entities.empty()) return;
     std::vector<Vec2> pts2;
     pts2.reserve(model.logicalVertices.size());
@@ -1479,7 +1483,7 @@ static void draw_sketch_dimension_model(const vicad::SketchDimensionModel &model
     const Vec3 dim_plane_lift = mul(facing_normal, world_per_px * 1.5f);
 
     char text[128];
-    glColor4f(0.0f, 0.0f, 0.0f, alpha);
+    glColor4f(ink, ink, ink, alpha);
     for (const vicad::SketchDimensionEntity &entity : model.entities) {
         if (entity.kind != vicad::SketchDimensionEntity::Kind::LineDim) continue;
         const Vec3 a3 = add(vec3_from_2d({(float)entity.line.a.x, (float)entity.line.a.y}, z), dim_plane_lift);
@@ -1493,7 +1497,7 @@ static void draw_sketch_dimension_model(const vicad::SketchDimensionModel &model
         if (dot(dim_dir, facing_right) < 0.0f) dim_dir = mul(dim_dir, -1.0f);
         const Vec3 dim_up = normalize(cross(facing_normal, dim_dir));
         draw_dimension_label_world(add(mid, label_lift), dim_dir, dim_up, world_scale, text,
-                                   0.0f, 0.0f, 0.0f, alpha, true);
+                                   ink, ink, ink, alpha, true);
     }
 }
 
@@ -1506,7 +1510,7 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
     glDisable(GL_CULL_FACE);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glLineWidth(1.5f);
     for (size_t scene_index = 0; scene_index < scene.size(); ++scene_index) {
@@ -1514,8 +1518,9 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
         if (!scene_object_is_sketch(obj)) continue;
         if (obj.sketchContours.empty()) continue;
         const bool selected = ((int)scene_index == selected_object_index);
-        const float alpha = selected ? 1.0f : 0.30f;
-        glColor4f(0.0f, 0.0f, 0.0f, alpha);
+        const float alpha = selected ? 1.0f : 0.78f;
+        const float ink = selected ? 0.12f : 0.28f;
+        glColor4f(ink, ink, ink, alpha);
 
         size_t largest_idx = 0;
         float largest_area = -1.0f;
@@ -1532,14 +1537,15 @@ static void draw_script_sketch_dimensions(const std::vector<vicad::ScriptSceneOb
             if (!obj.sketchContours.empty() && !obj.sketchContours.front().points.empty()) {
                 z = obj.sketchContours.front().points.front().z;
             }
-            draw_sketch_dimension_model(*obj.sketchDims, z, ctx, alpha);
+            draw_sketch_dimension_model(*obj.sketchDims, z, ctx, alpha, ink);
         } else {
-            draw_contour_dimensions(obj.sketchContours[largest_idx], ctx, alpha);
+            draw_contour_dimensions(obj.sketchContours[largest_idx], ctx, alpha, ink);
         }
     }
 
     glLineWidth(1.0f);
     glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glEnable(GL_CULL_FACE);
     glEnable(GL_LIGHTING);
@@ -2027,7 +2033,10 @@ static bool file_watch_stamp_equal(const FileWatchStamp &a, const FileWatchStamp
 
 class TabFileWatcher {
   public:
-    TabFileWatcher() : stop_(false), thread_(&TabFileWatcher::RunLoop, this) {}
+    TabFileWatcher() : stop_(false) {
+        // Start worker thread only after all members are fully constructed.
+        thread_ = std::thread(&TabFileWatcher::RunLoop, this);
+    }
 
     ~TabFileWatcher() { Stop(); }
 
@@ -3007,7 +3016,7 @@ static int AppRunLoop() {
     glEnable(GL_LIGHT2);
     glLightModeli(GL_LIGHT_MODEL_LOCAL_VIEWER, GL_TRUE);
     glLightModeli(GL_LIGHT_MODEL_TWO_SIDE, GL_FALSE);
-    const float global_ambient[4] = {0.14f, 0.15f, 0.17f, 1.0f};
+    const float global_ambient[4] = {0.08f, 0.08f, 0.09f, 1.0f};
     glLightModelfv(GL_LIGHT_MODEL_AMBIENT, global_ambient);
     glClearColor(0.93333334f, 0.93333334f, 0.93333334f, 1.0f);
     // Default to v-sync on to avoid an uncapped render loop when idle.
@@ -3015,16 +3024,16 @@ static int AppRunLoop() {
     const bool disable_vsync = std::getenv("VICAD_DISABLE_VSYNC") != nullptr;
     RGFW_window_swapInterval_OpenGL(win, disable_vsync ? 0 : 1);
 
-    const float light0_ambient[4] = {0.10f, 0.10f, 0.11f, 1.0f};
-    const float light0_diffuse[4] = {0.92f, 0.95f, 1.00f, 1.0f};
-    const float light0_specular[4] = {0.88f, 0.92f, 0.98f, 1.0f};
-    const float light1_ambient[4] = {0.03f, 0.03f, 0.04f, 1.0f};
-    const float light1_diffuse[4] = {0.44f, 0.50f, 0.58f, 1.0f};
-    const float light1_specular[4] = {0.18f, 0.20f, 0.24f, 1.0f};
+    const float light0_ambient[4] = {0.05f, 0.05f, 0.05f, 1.0f};
+    const float light0_diffuse[4] = {0.56f, 0.58f, 0.62f, 1.0f};
+    const float light0_specular[4] = {0.42f, 0.44f, 0.48f, 1.0f};
+    const float light1_ambient[4] = {0.01f, 0.01f, 0.01f, 1.0f};
+    const float light1_diffuse[4] = {0.26f, 0.28f, 0.30f, 1.0f};
+    const float light1_specular[4] = {0.10f, 0.11f, 0.12f, 1.0f};
     const float light2_ambient[4] = {0.00f, 0.00f, 0.00f, 1.0f};
-    const float light2_diffuse[4] = {0.32f, 0.33f, 0.37f, 1.0f};
-    const float light2_specular[4] = {0.60f, 0.64f, 0.72f, 1.0f};
-    const float mat_specular[4] = {0.58f, 0.60f, 0.64f, 1.0f};
+    const float light2_diffuse[4] = {0.16f, 0.18f, 0.20f, 1.0f};
+    const float light2_specular[4] = {0.24f, 0.26f, 0.30f, 1.0f};
+    const float mat_specular[4] = {0.34f, 0.34f, 0.36f, 1.0f};
     glLightfv(GL_LIGHT0, GL_AMBIENT, light0_ambient);
     glLightfv(GL_LIGHT0, GL_DIFFUSE, light0_diffuse);
     glLightfv(GL_LIGHT0, GL_SPECULAR, light0_specular);
@@ -3035,7 +3044,7 @@ static int AppRunLoop() {
     glLightfv(GL_LIGHT2, GL_DIFFUSE, light2_diffuse);
     glLightfv(GL_LIGHT2, GL_SPECULAR, light2_specular);
     glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, mat_specular);
-    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 52.0f);
+    glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 26.0f);
 
     RGFW_event event;
     i32 width = 0;
