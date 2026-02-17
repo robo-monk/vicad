@@ -47,6 +47,12 @@
 #ifdef VICAD_HAS_NFD
 #include "nfd.h"
 #endif
+#ifdef VICAD_HAS_HARFBUZZ
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include <hb.h>
+#include <hb-ft.h>
+#endif
 
 #if defined(__APPLE__)
 #include <OpenGL/gl.h>
@@ -138,7 +144,248 @@ static BakedFontState g_baked_font = {};
 static constexpr float kHudBaseScale = 0.75f;
 static constexpr float kHudLegacyScale = 1.5f;
 static constexpr int kRequestedMsaaSamples = 4;
-static constexpr float kTextShadowAlphaScale = 0.18f;
+static constexpr float kTextShadowAlphaScale = 0.0f;
+#ifdef VICAD_HAS_HARFBUZZ
+static constexpr size_t kHbTextCacheLimit = 512;
+
+struct HbTextCacheEntry {
+    GLuint texture;
+    int width;
+    int height;
+    int offset_x;
+    int offset_y;
+    uint64_t last_use;
+};
+
+struct HbTextState {
+    bool initialized;
+    FT_Library ft_library;
+    FT_Face ft_face;
+    hb_font_t *hb_font;
+    std::map<std::string, HbTextCacheEntry> cache;
+    uint64_t use_stamp;
+};
+
+static HbTextState g_hb_text = {};
+
+static int fixed26_6_floor(int v) {
+    if (v >= 0) return v / 64;
+    return -(((-v) + 63) / 64);
+}
+
+static bool ensure_hb_text_state(void) {
+    if (g_hb_text.initialized) return true;
+    if (FT_Init_FreeType(&g_hb_text.ft_library) != 0) return false;
+    if (FT_New_Face(g_hb_text.ft_library, "Funnel_Sans/static/FunnelSans-Regular.ttf", 0, &g_hb_text.ft_face) != 0) {
+        FT_Done_FreeType(g_hb_text.ft_library);
+        g_hb_text.ft_library = NULL;
+        return false;
+    }
+    g_hb_text.hb_font = hb_ft_font_create_referenced(g_hb_text.ft_face);
+    if (!g_hb_text.hb_font) {
+        FT_Done_Face(g_hb_text.ft_face);
+        FT_Done_FreeType(g_hb_text.ft_library);
+        g_hb_text.ft_face = NULL;
+        g_hb_text.ft_library = NULL;
+        return false;
+    }
+    hb_ft_font_set_load_flags(g_hb_text.hb_font, FT_LOAD_DEFAULT);
+    g_hb_text.initialized = true;
+    g_hb_text.use_stamp = 0;
+    return true;
+}
+
+static void destroy_hb_text_state(void) {
+    if (!g_hb_text.initialized) return;
+    for (auto &it : g_hb_text.cache) {
+        if (it.second.texture != 0) glDeleteTextures(1, &it.second.texture);
+    }
+    g_hb_text.cache.clear();
+    if (g_hb_text.hb_font) hb_font_destroy(g_hb_text.hb_font);
+    g_hb_text.hb_font = nullptr;
+    if (g_hb_text.ft_face) FT_Done_Face(g_hb_text.ft_face);
+    g_hb_text.ft_face = NULL;
+    if (g_hb_text.ft_library) FT_Done_FreeType(g_hb_text.ft_library);
+    g_hb_text.ft_library = NULL;
+    g_hb_text.initialized = false;
+}
+
+struct HbGlyphPlacement {
+    hb_codepoint_t gid;
+    int x;
+    int y;
+};
+
+static bool rasterize_text_hb(const char *text, int font_px,
+                              std::vector<uint8_t> *out_alpha,
+                              int *out_w, int *out_h,
+                              int *out_off_x, int *out_off_y) {
+    if (!text || !text[0] || !out_alpha || !out_w || !out_h || !out_off_x || !out_off_y) return false;
+    if (font_px <= 0) return false;
+    if (!ensure_hb_text_state()) return false;
+
+    if (FT_Set_Pixel_Sizes(g_hb_text.ft_face, 0, (FT_UInt)font_px) != 0) return false;
+    hb_ft_font_changed(g_hb_text.hb_font);
+
+    const int line_height = std::max(1, (int)(g_hb_text.ft_face->size->metrics.height >> 6));
+    const int ascender = (int)(g_hb_text.ft_face->size->metrics.ascender >> 6);
+
+    std::vector<std::string> lines;
+    {
+        const char *start = text;
+        const char *p = text;
+        for (;;) {
+            if (*p == '\n' || *p == '\0') {
+                lines.emplace_back(start, (size_t)(p - start));
+                if (*p == '\0') break;
+                start = p + 1;
+            }
+            ++p;
+        }
+        if (lines.empty()) lines.emplace_back("");
+    }
+
+    std::vector<HbGlyphPlacement> glyphs;
+    int min_x = 0;
+    int min_y = 0;
+    int max_x = 0;
+    int max_y = 0;
+    bool have_bounds = false;
+
+    for (size_t line_idx = 0; line_idx < lines.size(); ++line_idx) {
+        hb_buffer_t *buffer = hb_buffer_create();
+        if (!buffer) continue;
+        const std::string &line = lines[line_idx];
+        hb_buffer_add_utf8(buffer, line.c_str(), (int)line.size(), 0, (int)line.size());
+        hb_buffer_guess_segment_properties(buffer);
+        hb_shape(g_hb_text.hb_font, buffer, NULL, 0);
+
+        unsigned int glyph_count = 0;
+        hb_glyph_info_t *infos = hb_buffer_get_glyph_infos(buffer, &glyph_count);
+        hb_glyph_position_t *positions = hb_buffer_get_glyph_positions(buffer, &glyph_count);
+        int pen_x = 0;
+        int pen_y = 0;
+        const int line_off_y = (int)line_idx * line_height;
+
+        for (unsigned int i = 0; i < glyph_count; ++i) {
+            const hb_codepoint_t gid = infos[i].codepoint;
+            if (FT_Load_Glyph(g_hb_text.ft_face, (FT_UInt)gid, FT_LOAD_DEFAULT) == 0 &&
+                FT_Render_Glyph(g_hb_text.ft_face->glyph, FT_RENDER_MODE_NORMAL) == 0) {
+                const FT_GlyphSlot slot = g_hb_text.ft_face->glyph;
+                const int gx = fixed26_6_floor(pen_x + positions[i].x_offset) + slot->bitmap_left;
+                const int gy = line_off_y + ascender - fixed26_6_floor(pen_y + positions[i].y_offset) - slot->bitmap_top;
+                const int gw = (int)slot->bitmap.width;
+                const int gh = (int)slot->bitmap.rows;
+                if (gw > 0 && gh > 0) {
+                    if (!have_bounds) {
+                        min_x = gx;
+                        min_y = gy;
+                        max_x = gx + gw;
+                        max_y = gy + gh;
+                        have_bounds = true;
+                    } else {
+                        if (gx < min_x) min_x = gx;
+                        if (gy < min_y) min_y = gy;
+                        if (gx + gw > max_x) max_x = gx + gw;
+                        if (gy + gh > max_y) max_y = gy + gh;
+                    }
+                    glyphs.push_back({gid, gx, gy});
+                }
+            }
+            pen_x += positions[i].x_advance;
+            pen_y += positions[i].y_advance;
+        }
+        hb_buffer_destroy(buffer);
+    }
+
+    if (!have_bounds) return false;
+    const int w = std::max(1, max_x - min_x);
+    const int h = std::max(1, max_y - min_y);
+    out_alpha->assign((size_t)w * (size_t)h, 0);
+
+    for (const HbGlyphPlacement &g : glyphs) {
+        if (FT_Load_Glyph(g_hb_text.ft_face, (FT_UInt)g.gid, FT_LOAD_DEFAULT) != 0) continue;
+        if (FT_Render_Glyph(g_hb_text.ft_face->glyph, FT_RENDER_MODE_NORMAL) != 0) continue;
+        const FT_Bitmap &bm = g_hb_text.ft_face->glyph->bitmap;
+        for (int row = 0; row < (int)bm.rows; ++row) {
+            const uint8_t *src = bm.buffer + row * bm.pitch;
+            const int dy = g.y - min_y + row;
+            if (dy < 0 || dy >= h) continue;
+            for (int col = 0; col < (int)bm.width; ++col) {
+                const int dx = g.x - min_x + col;
+                if (dx < 0 || dx >= w) continue;
+                uint8_t &dst = (*out_alpha)[(size_t)dy * (size_t)w + (size_t)dx];
+                const uint8_t sv = src[col];
+                if (sv > dst) dst = sv;
+            }
+        }
+    }
+
+    *out_w = w;
+    *out_h = h;
+    *out_off_x = min_x;
+    *out_off_y = min_y;
+    return true;
+}
+
+static std::string hb_text_cache_key(const char *text, float font_px) {
+    const int px = (int)std::lround(font_px);
+    std::string k = std::to_string(px);
+    k.push_back('\n');
+    k.append(text ? text : "");
+    return k;
+}
+
+static HbTextCacheEntry *get_or_create_hb_text_entry(const char *text, float font_px) {
+    if (!text || !text[0]) return nullptr;
+    const std::string key = hb_text_cache_key(text, font_px);
+    auto it = g_hb_text.cache.find(key);
+    if (it != g_hb_text.cache.end()) {
+        it->second.last_use = ++g_hb_text.use_stamp;
+        return &it->second;
+    }
+
+    std::vector<uint8_t> alpha;
+    int w = 0, h = 0, off_x = 0, off_y = 0;
+    if (!rasterize_text_hb(text, (int)std::lround(font_px), &alpha, &w, &h, &off_x, &off_y)) return nullptr;
+
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    if (tex == 0) return nullptr;
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, w, h, 0, GL_ALPHA, GL_UNSIGNED_BYTE, alpha.data());
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    HbTextCacheEntry entry = {};
+    entry.texture = tex;
+    entry.width = w;
+    entry.height = h;
+    entry.offset_x = off_x;
+    entry.offset_y = off_y;
+    entry.last_use = ++g_hb_text.use_stamp;
+    auto inserted = g_hb_text.cache.emplace(key, entry);
+    if (!inserted.second) {
+        glDeleteTextures(1, &tex);
+        return nullptr;
+    }
+
+    if (g_hb_text.cache.size() > kHbTextCacheLimit) {
+        auto evict_it = g_hb_text.cache.begin();
+        for (auto jt = g_hb_text.cache.begin(); jt != g_hb_text.cache.end(); ++jt) {
+            if (jt->second.last_use < evict_it->second.last_use) evict_it = jt;
+        }
+        if (evict_it != g_hb_text.cache.end()) {
+            if (evict_it->second.texture != 0) glDeleteTextures(1, &evict_it->second.texture);
+            g_hb_text.cache.erase(evict_it);
+        }
+    }
+    return &inserted.first->second;
+}
+#endif
 
 static const VicadBakedGlyph *glyph_for_char(unsigned char ch) {
     if (ch < VICAD_BAKED_FIRST_CHAR || ch > VICAD_BAKED_LAST_CHAR) ch = '?';
@@ -147,6 +394,15 @@ static const VicadBakedGlyph *glyph_for_char(unsigned char ch) {
 
 static float text_width_for_slice(Clay_StringSlice text, float font_px) {
     if (text.length <= 0 || !text.chars || font_px <= 0.0f) return 0.0f;
+#ifdef VICAD_HAS_HARFBUZZ
+    std::string s(text.chars, (size_t)text.length);
+    std::vector<uint8_t> alpha;
+    int w = 0, h = 0, off_x = 0, off_y = 0;
+    if (rasterize_text_hb(s.c_str(), (int)std::lround(font_px), &alpha, &w, &h, &off_x, &off_y)) {
+        (void)off_y;
+        return (float)(off_x + w);
+    }
+#endif
     const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
     float width = 0.0f;
     float line_width = 0.0f;
@@ -175,6 +431,18 @@ static float text_width_for_cstr(const char *text, float font_px) {
 static Clay_Dimensions measure_text_mono(Clay_StringSlice text, Clay_TextElementConfig *config, void *userData) {
     (void)userData;
     const float font_px = (float)(config ? config->fontSize : 16);
+#ifdef VICAD_HAS_HARFBUZZ
+    if (text.length > 0 && text.chars && font_px > 0.0f) {
+        std::string s(text.chars, (size_t)text.length);
+        std::vector<uint8_t> alpha;
+        int w = 0, h = 0, off_x = 0, off_y = 0;
+        if (rasterize_text_hb(s.c_str(), (int)std::lround(font_px), &alpha, &w, &h, &off_x, &off_y)) {
+            (void)off_x;
+            (void)off_y;
+            return (Clay_Dimensions){(float)w, (float)h};
+        }
+    }
+#endif
     const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
     const float width = text_width_for_slice(text, font_px);
     int lines = 1;
@@ -452,7 +720,7 @@ static void draw_grid(const Vec3 &target, float distance, float fov_degrees, i32
 
 static void draw_mesh(const manifold::MeshGL &mesh) {
     glEnable(GL_LIGHTING);
-    glColor3f(0.68f, 0.65f, 0.61f);
+    glColor3f(0.69f, 0.65f, 0.61f);
     glBegin(GL_TRIANGLES);
     for (size_t tri = 0; tri < mesh.NumTri(); ++tri) {
         const size_t i0 = mesh.triVerts[tri * 3 + 0];
@@ -2042,7 +2310,7 @@ class TabFileWatcher {
 
     void Stop() {
         if (stop_.exchange(true)) return;
-        RGFW_stopCheckEvents();
+        // RGFW_stopCheckEvents();
         if (thread_.joinable()) thread_.join();
     }
 
@@ -2082,7 +2350,9 @@ class TabFileWatcher {
             std::vector<std::string> paths;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                paths = watched_paths_;
+                paths.reserve(watched_paths_.size());
+                for (const auto &p : watched_paths_)
+                    paths.emplace_back(p.data(), p.size());
             }
 
             for (auto it = stamps.begin(); it != stamps.end();) {
@@ -2153,6 +2423,31 @@ static void draw_text_baked_rgba(float x, float y, float font_px, const char *te
                                  float r, float g, float b, float a) {
     if (!text || !text[0]) return;
     if (font_px <= 0.0f) return;
+#ifdef VICAD_HAS_HARFBUZZ
+    if (ensure_hb_text_state()) {
+        HbTextCacheEntry *entry = get_or_create_hb_text_entry(text, font_px);
+        if (entry && entry->texture != 0 && entry->width > 0 && entry->height > 0) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_TEXTURE_2D);
+            glBindTexture(GL_TEXTURE_2D, entry->texture);
+            glColor4f(r, g, b, a);
+            const float x0 = x + (float)entry->offset_x;
+            const float y0 = y + (float)entry->offset_y;
+            const float x1 = x0 + (float)entry->width;
+            const float y1 = y0 + (float)entry->height;
+            glBegin(GL_QUADS);
+            glTexCoord2f(0.0f, 0.0f); glVertex2f(x0, y0);
+            glTexCoord2f(1.0f, 0.0f); glVertex2f(x1, y0);
+            glTexCoord2f(1.0f, 1.0f); glVertex2f(x1, y1);
+            glTexCoord2f(0.0f, 1.0f); glVertex2f(x0, y1);
+            glEnd();
+            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_BLEND);
+            return;
+        }
+    }
+#endif
     if (!ensure_baked_font_texture()) return;
 
     const float scale = font_px / (float)VICAD_BAKED_PIXEL_SIZE;
@@ -3880,6 +4175,9 @@ static int AppRunLoop() {
         needs_redraw = false;
     }
 
+    #ifdef VICAD_HAS_HARFBUZZ
+    destroy_hb_text_state();
+    #endif
     RGFW_window_close(win);
     return 0;
 }

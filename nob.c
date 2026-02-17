@@ -1,6 +1,8 @@
 #define NOB_IMPLEMENTATION
 #include "nob.h"
 #include <sys/stat.h>
+#include <limits.h>
+#include <stdlib.h>
 
 static const char *manifold_sources[] = {
     "manifold/src/boolean3.cpp",
@@ -88,6 +90,13 @@ typedef struct {
 typedef struct {
     const char *root;
     const char *include_dir;
+    const char *amalgamated_source;
+    bool found;
+} HarfBuzzInfo;
+
+typedef struct {
+    const char *root;
+    const char *include_dir;
     const char *common_source;
     const char *platform_source;
     bool found;
@@ -96,7 +105,62 @@ typedef struct {
 typedef struct {
     bool asan;
     bool asan_deps;
+    int max_procs;
 } BuildOptions;
+
+typedef enum {
+    COMPILE_LANG_C,
+    COMPILE_LANG_CXX,
+    COMPILE_LANG_OBJC,
+} CompileLang;
+
+typedef enum {
+    COMPILE_GROUP_APP,
+    COMPILE_GROUP_MANIFOLD,
+    COMPILE_GROUP_CLIPPER,
+    COMPILE_GROUP_HARFBUZZ,
+    COMPILE_GROUP_FREETYPE_RUNTIME,
+    COMPILE_GROUP_NFD,
+    COMPILE_GROUP_FONT_BAKER,
+} CompileGroup;
+
+typedef struct {
+    const char *src_path;
+    const char *obj_path;
+    CompileLang lang;
+    CompileGroup group;
+    bool sanitize;
+    const char *extra_dependencies[4];
+    size_t extra_dependency_count;
+} CompileUnit;
+
+typedef struct {
+    CompileUnit *items;
+    size_t count;
+    size_t capacity;
+} CompileUnits;
+
+typedef struct {
+    CompileUnits units;
+    Nob_File_Paths objects;
+} BuildPlan;
+
+typedef struct {
+    BuildOptions opt;
+    size_t max_procs;
+    const char *obj_root;
+    const char *binary_path;
+
+    bool enable_cross_section;
+    bool enable_meshio;
+    bool enable_harfbuzz;
+    bool enable_nfd;
+
+    const Clipper2Info *clipper2;
+    const AssimpInfo *assimp;
+    const HarfBuzzInfo *harfbuzz;
+    const NfdInfo *nfd;
+} BuildContext;
 
 static void append_sanitizer_flags(Nob_Cmd *cmd, BuildOptions opt) {
     if (!opt.asan) return;
@@ -104,8 +168,88 @@ static void append_sanitizer_flags(Nob_Cmd *cmd, BuildOptions opt) {
                    "-O1",
                    "-g",
                    "-fno-omit-frame-pointer",
-                   "-fsanitize=address,undefined",
+                   "-shared-libsan",
+                   "-fsanitize=address",
+                   "-fsanitize=undefined",
                    "-fno-sanitize-recover=all");
+}
+
+static void append_common_cxx_flags(Nob_Cmd *cmd) {
+    nob_cmd_append(cmd,
+                   "-std=c++20",
+                   "-Wall",
+                   "-Wextra",
+                   "-Wpedantic",
+                   "-O2");
+}
+
+static void append_common_c_flags(Nob_Cmd *cmd) {
+    nob_cmd_append(cmd,
+                   "-std=c99",
+                   "-Wall",
+                   "-Wextra",
+                   "-Wpedantic",
+                   "-O2");
+}
+
+static void append_common_freetype_include_flags(Nob_Cmd *cmd) {
+    nob_cmd_append(cmd,
+                   "-I.",
+                   "-Itools",
+                   "-Ifreetype/include",
+                   "-Ifreetype/src/base",
+                   "-Ifreetype/src/sfnt",
+                   "-Ifreetype/src/truetype",
+                   "-Ifreetype/src/smooth",
+                   "-Ifreetype/src/raster",
+                   "-Ifreetype/src/psnames",
+                   "-Ifreetype/src/gzip");
+}
+
+static void append_feature_includes_defs(const BuildContext *ctx, Nob_Cmd *cmd) {
+    if (ctx->enable_cross_section && ctx->clipper2 && ctx->clipper2->include_dir) {
+        nob_cmd_append(cmd, nob_temp_sprintf("-I%s", ctx->clipper2->include_dir));
+    }
+    if (ctx->enable_meshio && ctx->assimp) {
+        nob_cmd_append(cmd,
+                       nob_temp_sprintf("-I%s", ctx->assimp->include_src_dir),
+                       nob_temp_sprintf("-I%s", ctx->assimp->include_build_dir));
+    }
+    if (ctx->enable_harfbuzz && ctx->harfbuzz && ctx->harfbuzz->include_dir) {
+        nob_cmd_append(cmd,
+                       "-DVICAD_HAS_HARFBUZZ=1",
+                       nob_temp_sprintf("-I%s", ctx->harfbuzz->include_dir),
+                       "-Ifreetype/include");
+    }
+    if (ctx->enable_nfd && ctx->nfd && ctx->nfd->include_dir) {
+        nob_cmd_append(cmd,
+                       "-DVICAD_HAS_NFD=1",
+                       nob_temp_sprintf("-I%s", ctx->nfd->include_dir));
+    }
+}
+
+static bool read_command_first_line(const char *command, char *out, size_t out_cap) {
+    if (!command || !out || out_cap == 0) return false;
+    FILE *fp = popen(command, "r");
+    if (!fp) return false;
+    if (!fgets(out, (int)out_cap, fp)) {
+        pclose(fp);
+        return false;
+    }
+    pclose(fp);
+    size_t n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) {
+        out[n - 1] = '\0';
+        n--;
+    }
+    return n > 0;
+}
+
+static const char *dir_of_path(const char *path) {
+    if (!path || path[0] == '\0') return "";
+    const char *slash = strrchr(path, '/');
+    if (!slash) return ".";
+    return nob_temp_sprintf("%.*s", (int)(slash - path), path);
 }
 
 static bool file_mtime_ns(const char *path, long long *out_ns) {
@@ -139,6 +283,25 @@ static bool newest_file_mtime_ns_recursive(const char *dir_path, long long *newe
         }
     }
     nob_da_free(children);
+    return true;
+}
+
+static const char *path_stem(const char *path) {
+    const char *base = nob_path_name(path);
+    const char *dot = strrchr(base, '.');
+    int stem_len = dot ? (int)(dot - base) : (int)strlen(base);
+    return nob_temp_sprintf("%.*s", stem_len, base);
+}
+
+static const char *make_obj_path(const char *obj_root, const char *subdir, const char *src_path) {
+    return nob_temp_sprintf("%s/%s/%s.o", obj_root, subdir, path_stem(src_path));
+}
+
+static bool append_compile_unit(BuildPlan *plan, CompileUnit unit, bool add_to_link_objects) {
+    nob_da_append(&plan->units, unit);
+    if (add_to_link_objects) {
+        nob_da_append(&plan->objects, unit.obj_path);
+    }
     return true;
 }
 
@@ -200,6 +363,21 @@ static NfdInfo detect_nativefiledialog(void) {
     info.found = nob_file_exists(header) != 0 &&
                  nob_file_exists(info.common_source) != 0 &&
                  nob_file_exists(info.platform_source) != 0;
+    return info;
+}
+
+static HarfBuzzInfo detect_harfbuzz(void) {
+    HarfBuzzInfo info = {0};
+    info.root = getenv("HARFBUZZ_DIR");
+    if (info.root == NULL || info.root[0] == '\0') {
+        info.root = "harfbuzz";
+    }
+
+    info.include_dir = nob_temp_sprintf("%s/src", info.root);
+    info.amalgamated_source = nob_temp_sprintf("%s/src/harfbuzz.cc", info.root);
+    const char *header = nob_temp_sprintf("%s/hb.h", info.include_dir);
+    info.found = nob_file_exists(info.amalgamated_source) != 0 &&
+                 nob_file_exists(header) != 0;
     return info;
 }
 
@@ -289,129 +467,279 @@ static bool build_assimp_if_needed(const AssimpInfo *assimp) {
     return true;
 }
 
-static bool compile_object_if_needed(const char *src_path,
-                                     const char *obj_path,
-                                     bool enable_cross_section,
-                                     const char *clipper_include_dir,
-                                     bool enable_meshio,
-                                     const AssimpInfo *assimp,
-                                     bool enable_nfd,
-                                     const char *nfd_include_dir,
-                                     const char *extra_dependency,
-                                     BuildOptions opt,
-                                     bool sanitize_this_object) {
-    int rebuild = 0;
-    if (extra_dependency != NULL && extra_dependency[0] != '\0') {
-        const char *deps[2] = {src_path, extra_dependency};
-        rebuild = nob_needs_rebuild(obj_path, deps, NOB_ARRAY_LEN(deps));
+static int needs_rebuild_unit(const BuildContext *ctx, const CompileUnit *unit) {
+    if (unit->group == COMPILE_GROUP_HARFBUZZ && ctx->harfbuzz) {
+        long long obj_mtime = 0;
+        const bool have_obj = file_mtime_ns(unit->obj_path, &obj_mtime);
+        long long newest_hb_src = 0;
+        if (!newest_file_mtime_ns_recursive(ctx->harfbuzz->include_dir, &newest_hb_src)) return -1;
+        return (have_obj && newest_hb_src <= obj_mtime) ? 0 : 1;
+    }
+
+    if (unit->extra_dependency_count > 0) {
+        const size_t dep_count = 1 + unit->extra_dependency_count;
+        const char *deps[1 + NOB_ARRAY_LEN(unit->extra_dependencies)] = {0};
+        deps[0] = unit->src_path;
+        for (size_t i = 0; i < unit->extra_dependency_count; ++i) {
+            deps[i + 1] = unit->extra_dependencies[i];
+        }
+        return nob_needs_rebuild(unit->obj_path, deps, dep_count);
+    }
+
+    return nob_needs_rebuild1(unit->obj_path, unit->src_path);
+}
+
+static void build_compile_cmd(const BuildContext *ctx, const CompileUnit *unit, Nob_Cmd *cmd) {
+    const bool is_nfd_group = unit->group == COMPILE_GROUP_NFD;
+    const bool is_cc_group = unit->group == COMPILE_GROUP_FREETYPE_RUNTIME || unit->group == COMPILE_GROUP_FONT_BAKER;
+    if (is_nfd_group) {
+        nob_cmd_append(cmd, "clang");
+    } else if (is_cc_group) {
+        nob_cmd_append(cmd, "cc");
+    } else if (unit->lang == COMPILE_LANG_CXX) {
+        nob_cmd_append(cmd, "clang++");
     } else {
-        rebuild = nob_needs_rebuild1(obj_path, src_path);
+        nob_cmd_append(cmd, "cc");
     }
-    if (rebuild < 0) return false;
-    if (rebuild == 0) return true;
 
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, "clang++");
-    nob_cmd_append(&cmd,
-                   "-std=c++20",
-                   "-Wall",
-                   "-Wextra",
-                   "-Wpedantic",
-                   "-O2",
-                   "-I.",
-                   "-Ibuild/generated",
-                   "-Imanifold/include",
-                   "-DMANIFOLD_PAR=-1",
-                   enable_cross_section ? "-DMANIFOLD_CROSS_SECTION=1" : "-DMANIFOLD_CROSS_SECTION=0",
-                   "-DMANIFOLD_EXPORT=0",
+    if (unit->lang == COMPILE_LANG_OBJC) {
+        nob_cmd_append(cmd, "-x", "objective-c");
+    }
+
+    switch (unit->group) {
+    case COMPILE_GROUP_APP:
+    case COMPILE_GROUP_MANIFOLD:
+    case COMPILE_GROUP_CLIPPER:
+        append_common_cxx_flags(cmd);
+        nob_cmd_append(cmd,
+                       "-I.",
+                       "-Ibuild/generated",
+                       "-Imanifold/include",
+                       "-DMANIFOLD_PAR=-1",
+                       ctx->enable_cross_section ? "-DMANIFOLD_CROSS_SECTION=1" : "-DMANIFOLD_CROSS_SECTION=0",
+                       "-DMANIFOLD_EXPORT=0");
+        append_feature_includes_defs(ctx, cmd);
+        break;
+    case COMPILE_GROUP_HARFBUZZ:
+        nob_cmd_append(cmd,
+                       "-std=c++20",
+                       "-O2",
+                       "-DHAVE_FREETYPE=1",
+                       "-I.",
+                       "-Ifreetype/include",
+                       nob_temp_sprintf("-I%s", ctx->harfbuzz->include_dir));
+        break;
+    case COMPILE_GROUP_FREETYPE_RUNTIME:
+        append_common_c_flags(cmd);
+        nob_cmd_append(cmd, "-DFT2_BUILD_LIBRARY");
+        append_common_freetype_include_flags(cmd);
+        break;
+    case COMPILE_GROUP_NFD:
+        append_common_c_flags(cmd);
+        nob_cmd_append(cmd,
+                       "-I.",
+                       nob_temp_sprintf("-I%s", ctx->nfd->include_dir));
+        break;
+    case COMPILE_GROUP_FONT_BAKER:
+        append_common_c_flags(cmd);
+        nob_cmd_append(cmd, "-DFT2_BUILD_LIBRARY");
+        append_common_freetype_include_flags(cmd);
+        break;
+    }
+
+    nob_cmd_append(cmd,
                    "-c",
-                   src_path,
+                   unit->src_path,
                    "-o",
-                   obj_path);
-    if (sanitize_this_object) append_sanitizer_flags(&cmd, opt);
-    if (enable_cross_section && clipper_include_dir != NULL) {
-        nob_cmd_append(&cmd, nob_temp_sprintf("-I%s", clipper_include_dir));
+                   unit->obj_path);
+
+    if (unit->sanitize) {
+        append_sanitizer_flags(cmd, ctx->opt);
     }
-    if (enable_meshio && assimp != NULL) {
-        nob_cmd_append(&cmd,
-                       nob_temp_sprintf("-I%s", assimp->include_src_dir),
-                       nob_temp_sprintf("-I%s", assimp->include_build_dir));
-    }
-    if (enable_nfd && nfd_include_dir != NULL) {
-        nob_cmd_append(&cmd,
-                       "-DVICAD_HAS_NFD=1",
-                       nob_temp_sprintf("-I%s", nfd_include_dir));
-    }
-    return nob_cmd_run(&cmd);
 }
 
-static bool compile_font_baker_object_if_needed(const char *src_path, const char *obj_path) {
-    const char *deps[] = {
-        src_path,
-        "tools/freetype/config/ftmodule.h",
-    };
-    int rebuild = nob_needs_rebuild(obj_path, deps, NOB_ARRAY_LEN(deps));
-    if (rebuild < 0) return false;
-    if (rebuild == 0) return true;
+static bool run_compile_units_parallel(const BuildContext *ctx, BuildPlan *plan) {
+    size_t dirty_count = 0;
+    size_t skipped_count = 0;
+    bool success = true;
+    Nob_Procs procs = {0};
 
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, "cc");
-    nob_cmd_append(&cmd,
-                   "-std=c99",
-                   "-Wall",
-                   "-Wextra",
-                   "-Wpedantic",
-                   "-O2",
-                   "-DFT2_BUILD_LIBRARY",
-                   "-I.",
-                   "-Itools",
-                   "-Ifreetype/include",
-                   "-Ifreetype/src/base",
-                   "-Ifreetype/src/sfnt",
-                   "-Ifreetype/src/truetype",
-                   "-Ifreetype/src/smooth",
-                   "-Ifreetype/src/raster",
-                   "-Ifreetype/src/psnames",
-                   "-Ifreetype/src/gzip",
-                   "-c",
-                   src_path,
-                   "-o",
-                   obj_path);
-    return nob_cmd_run(&cmd);
-}
+    for (size_t i = 0; i < plan->units.count; ++i) {
+        int rebuild = needs_rebuild_unit(ctx, &plan->units.items[i]);
+        if (rebuild < 0) {
+            success = false;
+            break;
+        }
+        if (rebuild == 0) {
+            skipped_count += 1;
+            continue;
+        }
 
-static bool compile_nativefiledialog_object_if_needed(const char *src_path,
-                                                      const char *obj_path,
-                                                      const char *include_dir,
-                                                      BuildOptions opt,
-                                                      bool sanitize_this_object,
-                                                      bool objc_source) {
-    int rebuild = nob_needs_rebuild1(obj_path, src_path);
-    if (rebuild < 0) return false;
-    if (rebuild == 0) return true;
+        dirty_count += 1;
+        Nob_Cmd cmd = {0};
+        build_compile_cmd(ctx, &plan->units.items[i], &cmd);
 
-    Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, "clang");
-    if (objc_source) {
-        nob_cmd_append(&cmd, "-x", "objective-c");
+        if (ctx->max_procs > 0) {
+            if (!nob_cmd_run(&cmd, .async = &procs, .max_procs = ctx->max_procs)) {
+                success = false;
+                break;
+            }
+        } else {
+            if (!nob_cmd_run(&cmd, .async = &procs)) {
+                success = false;
+                break;
+            }
+        }
     }
-    nob_cmd_append(&cmd,
-                   "-std=c99",
-                   "-Wall",
-                   "-Wextra",
-                   "-Wpedantic",
-                   "-O2",
-                   "-I.",
-                   nob_temp_sprintf("-I%s", include_dir),
-                   "-c",
-                   src_path,
-                   "-o",
-                   obj_path);
-    if (sanitize_this_object) append_sanitizer_flags(&cmd, opt);
-    return nob_cmd_run(&cmd);
+
+    nob_log(NOB_INFO,
+            "Compilation plan: total=%zu dirty=%zu skipped=%zu",
+            plan->units.count,
+            dirty_count,
+            skipped_count);
+
+    if (!nob_procs_flush(&procs)) {
+        success = false;
+    }
+
+    return success;
 }
 
-static bool build_font_baker(const char *baker_bin_path) {
+static bool append_app_units(BuildPlan *plan, const BuildContext *ctx, const char *baked_font_header) {
+    for (size_t i = 0; i < NOB_ARRAY_LEN(app_sources); ++i) {
+        const char *src = app_sources[i];
+        const char *obj = make_obj_path(ctx->obj_root, "src", src);
+        CompileUnit unit = {0};
+        unit.src_path = src;
+        unit.obj_path = obj;
+        unit.lang = COMPILE_LANG_CXX;
+        unit.group = COMPILE_GROUP_APP;
+        unit.sanitize = ctx->opt.asan;
+        if (strcmp(src, "src/app_kernel.cpp") == 0) {
+            unit.extra_dependencies[unit.extra_dependency_count++] = baked_font_header;
+        }
+        if (!append_compile_unit(plan, unit, true)) return false;
+    }
+    return true;
+}
+
+static bool append_manifold_units(BuildPlan *plan, const BuildContext *ctx) {
+    for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
+        const char *src = manifold_sources[i];
+        const char *obj = make_obj_path(ctx->obj_root, "manifold/src", src);
+        CompileUnit unit = {0};
+        unit.src_path = src;
+        unit.obj_path = obj;
+        unit.lang = COMPILE_LANG_CXX;
+        unit.group = COMPILE_GROUP_MANIFOLD;
+        unit.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+        if (!append_compile_unit(plan, unit, true)) return false;
+    }
+    return true;
+}
+
+static bool append_optional_units(BuildPlan *plan, const BuildContext *ctx) {
+    if (ctx->enable_meshio && ctx->assimp) {
+        CompileUnit unit = {0};
+        unit.src_path = manifold_meshio_source;
+        unit.obj_path = make_obj_path(ctx->obj_root, "manifold/src", manifold_meshio_source);
+        unit.lang = COMPILE_LANG_CXX;
+        unit.group = COMPILE_GROUP_MANIFOLD;
+        unit.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+        unit.extra_dependencies[unit.extra_dependency_count++] = nob_temp_sprintf("%s/assimp/config.h", ctx->assimp->include_build_dir);
+        if (!append_compile_unit(plan, unit, true)) return false;
+    }
+
+    if (ctx->enable_cross_section) {
+        CompileUnit cross = {0};
+        cross.src_path = manifold_cross_section_source;
+        cross.obj_path = make_obj_path(ctx->obj_root, "manifold/src", manifold_cross_section_source);
+        cross.lang = COMPILE_LANG_CXX;
+        cross.group = COMPILE_GROUP_MANIFOLD;
+        cross.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+        if (!append_compile_unit(plan, cross, true)) return false;
+
+        for (size_t i = 0; i < NOB_ARRAY_LEN(ctx->clipper2->sources); ++i) {
+            CompileUnit clip = {0};
+            clip.src_path = ctx->clipper2->sources[i];
+            clip.obj_path = make_obj_path(ctx->obj_root, "clipper2/src", ctx->clipper2->sources[i]);
+            clip.lang = COMPILE_LANG_CXX;
+            clip.group = COMPILE_GROUP_CLIPPER;
+            clip.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+            if (!append_compile_unit(plan, clip, true)) return false;
+        }
+    }
+
+    if (ctx->enable_harfbuzz && ctx->harfbuzz) {
+        CompileUnit hb = {0};
+        hb.src_path = ctx->harfbuzz->amalgamated_source;
+        hb.obj_path = make_obj_path(ctx->obj_root, "harfbuzz", ctx->harfbuzz->amalgamated_source);
+        hb.lang = COMPILE_LANG_CXX;
+        hb.group = COMPILE_GROUP_HARFBUZZ;
+        hb.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+        if (!append_compile_unit(plan, hb, true)) return false;
+
+        for (size_t i = 0; i < NOB_ARRAY_LEN(freetype_baker_sources); ++i) {
+            CompileUnit ft = {0};
+            ft.src_path = freetype_baker_sources[i];
+            ft.obj_path = make_obj_path(ctx->obj_root, "freetype", freetype_baker_sources[i]);
+            ft.lang = COMPILE_LANG_C;
+            ft.group = COMPILE_GROUP_FREETYPE_RUNTIME;
+            ft.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+            if (!append_compile_unit(plan, ft, true)) return false;
+        }
+    }
+
+    if (ctx->enable_nfd && ctx->nfd) {
+        CompileUnit common = {0};
+        common.src_path = ctx->nfd->common_source;
+        common.obj_path = make_obj_path(ctx->obj_root, "nativefiledialog", ctx->nfd->common_source);
+        common.lang = COMPILE_LANG_C;
+        common.group = COMPILE_GROUP_NFD;
+        common.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+        if (!append_compile_unit(plan, common, true)) return false;
+
+        CompileUnit platform = {0};
+        platform.src_path = ctx->nfd->platform_source;
+        platform.obj_path = make_obj_path(ctx->obj_root, "nativefiledialog", ctx->nfd->platform_source);
+#if defined(__APPLE__)
+        platform.lang = COMPILE_LANG_OBJC;
+#else
+        platform.lang = COMPILE_LANG_C;
+#endif
+        platform.group = COMPILE_GROUP_NFD;
+        platform.sanitize = ctx->opt.asan && ctx->opt.asan_deps;
+        if (!append_compile_unit(plan, platform, true)) return false;
+    }
+
+    return true;
+}
+
+static bool append_font_baker_units(BuildPlan *plan, const char *obj_root) {
+    CompileUnit tool = {0};
+    tool.src_path = font_baker_tool_source;
+    tool.obj_path = make_obj_path(obj_root, ".", font_baker_tool_source);
+    tool.lang = COMPILE_LANG_C;
+    tool.group = COMPILE_GROUP_FONT_BAKER;
+    tool.sanitize = false;
+    tool.extra_dependencies[tool.extra_dependency_count++] = "tools/freetype/config/ftmodule.h";
+    if (!append_compile_unit(plan, tool, false)) return false;
+
+    for (size_t i = 0; i < NOB_ARRAY_LEN(freetype_baker_sources); ++i) {
+        CompileUnit ft = {0};
+        ft.src_path = freetype_baker_sources[i];
+        ft.obj_path = make_obj_path(obj_root, ".", freetype_baker_sources[i]);
+        ft.lang = COMPILE_LANG_C;
+        ft.group = COMPILE_GROUP_FONT_BAKER;
+        ft.sanitize = false;
+        ft.extra_dependencies[ft.extra_dependency_count++] = "tools/freetype/config/ftmodule.h";
+        if (!append_compile_unit(plan, ft, false)) return false;
+    }
+
+    return true;
+}
+
+static bool build_font_baker(const BuildOptions *opt, const char *baker_bin_path) {
     if (nob_file_exists("tools/freetype/config/ftmodule.h") == 0) {
         nob_log(NOB_ERROR, "Missing tools/freetype/config/ftmodule.h");
         return false;
@@ -428,20 +756,21 @@ static bool build_font_baker(const char *baker_bin_path) {
     if (!nob_mkdir_if_not_exists("build")) return false;
     if (!nob_mkdir_if_not_exists("build/font_baker")) return false;
 
+    BuildContext ctx = {0};
+    ctx.opt = *opt;
+    ctx.max_procs = opt->max_procs > 0 ? (size_t)opt->max_procs : 0;
+
+    BuildPlan plan = {0};
+    if (!append_font_baker_units(&plan, "build/font_baker")) return false;
+
+    if (!run_compile_units_parallel(&ctx, &plan)) {
+        nob_log(NOB_ERROR, "Font baker object compilation failed");
+        return false;
+    }
+
     Nob_File_Paths objects = {0};
-
-    const char *tool_obj = "build/font_baker/font_baker_tool.o";
-    nob_da_append(&objects, tool_obj);
-    if (!compile_font_baker_object_if_needed(font_baker_tool_source, tool_obj)) return false;
-
-    for (size_t i = 0; i < NOB_ARRAY_LEN(freetype_baker_sources); ++i) {
-        const char *src = freetype_baker_sources[i];
-        const char *base_name = nob_path_name(src);
-        const char *obj = nob_temp_sprintf("build/font_baker/%.*s.o",
-                                           (int)(strlen(base_name) - sizeof(".c") + 1),
-                                           base_name);
-        nob_da_append(&objects, obj);
-        if (!compile_font_baker_object_if_needed(src, obj)) return false;
+    for (size_t i = 0; i < plan.units.count; ++i) {
+        nob_da_append(&objects, plan.units.items[i].obj_path);
     }
 
     int relink = nob_needs_rebuild(baker_bin_path, objects.items, objects.count);
@@ -475,7 +804,7 @@ static bool bake_funnel_sans_header(const char *baker_bin_path, const char *head
     if (!nob_mkdir_if_not_exists("build/generated")) return false;
 
     Nob_Cmd cmd = {0};
-    nob_cmd_append(&cmd, baker_bin_path, font_path, header_path, "64");
+    nob_cmd_append(&cmd, baker_bin_path, font_path, header_path, "32");
     return nob_cmd_run(&cmd);
 }
 
@@ -491,14 +820,22 @@ int main(int argc, char **argv) {
             opt.asan = true;
         } else if (strcmp(arg, "--asan-deps") == 0) {
             opt.asan_deps = true;
+        } else if (strcmp(arg, "--max-procs") == 0) {
+            if (argc <= 0) {
+                nob_log(NOB_ERROR, "--max-procs expects an integer argument");
+                return 1;
+            }
+            const char *value = nob_shift_args(&argc, &argv);
+            opt.max_procs = atoi(value);
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
-            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps]");
+            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps] [--max-procs N]");
             nob_log(NOB_INFO, "  --asan  Build vicad with ASan+UBSan instrumentation.");
             nob_log(NOB_INFO, "  --asan-deps  Also instrument manifold/clipper dependencies (requires --asan).");
+            nob_log(NOB_INFO, "  --max-procs N  Limit concurrent compiler processes (N <= 0 uses Nob default).");
             return 0;
         } else {
             nob_log(NOB_ERROR, "Unknown argument: %s", arg);
-            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps]");
+            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps] [--max-procs N]");
             return 1;
         }
     }
@@ -509,10 +846,14 @@ int main(int argc, char **argv) {
 
     const Clipper2Info clipper2 = detect_clipper2();
     const AssimpInfo assimp = detect_assimp();
+    const HarfBuzzInfo harfbuzz = detect_harfbuzz();
     const NfdInfo nfd = detect_nativefiledialog();
+
     const bool enable_cross_section = clipper2.found;
     const bool enable_meshio = assimp.found;
+    const bool enable_harfbuzz = harfbuzz.found;
     const bool enable_nfd = nfd.found;
+
     const char *build_tag = enable_cross_section ? "cross_section" : "base";
     if (opt.asan) {
         build_tag = nob_temp_sprintf("%s_asan", build_tag);
@@ -538,6 +879,14 @@ int main(int argc, char **argv) {
                 "Set ASSIMP_DIR to your clone root to enable it.",
                 assimp.root);
     }
+    if (enable_harfbuzz) {
+        nob_log(NOB_INFO, "HarfBuzz detected at %s; enabling text shaping library build (amalgamated src/harfbuzz.cc)", harfbuzz.root);
+    } else {
+        nob_log(NOB_WARNING,
+                "HarfBuzz not found at %s; shaping library build disabled. "
+                "Set HARFBUZZ_DIR to your clone root to enable it.",
+                harfbuzz.root);
+    }
     if (enable_nfd) {
         nob_log(NOB_INFO, "nativefiledialog detected at %s; enabling native Open dialog", nfd.root);
     } else {
@@ -559,7 +908,7 @@ int main(int argc, char **argv) {
     if (enable_meshio) {
         if (!build_assimp_if_needed(&assimp)) return 1;
     }
-    if (!build_font_baker(font_baker_bin)) return 1;
+    if (!build_font_baker(&opt, font_baker_bin)) return 1;
     if (!bake_funnel_sans_header(font_baker_bin, baked_font_header)) return 1;
 
     if (!nob_mkdir_if_not_exists(obj_root)) return 1;
@@ -573,102 +922,44 @@ int main(int argc, char **argv) {
     if (enable_nfd) {
         if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/nativefiledialog", obj_root))) return 1;
     }
-
-    Nob_File_Paths objects = {0};
-    for (size_t i = 0; i < NOB_ARRAY_LEN(app_sources); ++i) {
-        const char *src = app_sources[i];
-        const char *base = src + sizeof("src/") - 1;
-        const char *obj = nob_temp_sprintf("%s/src/%.*s.o",
-                                           obj_root,
-                                           (int)(strlen(base) - sizeof(".cpp") + 1),
-                                           base);
-        nob_da_append(&objects, obj);
-        const char *extra_dep = strcmp(src, "src/app_kernel.cpp") == 0 ? baked_font_header : NULL;
-        if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir,
-                                      enable_meshio, &assimp,
-                                      enable_nfd, nfd.include_dir,
-                                      extra_dep, opt, opt.asan)) return 1;
+    if (enable_harfbuzz) {
+        if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/harfbuzz", obj_root))) return 1;
+        if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/freetype", obj_root))) return 1;
     }
 
-    for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
-        const char *src = manifold_sources[i];
-        const char *base = src + sizeof("manifold/src/") - 1;
-        const char *obj = nob_temp_sprintf("%s/manifold/src/%.*s.o",
-                                           obj_root,
-                                           (int)(strlen(base) - sizeof(".cpp") + 1),
-                                           base);
-        nob_da_append(&objects, obj);
-        if (!compile_object_if_needed(src, obj, enable_cross_section, clipper2.include_dir,
-                                      enable_meshio, &assimp,
-                                      enable_nfd, nfd.include_dir,
-                                      NULL, opt, opt.asan && opt.asan_deps)) return 1;
+    BuildContext ctx = {0};
+    ctx.opt = opt;
+    ctx.max_procs = opt.max_procs > 0 ? (size_t)opt.max_procs : 0;
+    ctx.obj_root = obj_root;
+    ctx.binary_path = binary_mode_path;
+    ctx.enable_cross_section = enable_cross_section;
+    ctx.enable_meshio = enable_meshio;
+    ctx.enable_harfbuzz = enable_harfbuzz;
+    ctx.enable_nfd = enable_nfd;
+    ctx.clipper2 = &clipper2;
+    ctx.assimp = &assimp;
+    ctx.harfbuzz = &harfbuzz;
+    ctx.nfd = &nfd;
+
+    BuildPlan plan = {0};
+    if (!append_app_units(&plan, &ctx, baked_font_header)) return 1;
+    if (!append_manifold_units(&plan, &ctx)) return 1;
+    if (!append_optional_units(&plan, &ctx)) return 1;
+
+    if (!run_compile_units_parallel(&ctx, &plan)) {
+        nob_log(NOB_ERROR, "Compilation failed");
+        return 1;
     }
 
-    if (enable_meshio) {
-        const char *obj = nob_temp_sprintf("%s/manifold/src/meshIO.o", obj_root);
-        nob_da_append(&objects, obj);
-        const char *meshio_dep = nob_temp_sprintf("%s/assimp/config.h", assimp.include_build_dir);
-        if (!compile_object_if_needed(manifold_meshio_source, obj, enable_cross_section, clipper2.include_dir,
-                                      true, &assimp,
-                                      enable_nfd, nfd.include_dir,
-                                      meshio_dep, opt, opt.asan && opt.asan_deps)) return 1;
-    }
-
-    if (enable_cross_section) {
-        const char *obj = nob_temp_sprintf("%s/manifold/src/cross_section.o", obj_root);
-        nob_da_append(&objects, obj);
-        if (!compile_object_if_needed(manifold_cross_section_source, obj, true, clipper2.include_dir,
-                                      enable_meshio, &assimp,
-                                      enable_nfd, nfd.include_dir,
-                                      NULL, opt, opt.asan && opt.asan_deps)) return 1;
-
-        for (size_t i = 0; i < NOB_ARRAY_LEN(clipper2.sources); ++i) {
-            const char *src = clipper2.sources[i];
-            const char *base_name = nob_path_name(src);
-            const char *obj2 = nob_temp_sprintf("%s/clipper2/src/%.*s.o",
-                                                obj_root,
-                                                (int)(strlen(base_name) - sizeof(".cpp") + 1),
-                                                base_name);
-            nob_da_append(&objects, obj2);
-            if (!compile_object_if_needed(src, obj2, true, clipper2.include_dir,
-                                          enable_meshio, &assimp,
-                                          enable_nfd, nfd.include_dir,
-                                          NULL, opt, opt.asan && opt.asan_deps)) return 1;
-        }
-    }
-
-    if (enable_nfd) {
-        const char *nfd_common_obj = nob_temp_sprintf("%s/nativefiledialog/nfd_common.o", obj_root);
-        nob_da_append(&objects, nfd_common_obj);
-        if (!compile_nativefiledialog_object_if_needed(nfd.common_source, nfd_common_obj, nfd.include_dir,
-                                                       opt, opt.asan && opt.asan_deps, false)) return 1;
-
-        const char *base_name = nob_path_name(nfd.platform_source);
-        const char *dot = strrchr(base_name, '.');
-        int stem_len = dot ? (int)(dot - base_name) : (int)strlen(base_name);
-        const char *nfd_platform_obj = nob_temp_sprintf("%s/nativefiledialog/%.*s.o",
-                                                        obj_root,
-                                                        stem_len,
-                                                        base_name);
-        nob_da_append(&objects, nfd_platform_obj);
-#if defined(__APPLE__)
-        const bool objc_source = true;
-#else
-        const bool objc_source = false;
-#endif
-        if (!compile_nativefiledialog_object_if_needed(nfd.platform_source, nfd_platform_obj, nfd.include_dir,
-                                                       opt, opt.asan && opt.asan_deps, objc_source)) return 1;
-    }
-
-    int relink = nob_needs_rebuild(binary_mode_path, objects.items, objects.count);
+    int relink = nob_needs_rebuild(binary_mode_path, plan.objects.items, plan.objects.count);
     if (relink < 0) return 1;
     if (relink == 0) {
         nob_log(NOB_INFO, "%s is up-to-date", binary_mode_path);
     } else {
         Nob_Cmd cmd = {0};
         nob_cmd_append(&cmd, "clang++");
-        for (size_t i = 0; i < objects.count; ++i) {
-            nob_cmd_append(&cmd, objects.items[i]);
+        for (size_t i = 0; i < plan.objects.count; ++i) {
+            nob_cmd_append(&cmd, plan.objects.items[i]);
         }
         if (enable_meshio) {
             nob_cmd_append(&cmd, assimp.lib_assimp);
@@ -679,6 +970,19 @@ int main(int argc, char **argv) {
         append_sanitizer_flags(&cmd, opt);
 
 #ifdef __APPLE__
+        if (opt.asan) {
+            char asan_dylib[PATH_MAX] = {0};
+            char ubsan_dylib[PATH_MAX] = {0};
+            if (read_command_first_line("clang++ --print-file-name=libclang_rt.asan_osx_dynamic.dylib",
+                                        asan_dylib, sizeof(asan_dylib))) {
+                const char *asan_dir = dir_of_path(asan_dylib);
+                nob_cmd_append(&cmd, "-Wl,-rpath", nob_temp_sprintf("%s", asan_dir), asan_dylib);
+            }
+            if (read_command_first_line("clang++ --print-file-name=libclang_rt.ubsan_osx_dynamic.dylib",
+                                        ubsan_dylib, sizeof(ubsan_dylib))) {
+                nob_cmd_append(&cmd, ubsan_dylib);
+            }
+        }
         nob_cmd_append(&cmd,
                        "-framework", "Cocoa",
                        "-framework", "OpenGL",

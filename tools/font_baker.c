@@ -89,7 +89,6 @@ int main(int argc, char **argv) {
         }
 
         FT_GlyphSlot slot = face->glyph;
-        FT_GlyphSlot_Embolden(slot);
         const int w = (int)slot->bitmap.width;
         const int h = (int)slot->bitmap.rows;
 

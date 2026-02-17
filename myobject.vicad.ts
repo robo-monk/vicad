@@ -27,18 +27,24 @@ function solidify({
   return x;
 }
 
-const hingeProfiles = (size: number = 10) => [
+const hingeProfiles = (size: number = 10) => ([
   XZ.rectangle(size, size).translate(-size / 2, -size / 2),
   XZ.rectangle(size, size)
     .translate(0, -size / 2)
     .fillet(size / 2 - 0.1),
-];
+  // XZ.circle(1).translate(size / 2, 0),
+]);
 
-const hinge = (depth: number, size: number = 10) =>
-  solidify({
+// hingeProfiles()
+
+const hinge = (depth: number, size: number = 10) => {
+  return solidify({
     depth,
     extrudes: hingeProfiles(size),
+    // subtractions: [hingeProfiles[2]],
   });
+}
+
 
 const outerHeight = 5;
 const middleHeight = 6;
