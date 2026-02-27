@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "ipc_protocol.h"
@@ -123,6 +125,260 @@ manifold::Manifold apply_plane_to_manifold(const manifold::Manifold &in_m, const
   return in_m.Warp([plane](manifold::vec3 &v) {
     v = map_plane_local_to_world(plane, v);
   });
+}
+
+double cross2(const manifold::vec2 &a, const manifold::vec2 &b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+double poly_area(const manifold::SimplePolygon &poly) {
+  if (poly.size() < 3) return 0.0;
+  double acc = 0.0;
+  for (size_t i = 0; i < poly.size(); ++i) {
+    const manifold::vec2 &a = poly[i];
+    const manifold::vec2 &b = poly[(i + 1) % poly.size()];
+    acc += a.x * b.y - b.x * a.y;
+  }
+  return 0.5 * acc;
+}
+
+double vec_len(const manifold::vec2 &v) {
+  return std::sqrt(v.x * v.x + v.y * v.y);
+}
+
+manifold::vec2 vec_norm(const manifold::vec2 &v) {
+  const double l = vec_len(v);
+  if (l <= 1e-15) return manifold::vec2(0.0, 0.0);
+  return manifold::vec2(v.x / l, v.y / l);
+}
+
+bool nearly_same_point(const manifold::vec2 &a, const manifold::vec2 &b, double eps) {
+  return std::abs(a.x - b.x) <= eps && std::abs(a.y - b.y) <= eps;
+}
+
+struct CornerFilletSpec {
+  uint32_t contour = 0;
+  uint32_t vertex = 0;
+  double radius = 0.0;
+};
+
+bool apply_corner_fillets(const manifold::CrossSection &in_c,
+                          const std::vector<CornerFilletSpec> &specs,
+                          const ReplayLodPolicy &lod_policy,
+                          manifold::CrossSection *out_c,
+                          std::string *error) {
+  if (!out_c) {
+    if (error) *error = "Replay failed: null cross-section output for corner fillet.";
+    return false;
+  }
+  if (specs.empty()) {
+    *out_c = in_c;
+    return true;
+  }
+
+  manifold::Polygons polys = in_c.ToPolygons();
+  if (polys.empty()) {
+    if (error) *error = "Replay failed: cross fillet corners requires a non-empty cross-section.";
+    return false;
+  }
+
+  std::unordered_map<uint32_t, std::unordered_map<uint32_t, double>> corner_radii;
+  corner_radii.reserve(specs.size());
+  for (const CornerFilletSpec &spec : specs) {
+    if (!std::isfinite(spec.radius) || spec.radius < 0.0) {
+      if (error) *error = "Replay failed: cross fillet corner radius must be finite and >= 0.";
+      return false;
+    }
+    if ((size_t)spec.contour >= polys.size()) {
+      if (error) *error = "Replay failed: cross fillet corner contour index out of range.";
+      return false;
+    }
+    const manifold::SimplePolygon &poly = polys[spec.contour];
+    if (poly.size() < 3) {
+      if (error) *error = "Replay failed: cross fillet corner contour has fewer than 3 vertices.";
+      return false;
+    }
+    if ((size_t)spec.vertex >= poly.size()) {
+      if (error) *error = "Replay failed: cross fillet corner vertex index out of range.";
+      return false;
+    }
+    auto &by_vertex = corner_radii[spec.contour];
+    if (by_vertex.find(spec.vertex) != by_vertex.end()) {
+      if (error) *error = "Replay failed: duplicate cross fillet corner selection.";
+      return false;
+    }
+    by_vertex[spec.vertex] = spec.radius;
+  }
+
+  manifold::Polygons out_polys;
+  out_polys.reserve(polys.size());
+  constexpr double kGeomEps = 1e-9;
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double kTwoPi = 2.0 * kPi;
+
+  for (size_t ci = 0; ci < polys.size(); ++ci) {
+    const manifold::SimplePolygon &poly = polys[ci];
+    if (poly.size() < 3) {
+      if (error) *error = "Replay failed: cross fillet corner contour has fewer than 3 vertices.";
+      return false;
+    }
+
+    const double area = poly_area(poly);
+    if (std::abs(area) <= kGeomEps) {
+      if (error) *error = "Replay failed: cross fillet corners cannot be applied to degenerate contours.";
+      return false;
+    }
+    const double contour_dir = (area > 0.0) ? 1.0 : -1.0;
+
+    std::vector<double> radii(poly.size(), 0.0);
+    auto it_contour = corner_radii.find((uint32_t)ci);
+    if (it_contour != corner_radii.end()) {
+      for (const auto &entry : it_contour->second) {
+        radii[entry.first] = entry.second;
+      }
+    }
+
+    std::vector<double> tangent_dist(poly.size(), 0.0);
+    for (size_t i = 0; i < poly.size(); ++i) {
+      const double r = radii[i];
+      if (r <= kGeomEps) continue;
+      const size_t ip = (i + poly.size() - 1) % poly.size();
+      const size_t in = (i + 1) % poly.size();
+      const manifold::vec2 &prev = poly[ip];
+      const manifold::vec2 &curr = poly[i];
+      const manifold::vec2 &next = poly[in];
+
+      const manifold::vec2 e_in(curr.x - prev.x, curr.y - prev.y);
+      const manifold::vec2 e_out(next.x - curr.x, next.y - curr.y);
+      const double len_in = vec_len(e_in);
+      const double len_out = vec_len(e_out);
+      if (len_in <= kGeomEps || len_out <= kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corners encountered a zero-length edge.";
+        return false;
+      }
+
+      const double turn = cross2(e_in, e_out);
+      if (turn * contour_dir <= kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corners only supports convex vertices.";
+        return false;
+      }
+
+      const manifold::vec2 u_prev = vec_norm(manifold::vec2(prev.x - curr.x, prev.y - curr.y));
+      const manifold::vec2 u_next = vec_norm(manifold::vec2(next.x - curr.x, next.y - curr.y));
+      const double dot = std::clamp(u_prev.x * u_next.x + u_prev.y * u_next.y, -1.0, 1.0);
+      const double alpha = std::acos(dot);
+      if (!(alpha > 1e-6 && alpha < kPi - 1e-6)) {
+        if (error) *error = "Replay failed: cross fillet corner angle is invalid.";
+        return false;
+      }
+      const double tan_half = std::tan(alpha * 0.5);
+      if (tan_half <= kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corner angle is too sharp.";
+        return false;
+      }
+      const double t = r / tan_half;
+      if (t >= len_in - kGeomEps || t >= len_out - kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corner radius is too large for adjacent edges.";
+        return false;
+      }
+      tangent_dist[i] = t;
+    }
+
+    for (size_t i = 0; i < poly.size(); ++i) {
+      const size_t in = (i + 1) % poly.size();
+      const manifold::vec2 edge(poly[in].x - poly[i].x, poly[in].y - poly[i].y);
+      const double len_edge = vec_len(edge);
+      if (len_edge <= kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corners encountered a zero-length edge.";
+        return false;
+      }
+      if (tangent_dist[i] + tangent_dist[in] >= len_edge - kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corner radii overlap on an edge.";
+        return false;
+      }
+    }
+
+    manifold::SimplePolygon out_poly;
+    out_poly.reserve(poly.size() * 3);
+    auto push_point = [&out_poly](const manifold::vec2 &p) {
+      constexpr double kPushEps = 1e-10;
+      if (out_poly.empty() || !nearly_same_point(out_poly.back(), p, kPushEps)) {
+        out_poly.push_back(p);
+      }
+    };
+
+    for (size_t i = 0; i < poly.size(); ++i) {
+      const double r = radii[i];
+      if (r <= kGeomEps) {
+        push_point(poly[i]);
+        continue;
+      }
+
+      const size_t ip = (i + poly.size() - 1) % poly.size();
+      const size_t in = (i + 1) % poly.size();
+      const manifold::vec2 &prev = poly[ip];
+      const manifold::vec2 &curr = poly[i];
+      const manifold::vec2 &next = poly[in];
+      const manifold::vec2 u_prev = vec_norm(manifold::vec2(prev.x - curr.x, prev.y - curr.y));
+      const manifold::vec2 u_next = vec_norm(manifold::vec2(next.x - curr.x, next.y - curr.y));
+      const double dot = std::clamp(u_prev.x * u_next.x + u_prev.y * u_next.y, -1.0, 1.0);
+      const double alpha = std::acos(dot);
+      const double dist_center = r / std::sin(alpha * 0.5);
+      const manifold::vec2 bisector = vec_norm(manifold::vec2(u_prev.x + u_next.x, u_prev.y + u_next.y));
+      if (vec_len(bisector) <= kGeomEps) {
+        if (error) *error = "Replay failed: cross fillet corner bisector is undefined.";
+        return false;
+      }
+
+      const double t = tangent_dist[i];
+      const manifold::vec2 p_start(curr.x + u_prev.x * t, curr.y + u_prev.y * t);
+      const manifold::vec2 p_end(curr.x + u_next.x * t, curr.y + u_next.y * t);
+      const manifold::vec2 center(curr.x + bisector.x * dist_center,
+                                  curr.y + bisector.y * dist_center);
+
+      double a0 = std::atan2(p_start.y - center.y, p_start.x - center.x);
+      double a1 = std::atan2(p_end.y - center.y, p_end.x - center.x);
+      double delta = a1 - a0;
+      if (contour_dir > 0.0) {
+        while (delta <= 0.0) delta += kTwoPi;
+      } else {
+        while (delta >= 0.0) delta -= kTwoPi;
+      }
+      const double sweep = std::abs(delta);
+      if (sweep <= 1e-8 || sweep >= kPi + 1e-6) {
+        if (error) *error = "Replay failed: cross fillet corner arc sweep is invalid.";
+        return false;
+      }
+
+      const int full_segments = AutoCircularSegments(std::abs(r), lod_policy.profile);
+      int seg = std::max(1, (int)std::ceil((double)full_segments * sweep / kTwoPi));
+      push_point(p_start);
+      for (int s = 1; s < seg; ++s) {
+        const double u = (double)s / (double)seg;
+        const double a = a0 + delta * u;
+        push_point(manifold::vec2(center.x + std::cos(a) * r,
+                                  center.y + std::sin(a) * r));
+      }
+      push_point(p_end);
+    }
+
+    if (out_poly.size() >= 2 && nearly_same_point(out_poly.front(), out_poly.back(), 1e-10)) {
+      out_poly.pop_back();
+    }
+    if (out_poly.size() < 3) {
+      if (error) *error = "Replay failed: cross fillet corners produced an invalid contour.";
+      return false;
+    }
+    out_polys.push_back(std::move(out_poly));
+  }
+
+  manifold::CrossSection out(out_polys, manifold::CrossSection::FillRule::Positive);
+  if (out.IsEmpty()) {
+    if (error) *error = "Replay failed: cross fillet corners produced an empty cross-section.";
+    return false;
+  }
+  *out_c = std::move(out);
+  return true;
 }
 
 // Sketch semantic derivation and operation trace construction are implemented in
@@ -448,6 +704,44 @@ bool ReplayOpsToTables(const uint8_t *records, size_t records_size, uint32_t op_
         cross_plane[out_id] = ((size_t)in_id < cross_plane.size()) ? cross_plane[in_id] : default_sketch_plane();
         sem.inputs = {in_id};
         sem.params_f64 = {radius};
+      } break;
+      case OpCode::CrossFilletCorners: {
+        uint32_t in_id = 0;
+        uint32_t corner_count = 0;
+        if (!read_u32(&payload, &in_id) || !read_u32(&payload, &corner_count) || corner_count == 0) {
+          *error = "Replay failed: invalid cross fillet corners payload.";
+          return false;
+        }
+        manifold::CrossSection in_c;
+        if (!need_c(c_nodes, has_c, in_id, &in_c, error)) return false;
+
+        std::vector<CornerFilletSpec> specs;
+        specs.reserve(corner_count);
+        sem.params_u32.push_back(corner_count);
+        for (uint32_t i = 0; i < corner_count; ++i) {
+          CornerFilletSpec spec = {};
+          if (!read_u32(&payload, &spec.contour) || !read_u32(&payload, &spec.vertex) ||
+              !read_f64(&payload, &spec.radius)) {
+            *error = "Replay failed: invalid cross fillet corner entry payload.";
+            return false;
+          }
+          if (!std::isfinite(spec.radius) || spec.radius < 0.0) {
+            *error = "Replay failed: cross fillet corner radius must be finite and >= 0.";
+            return false;
+          }
+          specs.push_back(spec);
+          sem.params_u32.push_back(spec.contour);
+          sem.params_u32.push_back(spec.vertex);
+          sem.params_f64.push_back(spec.radius);
+        }
+
+        manifold::CrossSection out_c;
+        if (!apply_corner_fillets(in_c, specs, lod_policy, &out_c, error)) return false;
+        c_nodes[out_id] = std::move(out_c);
+        has_c[out_id] = true;
+        cross_plane[out_id] =
+            ((size_t)in_id < cross_plane.size()) ? cross_plane[in_id] : default_sketch_plane();
+        sem.inputs = {in_id};
       } break;
       case OpCode::CrossOffsetClone: {
         uint32_t in_id = 0;

@@ -65,6 +65,7 @@ enum class OpCode : uint16_t {
   CrossFillet = 107,
   CrossOffsetClone = 108,
   CrossPlane = 109,
+  CrossFilletCorners = 110,
 };
 
 enum class NodeKind : uint32_t {

@@ -173,15 +173,16 @@ function requestScriptPath() {
 async function executeScript(scriptPath: string) {
   const abs = resolve(scriptPath);
   __vicadBeginRun();
-  (globalThis as any).Manifold = Manifold;
-  (globalThis as any).CrossSection = CrossSection;
-  (globalThis as any).GLTFNode = GLTFNode;
-  (globalThis as any).Mesh = Mesh;
-  (globalThis as any).Plane = Plane;
-  (globalThis as any).XY = XY;
-  (globalThis as any).XZ = XZ;
-  (globalThis as any).YZ = YZ;
-  (globalThis as any).vicad = vicad;
+  const g = globalThis as Record<string, unknown>;
+  g.Manifold = Manifold;
+  g.CrossSection = CrossSection;
+  g.GLTFNode = GLTFNode;
+  g.Mesh = Mesh;
+  g.Plane = Plane;
+  g.XY = XY;
+  g.XZ = XZ;
+  g.YZ = YZ;
+  g.vicad = vicad;
   const loaded = await import(`file://${abs}?t=${Date.now()}`);
   if (loaded.default !== undefined) {
     throw new Error("SceneRegistrationError: scene mode uses side-effect registration only; default export is disabled.");
@@ -233,6 +234,12 @@ function makeDiag(error: unknown, phase: number, runId: bigint, startedAt: numbe
   };
 }
 
+// Emits a newline-delimited JSON log record to stderr.
+// Agents can query with: grep '"event":"RUN_DONE"' build/vicad-worker.log | jq .
+function log(event: string, fields: Record<string, string | number> = {}) {
+  process.stderr.write(JSON.stringify({ src: "vicad-worker", event, ...fields }) + "\n");
+}
+
 headerCheck();
 
 const sock = createConnection(socketPath);
@@ -276,7 +283,7 @@ sock.on("data", async (chunk: Buffer) => {
     }
     setU32(HEADER_OFFSETS.state, IPC_STATE.REQ_RUNNING);
     const startedAt = Date.now();
-    console.error(`[vicad-worker] RUN_STARTED run_id=${seq.toString()}`);
+    log("RUN_STARTED", { run_id: seq.toString() });
     try {
       const path = requestScriptPath();
       const result = await executeScript(path);
@@ -305,13 +312,13 @@ sock.on("data", async (chunk: Buffer) => {
       }
       writeSuccessResponseScene(entries.length, result.opCount, result.records, objectTable, namesBlob);
       setU64(HEADER_OFFSETS.responseSeq, seq);
-      console.error(`[vicad-worker] RUN_DONE run_id=${seq.toString()} duration_ms=${Date.now() - startedAt}`);
+      log("RUN_DONE", { run_id: seq.toString(), duration_ms: Date.now() - startedAt });
       sock.write(`DONE ${seq}\n`);
     } catch (error) {
       const diag = makeDiag(error, IPC_ERROR_PHASE.SCRIPT_EXECUTE, seq, startedAt);
       writeErrorResponse(diag);
       setU64(HEADER_OFFSETS.responseSeq, seq);
-      console.error(`[vicad-worker] RUN_FAILED run_id=${seq.toString()} duration_ms=${Date.now() - startedAt} code=${diag.code}`);
+      log("RUN_FAILED", { run_id: seq.toString(), duration_ms: Date.now() - startedAt, code: diag.code });
       sock.write(`ERROR ${seq}\n`);
     }
   }

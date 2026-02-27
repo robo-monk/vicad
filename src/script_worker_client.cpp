@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "ipc_protocol.h"
+#include "log.h"
 #include "op_decoder.h"
 
 namespace vicad {
@@ -519,13 +520,7 @@ bool ScriptWorkerClient::ExecuteScriptScene(const char *script_path,
 
 void ScriptWorkerClient::LogEvent(const char *event, uint64_t run_id, const std::string &details) {
   if (!event) return;
-  if (details.empty()) {
-    std::fprintf(stderr, "[vicad-ipc] %s run_id=%llu\n",
-                 event, (unsigned long long)run_id);
-  } else {
-    std::fprintf(stderr, "[vicad-ipc] %s run_id=%llu %s\n",
-                 event, (unsigned long long)run_id, details.c_str());
-  }
+  vicad::log_event(event, run_id, details.empty() ? nullptr : details.c_str());
 }
 
 void ScriptWorkerClient::Shutdown() {

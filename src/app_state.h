@@ -31,12 +31,8 @@ struct FaceSelectState {
 struct EdgeSelectState {
   bool enabled;
   bool dirtyTopology;
-  bool dirtySilhouette;
-  float sharpAngleDeg;
   int hoveredEdge;
   int selectedEdge;
-  int hoveredChain;
-  int selectedChain;
   vicad::EdgeDetectionResult edges;
   vicad::SilhouetteResult silhouette;
 };

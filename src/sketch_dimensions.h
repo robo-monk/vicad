@@ -54,6 +54,9 @@ struct SketchDimensionModel {
 
   bool hasFillet = false;
   double filletRadius = 0.0;
+  uint32_t filletCornerCount = 0;
+  double filletRadiusMin = 0.0;
+  double filletRadiusMax = 0.0;
 
   bool regularPolygon = false;
   uint32_t polygonSides = 0;

@@ -71,6 +71,76 @@ describe("CrossSection.fillet", () => {
   });
 });
 
+describe("CrossSection.filletCorners", () => {
+  it("encodes CROSS_FILLET_CORNERS with contour/vertex/radius triplets", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(10);
+    const filleted = square.filletCorners([
+      { contour: 0, vertex: 0, radius: 1.5 },
+      { contour: 0, vertex: 2, radius: 0.75 },
+    ]);
+    vicad.addSketch(filleted, { name: "fillet-corners-test" });
+
+    const scene = __vicadEncodeScene();
+    const ops = decodeOps(scene.records);
+    expect(ops.length).toBe(2);
+    expect(ops[1].opcode).toBe(OP.CROSS_FILLET_CORNERS);
+
+    const payload = ops[1].payload;
+    expect(payload.byteLength).toBe(44);
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    expect(view.getUint32(0, true)).toBe(filleted.nodeId);
+    expect(view.getUint32(4, true)).toBe(square.nodeId);
+    expect(view.getUint32(8, true)).toBe(2);
+    expect(view.getUint32(12, true)).toBe(0);
+    expect(view.getUint32(16, true)).toBe(0);
+    expect(view.getFloat64(20, true)).toBe(1.5);
+    expect(view.getUint32(28, true)).toBe(0);
+    expect(view.getUint32(32, true)).toBe(2);
+    expect(view.getFloat64(36, true)).toBe(0.75);
+  });
+
+  it("accepts radius 0 on selected corners", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(5);
+    const filleted = square.filletCorners([{ contour: 0, vertex: 1, radius: 0 }]);
+    expect(filleted.nodeId).not.toBe(square.nodeId);
+  });
+
+  it("rejects empty selections", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(5);
+    expect(() => square.filletCorners([])).toThrow(
+      "CrossSection.filletCorners requires a non-empty array of corner selections.",
+    );
+  });
+
+  it("rejects invalid indices and radii", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(5);
+    expect(() => square.filletCorners([{ contour: -1, vertex: 0, radius: 1 }])).toThrow(
+      "CrossSection.filletCorners requires contour indices as integers >= 0.",
+    );
+    expect(() => square.filletCorners([{ contour: 0, vertex: 1.25, radius: 1 }])).toThrow(
+      "CrossSection.filletCorners requires vertex indices as integers >= 0.",
+    );
+    expect(() => square.filletCorners([{ contour: 0, vertex: 1, radius: Number.NaN }])).toThrow(
+      "CrossSection.filletCorners requires a finite radius >= 0 for each corner.",
+    );
+  });
+
+  it("rejects duplicate contour/vertex selections", () => {
+    __vicadBeginRun();
+    const square = CrossSection.square(5);
+    expect(() =>
+      square.filletCorners([
+        { contour: 0, vertex: 1, radius: 0.5 },
+        { contour: 0, vertex: 1, radius: 1.0 },
+      ]),
+    ).toThrow("CrossSection.filletCorners does not allow duplicate contour/vertex selections.");
+  });
+});
+
 describe("CrossSection.offsetClone", () => {
   it("encodes CROSS_OFFSET_CLONE with inId and delta", () => {
     __vicadBeginRun();

@@ -3,6 +3,7 @@ import { encodeOps, type EncodedOp } from "./op-encoder";
 
 type Vec2Like = [number, number] | number[];
 type Vec3Like = [number, number, number] | number[];
+type FilletCornerSelection = { contour: number; vertex: number; radius: number };
 
 type Part = { t: "u32" | "u64" | "f64"; v: number | bigint };
 
@@ -93,6 +94,28 @@ function makePolygonsPayload(outId: number, contours: [number, number][][]) {
       view.setFloat64(off, y, true);
       off += 8;
     }
+  }
+  return out.buffer;
+}
+
+function makeFilletCornersPayload(outId: number, inId: number, corners: FilletCornerSelection[]) {
+  const bytes = 12 + corners.length * 16;
+  const out = new Uint8Array(bytes);
+  const view = new DataView(out.buffer);
+  let off = 0;
+  view.setUint32(off, outId >>> 0, true);
+  off += 4;
+  view.setUint32(off, inId >>> 0, true);
+  off += 4;
+  view.setUint32(off, corners.length >>> 0, true);
+  off += 4;
+  for (const corner of corners) {
+    view.setUint32(off, corner.contour >>> 0, true);
+    off += 4;
+    view.setUint32(off, corner.vertex >>> 0, true);
+    off += 4;
+    view.setFloat64(off, corner.radius, true);
+    off += 8;
   }
   return out.buffer;
 }
@@ -490,6 +513,40 @@ export class CrossSection {
       { t: "f64", v: r },
     ]));
     return this.derive(out, "CrossSection.fillet");
+  }
+
+  filletCorners(corners: FilletCornerSelection[]) {
+    if (!Array.isArray(corners) || corners.length === 0) {
+      throw new Error("CrossSection.filletCorners requires a non-empty array of corner selections.");
+    }
+    const normalized: FilletCornerSelection[] = [];
+    const seen = new Set<string>();
+    for (const corner of corners) {
+      if (!corner || typeof corner !== "object") {
+        throw new Error("CrossSection.filletCorners requires each corner as { contour, vertex, radius }.");
+      }
+      const contour = Number((corner as { contour: unknown }).contour);
+      const vertex = Number((corner as { vertex: unknown }).vertex);
+      const radius = Number((corner as { radius: unknown }).radius);
+      if (!Number.isInteger(contour) || contour < 0) {
+        throw new Error("CrossSection.filletCorners requires contour indices as integers >= 0.");
+      }
+      if (!Number.isInteger(vertex) || vertex < 0) {
+        throw new Error("CrossSection.filletCorners requires vertex indices as integers >= 0.");
+      }
+      if (!Number.isFinite(radius) || radius < 0) {
+        throw new Error("CrossSection.filletCorners requires a finite radius >= 0 for each corner.");
+      }
+      const key = `${contour}:${vertex}`;
+      if (seen.has(key)) {
+        throw new Error("CrossSection.filletCorners does not allow duplicate contour/vertex selections.");
+      }
+      seen.add(key);
+      normalized.push({ contour, vertex, radius });
+    }
+    const out = reg.allocNodeId();
+    reg.push(OP.CROSS_FILLET_CORNERS, makeFilletCornersPayload(out, this.nodeId, normalized));
+    return this.derive(out, "CrossSection.filletCorners");
   }
 
   offsetClone(delta: number) {

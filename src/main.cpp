@@ -1,13 +1,13 @@
-#include <cstdio>
 #include <string>
 
 #include "app_kernel.h"
+#include "log.h"
 
 int main() {
     AppKernel app = {};
     std::string err;
     if (!AppInit(&app, &err)) {
-        if (!err.empty()) std::fprintf(stderr, "[vicad] init failed: %s\n", err.c_str());
+        if (!err.empty()) vicad::log_event("INIT_FAILED", 0, err.c_str());
         AppShutdown(&app);
         return 1;
     }
@@ -17,7 +17,7 @@ int main() {
         err.clear();
         if (!AppTick(&app, &err)) {
             if (!err.empty()) {
-                std::fprintf(stderr, "[vicad] runtime error: %s\n", err.c_str());
+                vicad::log_event("RUNTIME_ERROR", 0, err.c_str());
                 rc = 1;
             }
             break;

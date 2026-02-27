@@ -9,9 +9,8 @@ namespace vicad {
 
 enum EdgeClassFlags : uint8_t {
     EdgeClassNone = 0,
-    EdgeClassBoundary = 1 << 0,
-    EdgeClassSharp = 1 << 1,
-    EdgeClassNonManifold = 1 << 2,
+    EdgeClassFeature = 1 << 0,
+    EdgeClassNonManifold = 1 << 1,
 };
 
 struct EdgeVec3 {
@@ -32,11 +31,8 @@ struct EdgeRecord {
 struct EdgeDetectionResult {
     std::vector<EdgeRecord> edges;
     std::vector<uint8_t> edgeFlags;
-    std::vector<int> sharpEdgeIndices;
-    std::vector<int> boundaryEdgeIndices;
+    std::vector<int> featureEdgeIndices;
     std::vector<int> nonManifoldEdgeIndices;
-    std::vector<std::vector<int>> featureChains;
-    std::vector<int> edgeFeatureChain;
 };
 
 struct SilhouetteResult {
@@ -44,7 +40,7 @@ struct SilhouetteResult {
     std::vector<uint8_t> isSilhouette;
 };
 
-EdgeDetectionResult BuildEdgeTopology(const manifold::MeshGL &mesh, float sharpAngleDeg);
+EdgeDetectionResult BuildEdgeTopology(const manifold::MeshGL &mesh);
 
 SilhouetteResult ComputeSilhouetteEdges(const manifold::MeshGL &mesh,
                                         const EdgeDetectionResult &edges,

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -118,6 +119,9 @@ struct EvalSketchNode {
   double circle_r = 0.0;
   bool has_fillet = false;
   double fillet_radius = 0.0;
+  uint32_t fillet_count = 0;
+  double fillet_radius_min = 0.0;
+  double fillet_radius_max = 0.0;
 };
 
 bool eval_sketch_node(const ReplayTables &tables,
@@ -219,6 +223,7 @@ bool eval_sketch_node(const ReplayTables &tables,
     case OpCode::CrossTranslate:
     case OpCode::CrossRotate:
     case OpCode::CrossFillet:
+    case OpCode::CrossFilletCorners:
     case OpCode::CrossOffsetClone:
     case OpCode::CrossPlane: {
       if (node.inputs.empty()) {
@@ -259,6 +264,27 @@ bool eval_sketch_node(const ReplayTables &tables,
         }
         res.has_fillet = true;
         res.fillet_radius = std::fabs(node.params_f64[0]);
+        res.fillet_radius_min = res.fillet_radius;
+        res.fillet_radius_max = res.fillet_radius;
+      } else if ((OpCode)node.opcode == OpCode::CrossFilletCorners) {
+        if (node.params_f64.empty()) {
+          *error = "Replay failed: malformed cross fillet corners semantic node.";
+          visiting->erase(id);
+          return false;
+        }
+        res.has_fillet = true;
+        res.fillet_count = (uint32_t)node.params_f64.size();
+        res.fillet_radius_min = std::numeric_limits<double>::infinity();
+        res.fillet_radius_max = 0.0;
+        for (double r : node.params_f64) {
+          const double rr = std::fabs(r);
+          if (rr < res.fillet_radius_min) res.fillet_radius_min = rr;
+          if (rr > res.fillet_radius_max) res.fillet_radius_max = rr;
+        }
+        if (!std::isfinite(res.fillet_radius_min)) res.fillet_radius_min = 0.0;
+        if (res.fillet_count == 1) {
+          res.fillet_radius = res.fillet_radius_max;
+        }
       } else if ((OpCode)node.opcode == OpCode::CrossOffsetClone) {
         res.fallback_only = true;
       } else if ((OpCode)node.opcode == OpCode::CrossPlane) {
@@ -312,6 +338,9 @@ bool BuildSketchDimensionModelForRoot(const ReplayTables &tables, uint32_t root_
   model.circleRadius = node.circle_r;
   model.hasFillet = node.has_fillet;
   model.filletRadius = node.fillet_radius;
+  model.filletCornerCount = node.fillet_count;
+  model.filletRadiusMin = node.fillet_radius_min;
+  model.filletRadiusMax = node.fillet_radius_max;
 
   if (node.primitive == SketchPrimitiveKind::Rect && node.vertices.size() == 4) {
     SketchDimensionEntity w;

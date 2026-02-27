@@ -381,6 +381,34 @@ static HarfBuzzInfo detect_harfbuzz(void) {
     return info;
 }
 
+// Fingerprint that encodes the cmake options we pass to assimp.
+// Changing this string forces a clean reconfigure on the next build,
+// ensuring options like the importer/exporter subset always take effect.
+static const char *k_assimp_cmake_fingerprint =
+    "v2:shared=OFF,tools=OFF,tests=OFF,samples=OFF,install=OFF,zlib=ON,"
+    "all-importers=OFF,all-exporters=OFF,3mf-importer=ON,gltf-importer=ON,"
+    "3mf-exporter=ON,gltf-exporter=ON";
+
+static bool assimp_cmake_opts_current(const char *build_dir) {
+    const char *path = nob_temp_sprintf("%s/vicad_cmake_opts.txt", build_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char buf[512] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+    return strcmp(buf, k_assimp_cmake_fingerprint) == 0;
+}
+
+static bool assimp_write_cmake_opts(const char *build_dir) {
+    const char *path = nob_temp_sprintf("%s/vicad_cmake_opts.txt", build_dir);
+    FILE *f = fopen(path, "w");
+    if (!f) { nob_log(NOB_ERROR, "Failed to write %s", path); return false; }
+    fprintf(f, "%s\n", k_assimp_cmake_fingerprint);
+    fclose(f);
+    return true;
+}
+
 static bool build_assimp_if_needed(const AssimpInfo *assimp) {
     if (!assimp || !assimp->found) return false;
 
@@ -389,8 +417,20 @@ static bool build_assimp_if_needed(const AssimpInfo *assimp) {
 
     const char *cache_path = nob_temp_sprintf("%s/CMakeCache.txt", assimp->build_dir);
     const char *root_cmake = nob_temp_sprintf("%s/CMakeLists.txt", assimp->root);
-    const bool have_cache = nob_file_exists(cache_path) != 0;
+    bool have_cache = nob_file_exists(cache_path) != 0;
     bool need_configure = !have_cache;
+
+    // If cmake options have changed since last configure, blow away the cache
+    // so the new options take effect.  This is a one-time cost per option change.
+    if (have_cache && !assimp_cmake_opts_current(assimp->build_dir)) {
+        nob_log(NOB_INFO,
+                "Assimp cmake options changed; forcing reconfigure "
+                "(this is a one-time rebuild with the trimmed importer set)");
+        remove(cache_path);
+        have_cache = false;
+        need_configure = true;
+    }
+
     if (!need_configure) {
         int cfg_stale = nob_needs_rebuild1(cache_path, root_cmake);
         if (cfg_stale < 0) return false;
@@ -409,8 +449,17 @@ static bool build_assimp_if_needed(const AssimpInfo *assimp) {
                        "-DASSIMP_BUILD_TESTS=OFF",
                        "-DASSIMP_BUILD_SAMPLES=OFF",
                        "-DASSIMP_INSTALL=OFF",
-                       "-DASSIMP_BUILD_ZLIB=ON");
+                       "-DASSIMP_BUILD_ZLIB=ON",
+                       // Disable the ~70 importers and ~30 exporters that assimp
+                       // builds by default; only enable the two formats vicad uses.
+                       "-DASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT=OFF",
+                       "-DASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT=OFF",
+                       "-DASSIMP_BUILD_3MF_IMPORTER=ON",
+                       "-DASSIMP_BUILD_GLTF_IMPORTER=ON",
+                       "-DASSIMP_BUILD_3MF_EXPORTER=ON",
+                       "-DASSIMP_BUILD_GLTF_EXPORTER=ON");
         if (!nob_cmd_run(&cfg)) return false;
+        if (!assimp_write_cmake_opts(assimp->build_dir)) return false;
     } else {
         nob_log(NOB_INFO, "Assimp configure is up-to-date");
     }
@@ -450,7 +499,8 @@ static bool build_assimp_if_needed(const AssimpInfo *assimp) {
                        "cmake",
                        "--build", assimp->build_dir,
                        "--config", "Release",
-                       "--target", "assimp");
+                       "--target", "assimp",
+                       "--parallel");
         if (!nob_cmd_run(&build)) return false;
     } else {
         nob_log(NOB_INFO, "Assimp build is up-to-date");
@@ -808,15 +858,567 @@ static bool bake_funnel_sans_header(const char *baker_bin_path, const char *head
     return nob_cmd_run(&cmd);
 }
 
+// Build lod_replay_test by compiling only its own source file and linking it
+// with the shared objects already produced by the main build (manifold,
+// op_decoder, lod_policy, and optionally cross_section / clipper2).  This
+// avoids recompiling shared code and keeps the incremental build fast.
+static bool build_lod_replay_test(const BuildContext *ctx, const char *binary_path) {
+    const char *obj_dir = "build/obj_lod_replay_test";
+    if (!nob_mkdir_if_not_exists(obj_dir)) return false;
+    if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/src", obj_dir))) return false;
+
+    const char *src = "src/lod_replay_test.cpp";
+    const char *obj = make_obj_path(obj_dir, "src", src);
+
+    CompileUnit unit = {0};
+    unit.src_path = src;
+    unit.obj_path = obj;
+    unit.lang = COMPILE_LANG_CXX;
+    unit.group = COMPILE_GROUP_APP;
+    unit.sanitize = ctx->opt.asan;
+
+    int rebuild = needs_rebuild_unit(ctx, &unit);
+    if (rebuild < 0) return false;
+    if (rebuild != 0) {
+        Nob_Cmd cmd = {0};
+        build_compile_cmd(ctx, &unit, &cmd);
+        if (!nob_cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "lod_replay_test compilation failed");
+            return false;
+        }
+    }
+
+    // Link: lod_replay_test.o + shared objects already compiled by the main build.
+    Nob_File_Paths link_objs = {0};
+    nob_da_append(&link_objs, obj);
+    nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "src", "src/op_decoder.cpp"));
+    nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "src", "src/lod_policy.cpp"));
+    for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "manifold/src", manifold_sources[i]));
+    }
+    if (ctx->enable_cross_section && ctx->clipper2) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "manifold/src", manifold_cross_section_source));
+        for (size_t i = 0; i < NOB_ARRAY_LEN(ctx->clipper2->sources); ++i) {
+            nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "clipper2/src", ctx->clipper2->sources[i]));
+        }
+    }
+
+    int relink = nob_needs_rebuild(binary_path, link_objs.items, link_objs.count);
+    if (relink < 0) return false;
+    if (relink == 0) {
+        nob_log(NOB_INFO, "%s is up-to-date", binary_path);
+        return true;
+    }
+
+    Nob_Cmd link = {0};
+    nob_cmd_append(&link, "clang++");
+    for (size_t i = 0; i < link_objs.count; ++i) {
+        nob_cmd_append(&link, link_objs.items[i]);
+    }
+    append_sanitizer_flags(&link, ctx->opt);
+    // lod_replay_test is headless: no windowing frameworks needed.
+    nob_cmd_append(&link, "-o", binary_path);
+    if (!nob_cmd_run(&link)) return false;
+
+    nob_log(NOB_INFO, "Built %s", binary_path);
+    return true;
+}
+
+// Build ipc_integration_test.  Links script_worker_client and its transitive
+// dependencies against the shared objects produced by the main build.
+static bool build_ipc_integration_test(const BuildContext *ctx, const char *binary_path) {
+    const char *obj_dir = "build/obj_ipc_integration_test";
+    if (!nob_mkdir_if_not_exists(obj_dir)) return false;
+    if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/src", obj_dir))) return false;
+
+    const char *src = "src/ipc_integration_test.cpp";
+    const char *obj = make_obj_path(obj_dir, "src", src);
+
+    CompileUnit unit = {0};
+    unit.src_path = src;
+    unit.obj_path = obj;
+    unit.lang = COMPILE_LANG_CXX;
+    unit.group = COMPILE_GROUP_APP;
+    unit.sanitize = ctx->opt.asan;
+
+    int rebuild = needs_rebuild_unit(ctx, &unit);
+    if (rebuild < 0) return false;
+    if (rebuild != 0) {
+        Nob_Cmd cmd = {0};
+        build_compile_cmd(ctx, &unit, &cmd);
+        if (!nob_cmd_run(&cmd)) {
+            nob_log(NOB_ERROR, "ipc_integration_test compilation failed");
+            return false;
+        }
+    }
+
+    // Shared objects required by ScriptWorkerClient and its call graph.
+    const char *ipc_srcs[] = {
+        "src/script_worker_client.cpp",
+        "src/op_decoder.cpp",
+        "src/op_reader.cpp",
+        "src/op_trace.cpp",
+        "src/lod_policy.cpp",
+        "src/sketch_dimensions.cpp",
+        "src/sketch_semantics.cpp",
+    };
+
+    Nob_File_Paths link_objs = {0};
+    nob_da_append(&link_objs, obj);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(ipc_srcs); ++i) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "src", ipc_srcs[i]));
+    }
+    for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "manifold/src", manifold_sources[i]));
+    }
+    if (ctx->enable_cross_section && ctx->clipper2) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "manifold/src", manifold_cross_section_source));
+        for (size_t i = 0; i < NOB_ARRAY_LEN(ctx->clipper2->sources); ++i) {
+            nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "clipper2/src", ctx->clipper2->sources[i]));
+        }
+    }
+
+    int relink = nob_needs_rebuild(binary_path, link_objs.items, link_objs.count);
+    if (relink < 0) return false;
+    if (relink == 0) {
+        nob_log(NOB_INFO, "%s is up-to-date", binary_path);
+        return true;
+    }
+
+    Nob_Cmd link = {0};
+    nob_cmd_append(&link, "clang++");
+    for (size_t i = 0; i < link_objs.count; ++i) {
+        nob_cmd_append(&link, link_objs.items[i]);
+    }
+    append_sanitizer_flags(&link, ctx->opt);
+    // Headless: no windowing frameworks needed.
+    nob_cmd_append(&link, "-o", binary_path);
+    if (!nob_cmd_run(&link)) return false;
+
+    nob_log(NOB_INFO, "Built %s", binary_path);
+    return true;
+}
+
+// Run the full test suite:
+//   0. Layer violation check (tools/check-layers.sh)
+//   1. C++ LOD replay unit test (build/lod_replay_test)
+//   2. TypeScript unit tests via bun (worker/proxy-manifold.test.ts)
+//   3. C++ IPC integration test (build/ipc_integration_test)
+//   4. App smoke test: launch vicad, verify it stays alive for 1 second
+static bool run_test_suite(const char *lod_test_binary, const char *ipc_test_binary,
+                           const char *app_binary) {
+    int test_count = 0;
+    int pass_count = 0;
+    bool all_passed = true;
+
+    // --- 0. Layer violation check ---
+    test_count++;
+    nob_log(NOB_INFO, "");
+    nob_log(NOB_INFO, "--- [%d/5] Layer violation check ---", test_count);
+    {
+        Nob_Cmd cmd = {0};
+        nob_cmd_append(&cmd, "sh", "tools/check-layers.sh");
+        if (nob_cmd_run(&cmd)) {
+            pass_count++;
+        } else {
+            all_passed = false;
+        }
+    }
+
+    // --- 1. C++ LOD replay test ---
+    test_count++;
+    nob_log(NOB_INFO, "");
+    nob_log(NOB_INFO, "--- [%d/5] lod_replay_test ---", test_count);
+    {
+        Nob_Cmd cmd = {0};
+        nob_cmd_append(&cmd, lod_test_binary);
+        if (nob_cmd_run(&cmd)) {
+            pass_count++;
+        } else {
+            all_passed = false;
+        }
+    }
+
+    // --- 2. TypeScript unit tests ---
+    test_count++;
+    nob_log(NOB_INFO, "");
+    nob_log(NOB_INFO, "--- [%d/5] bun test (worker/proxy-manifold.test.ts) ---", test_count);
+    {
+        Nob_Cmd cmd = {0};
+        nob_cmd_append(&cmd, "bun", "test", "worker/proxy-manifold.test.ts");
+        if (nob_cmd_run(&cmd)) {
+            pass_count++;
+        } else {
+            all_passed = false;
+        }
+    }
+
+    // --- 3. C++ IPC integration test ---
+    // Spawns the Bun worker, sends sketch-fillet-example.vicad.ts, and
+    // verifies the decoded scene objects.  Requires `bun` on PATH.
+    test_count++;
+    nob_log(NOB_INFO, "");
+    nob_log(NOB_INFO, "--- [%d/5] ipc_integration_test ---", test_count);
+    {
+        Nob_Cmd cmd = {0};
+        nob_cmd_append(&cmd, ipc_test_binary);
+        if (nob_cmd_run(&cmd)) {
+            pass_count++;
+        } else {
+            all_passed = false;
+        }
+    }
+
+    // --- 4. App smoke test ---
+    // Start the app in the background; if it is still alive after 1 second
+    // (i.e. did not crash during startup) the test passes and we kill it.
+    test_count++;
+    nob_log(NOB_INFO, "");
+    nob_log(NOB_INFO, "--- [%d/5] App smoke test (1-second launch) ---", test_count);
+    {
+        const char *shell_script = nob_temp_sprintf(
+            "%s & APP_PID=$!; "
+            "sleep 1; "
+            "if kill -0 \"$APP_PID\" 2>/dev/null; then "
+            "  kill \"$APP_PID\"; wait \"$APP_PID\" 2>/dev/null; "
+            "  echo '[smoke] vicad ran 1 second without crash: PASS'; "
+            "  exit 0; "
+            "else "
+            "  echo '[smoke] vicad exited/crashed within 1 second: FAIL'; "
+            "  exit 1; "
+            "fi",
+            app_binary);
+        Nob_Cmd cmd = {0};
+        nob_cmd_append(&cmd, "sh", "-c", shell_script);
+        if (nob_cmd_run(&cmd)) {
+            pass_count++;
+        } else {
+            all_passed = false;
+        }
+    }
+
+    nob_log(NOB_INFO, "");
+    if (all_passed) {
+        nob_log(NOB_INFO, "Tests PASSED: %d/%d", pass_count, test_count);
+    } else {
+        nob_log(NOB_ERROR, "Tests FAILED: %d/%d passed", pass_count, test_count);
+    }
+    return all_passed;
+}
+
+static bool build_run_script(const BuildContext *ctx, const char *binary_path) {
+    const char *obj_dir = "build/obj_run_script";
+    if (!nob_mkdir_if_not_exists(obj_dir)) return false;
+    if (!nob_mkdir_if_not_exists(nob_temp_sprintf("%s/src", obj_dir))) return false;
+
+    const char *src = "src/run_script.cpp";
+    const char *obj = make_obj_path(obj_dir, "src", src);
+
+    CompileUnit unit = {0};
+    unit.src_path = src;
+    unit.obj_path = obj;
+    unit.lang = COMPILE_LANG_CXX;
+    unit.group = COMPILE_GROUP_APP;
+    unit.sanitize = ctx->opt.asan;
+
+    int rebuild = needs_rebuild_unit(ctx, &unit);
+    if (rebuild < 0) return false;
+    if (rebuild != 0) {
+        Nob_Cmd cmd = {0};
+        build_compile_cmd(ctx, &unit, &cmd);
+        if (!nob_cmd_run(&cmd)) return false;
+    }
+
+    const char *ipc_srcs[] = {
+        "src/script_worker_client.cpp",
+        "src/op_decoder.cpp",
+        "src/op_reader.cpp",
+        "src/op_trace.cpp",
+        "src/lod_policy.cpp",
+        "src/sketch_dimensions.cpp",
+        "src/sketch_semantics.cpp",
+    };
+
+    Nob_File_Paths link_objs = {0};
+    nob_da_append(&link_objs, obj);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(ipc_srcs); ++i) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "src", ipc_srcs[i]));
+    }
+    for (size_t i = 0; i < NOB_ARRAY_LEN(manifold_sources); ++i) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "manifold/src", manifold_sources[i]));
+    }
+    if (ctx->enable_cross_section && ctx->clipper2) {
+        nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "manifold/src", manifold_cross_section_source));
+        for (size_t i = 0; i < NOB_ARRAY_LEN(ctx->clipper2->sources); ++i) {
+            nob_da_append(&link_objs, make_obj_path(ctx->obj_root, "clipper2/src", ctx->clipper2->sources[i]));
+        }
+    }
+
+    int relink = nob_needs_rebuild(binary_path, link_objs.items, link_objs.count);
+    if (relink < 0) return false;
+    if (relink == 0) {
+        nob_log(NOB_INFO, "%s is up-to-date", binary_path);
+        return true;
+    }
+
+    Nob_Cmd link = {0};
+    nob_cmd_append(&link, "clang++");
+    for (size_t i = 0; i < link_objs.count; ++i) {
+        nob_cmd_append(&link, link_objs.items[i]);
+    }
+    append_sanitizer_flags(&link, ctx->opt);
+    nob_cmd_append(&link, "-o", binary_path);
+    if (!nob_cmd_run(&link)) return false;
+
+    nob_log(NOB_INFO, "Built %s", binary_path);
+    return true;
+}
+
+// ── incremental parallel clang-tidy ──────────────────────────────────────────
+//
+// Runs clang-tidy on every source in `srcs` that is newer than its stamp file
+// (build/clang-tidy-stamps/<basename>.stamp).  Dirty files are dispatched in
+// parallel using Nob_Procs.  On success the stamp is updated so repeated runs
+// are instant unless a source changes.
+//
+// Returns true if all (dirty or cached) files are clean.
+
+static bool touch_file(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return false;
+    fclose(f);
+    return true;
+}
+
+static bool run_lint_cpp_incremental(void) {
+    static const char *srcs[] = {
+        "src/op_reader.cpp",
+        "src/op_decoder.cpp",
+        "src/op_trace.cpp",
+        "src/script_worker_client.cpp",
+        "src/scene_session.cpp",
+        "src/edge_detection.cpp",
+        "src/face_detection.cpp",
+        "src/lod_policy.cpp",
+        "src/sketch_dimensions.cpp",
+        "src/sketch_semantics.cpp",
+        "src/picking.cpp",
+        "src/interaction_state.cpp",
+        "src/input_controller.cpp",
+        "src/renderer_3d.cpp",
+        "src/renderer_overlay.cpp",
+        "src/render_ui.cpp",
+        "src/ui_layout.cpp",
+        "src/ui_state.cpp",
+    };
+    size_t nsrcs = sizeof(srcs) / sizeof(srcs[0]);
+
+    nob_mkdir_if_not_exists("build/clang-tidy-stamps");
+
+    // Collect dirty sources and their stamp paths.
+    const char *dirty_srcs[32];
+    char stamp_paths[32][256];
+    size_t ndirty = 0;
+    size_t nskipped = 0;
+    bool ok = true;
+
+    for (size_t i = 0; i < nsrcs; ++i) {
+        // Derive stamp path: src/foo.cpp → build/clang-tidy-stamps/foo.cpp.stamp
+        const char *slash = strrchr(srcs[i], '/');
+        const char *basename = slash ? slash + 1 : srcs[i];
+        snprintf(stamp_paths[ndirty + nskipped], sizeof(stamp_paths[0]),
+                 "build/clang-tidy-stamps/%s.stamp", basename);
+        const char *stamp = stamp_paths[ndirty + nskipped];
+
+        int rebuild = nob_needs_rebuild1(stamp, srcs[i]);
+        if (rebuild < 0) { ok = false; continue; }
+        if (rebuild == 0) { nskipped++; continue; }
+
+        dirty_srcs[ndirty] = srcs[i];
+        // Slide stamp path into dirty slot.
+        if (ndirty + nskipped != ndirty) {
+            memcpy(stamp_paths[ndirty], stamp_paths[ndirty + nskipped],
+                   sizeof(stamp_paths[0]));
+        }
+        ndirty++;
+    }
+
+    nob_log(NOB_INFO, "[lint-cpp] %zu dirty, %zu cached", ndirty, nskipped);
+
+    if (ndirty == 0) return ok;
+
+    // Spawn clang-tidy processes in parallel.
+    Nob_Procs procs = {0};
+    // Record which sources were dispatched so we can stamp them on success.
+    // We need to track per-process which stamp to touch; since Nob_Procs only
+    // gives us a pass/fail aggregate we run sequentially when ndirty > 1 would
+    // require per-process bookkeeping.  Instead: dispatch all, flush, then
+    // stamp only if the whole batch passed (conservative but correct).
+    for (size_t i = 0; i < ndirty; ++i) {
+        Nob_Cmd ct = {0};
+        nob_cmd_append(&ct, "clang-tidy", dirty_srcs[i],
+                       "--", "-std=c++20", "-x", "c++",
+                       "-Isrc", "-Imanifold/include", "-Ibuild/generated");
+        if (!nob_cmd_run(&ct, .async = &procs)) {
+            ok = false;
+            break;
+        }
+    }
+
+    if (!nob_procs_flush(&procs)) ok = false;
+
+    // Touch stamps only when the whole batch was clean.
+    if (ok) {
+        for (size_t i = 0; i < ndirty; ++i) {
+            touch_file(stamp_paths[i]);
+        }
+    }
+
+    return ok;
+}
+
+// ── agent-check ──────────────────────────────────────────────────────────────
+//
+// Composite target for the agent closed loop:
+//   1. Rebuild (./nob)
+//   2. Static checks: layer violations, lint-ts, lint-cpp (incremental), lint-docs+opcodes
+//   3. IPC integration test (or run_script <path> when --script= is given)
+//   4. Emit a single JSON verdict line to stdout
+//
+// Stdout JSON format (one line, always present):
+//   {"result":"pass","checks":{"build":true,"layers":true,...}}
+//   {"result":"fail","checks":{"build":true,"layers":false,...}}
+//
+// Worker/build log output goes to stderr (structured JSON via nob/vicad).
+// Agents should redirect stderr to a log file and parse stdout for the verdict.
+
+typedef struct {
+    const char *name;
+    bool passed;
+} AgentCheck;
+
+static void agent_check_json(const AgentCheck *checks, size_t count) {
+    bool any_fail = false;
+    for (size_t i = 0; i < count; ++i) if (!checks[i].passed) any_fail = true;
+
+    printf("{\"result\":\"%s\",\"checks\":{", any_fail ? "fail" : "pass");
+    for (size_t i = 0; i < count; ++i) {
+        if (i > 0) printf(",");
+        printf("\"%s\":%s", checks[i].name, checks[i].passed ? "true" : "false");
+    }
+    printf("}}\n");
+    fflush(stdout);
+}
+
+static bool run_cmd_silent_ok(const char **args, size_t n) {
+    Nob_Cmd cmd = {0};
+    for (size_t i = 0; i < n; ++i) nob_cmd_append(&cmd, args[i]);
+    return nob_cmd_run(&cmd);
+}
+
 int main(int argc, char **argv) {
     NOB_GO_REBUILD_URSELF(argc, argv);
     BuildOptions opt = {0};
+    bool run_tests = false;
     argc--;
     argv++;
 
     while (argc > 0) {
         const char *arg = nob_shift_args(&argc, &argv);
-        if (strcmp(arg, "--asan") == 0) {
+        if (strcmp(arg, "agent-check") == 0) {
+            // Consume optional --script=<path> from remaining args.
+            const char *script_path = NULL;
+            while (argc > 0) {
+                const char *a = nob_shift_args(&argc, &argv);
+                if (strncmp(a, "--script=", 9) == 0) script_path = a + 9;
+            }
+
+            // Up to 7 checks; populate as we go.
+            AgentCheck checks[7];
+            size_t ncheck = 0;
+
+            // Each check runs via `sh -c 'cmd >&2'` so its stdout is redirected
+            // to stderr.  Only the JSON verdict line reaches stdout.
+
+            // ── 1. Build ─────────────────────────────────────────────────────
+            nob_log(NOB_INFO, "[agent-check] step 1/6: build");
+            {
+                Nob_Cmd cmd = {0};
+                nob_cmd_append(&cmd, "sh", "-c", "./nob >&2");
+                checks[ncheck++] = (AgentCheck){"build", nob_cmd_run(&cmd)};
+            }
+
+            // ── 2. Layer check ───────────────────────────────────────────────
+            nob_log(NOB_INFO, "[agent-check] step 2/6: layers");
+            {
+                Nob_Cmd cmd = {0};
+                nob_cmd_append(&cmd, "sh", "-c", "sh tools/check-layers.sh >&2");
+                checks[ncheck++] = (AgentCheck){"layers", nob_cmd_run(&cmd)};
+            }
+
+            // ── 3. TypeScript lint ───────────────────────────────────────────
+            nob_log(NOB_INFO, "[agent-check] step 3/6: lint-ts");
+            {
+                Nob_Cmd cmd = {0};
+                nob_cmd_append(&cmd, "sh", "-c", "bun run lint-ts >&2");
+                checks[ncheck++] = (AgentCheck){"lint-ts", nob_cmd_run(&cmd)};
+            }
+
+            // ── 4. C++ lint (incremental, parallel) ──────────────────────────
+            nob_log(NOB_INFO, "[agent-check] step 4/6: lint-cpp");
+            checks[ncheck++] = (AgentCheck){"lint-cpp", run_lint_cpp_incremental()};
+
+            // ── 5. Doc link + op-code sync check ─────────────────────────────
+            nob_log(NOB_INFO, "[agent-check] step 5/6: lint-docs");
+            {
+                Nob_Cmd cmd = {0};
+                nob_cmd_append(&cmd, "sh", "-c",
+                    "sh tools/check-docs.sh >&2 && sh tools/check-opcode-sync.sh >&2");
+                checks[ncheck++] = (AgentCheck){"lint-docs", nob_cmd_run(&cmd)};
+            }
+
+            // ── 6. IPC / script check ────────────────────────────────────────
+            // run_script writes its JSON result to stdout deliberately; the
+            // worker lifecycle events go to stderr.  When no --script is given,
+            // redirect ipc_integration_test stdout to stderr for consistency.
+            if (script_path) {
+                nob_log(NOB_INFO, "[agent-check] step 6/6: run_script %s", script_path);
+                Nob_Cmd cmd = {0};
+                nob_cmd_append(&cmd, "build/run_script", script_path);
+                checks[ncheck++] = (AgentCheck){"script", nob_cmd_run(&cmd)};
+            } else {
+                nob_log(NOB_INFO, "[agent-check] step 6/6: ipc_integration_test");
+                Nob_Cmd cmd = {0};
+                nob_cmd_append(&cmd, "sh", "-c", "build/ipc_integration_test >&2");
+                checks[ncheck++] = (AgentCheck){"ipc", nob_cmd_run(&cmd)};
+            }
+
+            agent_check_json(checks, ncheck);
+
+            for (size_t i = 0; i < ncheck; ++i) {
+                if (!checks[i].passed) return 1;
+            }
+            return 0;
+        } else if (strcmp(arg, "lint-ts") == 0) {
+            Nob_Cmd lint = {0};
+            nob_cmd_append(&lint, "bun", "run", "lint-ts");
+            return nob_cmd_run(&lint) ? 0 : 1;
+        } else if (strcmp(arg, "lint-cpp") == 0) {
+            // Incremental parallel clang-tidy.
+            // Requires: clang-tidy on PATH, baked font header (./nob build first).
+            return run_lint_cpp_incremental() ? 0 : 1;
+        } else if (strcmp(arg, "lint-docs") == 0) {
+            bool ok = true;
+            Nob_Cmd docs = {0};
+            nob_cmd_append(&docs, "sh", "tools/check-docs.sh");
+            if (!nob_cmd_run(&docs)) ok = false;
+            Nob_Cmd sync = {0};
+            nob_cmd_append(&sync, "sh", "tools/check-opcode-sync.sh");
+            if (!nob_cmd_run(&sync)) ok = false;
+            return ok ? 0 : 1;
+        } else if (strcmp(arg, "test") == 0) {
+            run_tests = true;
+        } else if (strcmp(arg, "--asan") == 0) {
             opt.asan = true;
         } else if (strcmp(arg, "--asan-deps") == 0) {
             opt.asan_deps = true;
@@ -828,14 +1430,22 @@ int main(int argc, char **argv) {
             const char *value = nob_shift_args(&argc, &argv);
             opt.max_procs = atoi(value);
         } else if (strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0) {
-            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps] [--max-procs N]");
-            nob_log(NOB_INFO, "  --asan  Build vicad with ASan+UBSan instrumentation.");
+            nob_log(NOB_INFO, "Usage: ./nob [agent-check|lint-ts|lint-cpp|lint-docs|test] [--asan] [--asan-deps] [--max-procs N]");
+            nob_log(NOB_INFO, "  agent-check [--script=<path>]");
+            nob_log(NOB_INFO, "             Closed-loop: build → layers → lint-ts → lint-cpp → lint-docs → ipc test.");
+            nob_log(NOB_INFO, "             With --script=<path>: also runs that script through the worker.");
+            nob_log(NOB_INFO, "             Emits a single JSON verdict line to stdout; logs go to stderr.");
+            nob_log(NOB_INFO, "  lint-ts    Run ESLint on worker/ TypeScript sources (requires bun install).");
+            nob_log(NOB_INFO, "  lint-cpp   Run clang-tidy incrementally in parallel (requires build first).");
+            nob_log(NOB_INFO, "  lint-docs  Check markdown links + op-code sync across C++/TS/docs.");
+            nob_log(NOB_INFO, "  test       Build and run all tests (layer check, lod_replay_test, bun tests, smoke test).");
+            nob_log(NOB_INFO, "  --asan     Build vicad with ASan+UBSan instrumentation.");
             nob_log(NOB_INFO, "  --asan-deps  Also instrument manifold/clipper dependencies (requires --asan).");
             nob_log(NOB_INFO, "  --max-procs N  Limit concurrent compiler processes (N <= 0 uses Nob default).");
             return 0;
         } else {
             nob_log(NOB_ERROR, "Unknown argument: %s", arg);
-            nob_log(NOB_INFO, "Usage: ./nob [--asan] [--asan-deps] [--max-procs N]");
+            nob_log(NOB_INFO, "Usage: ./nob [agent-check|lint-ts|lint-cpp|lint-docs|test] [--asan] [--asan-deps] [--max-procs N]");
             return 1;
         }
     }
@@ -1010,5 +1620,17 @@ int main(int argc, char **argv) {
         nob_log(NOB_INFO,
                 "Run leak checks with: ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ./build/vicad");
     }
+
+    // run_script is always built — agent-check --script= depends on it.
+    if (!build_run_script(&ctx, "build/run_script")) return 1;
+
+    if (run_tests) {
+        const char *lod_test_binary = "build/lod_replay_test";
+        const char *ipc_test_binary = "build/ipc_integration_test";
+        if (!build_lod_replay_test(&ctx, lod_test_binary)) return 1;
+        if (!build_ipc_integration_test(&ctx, ipc_test_binary)) return 1;
+        if (!run_test_suite(lod_test_binary, ipc_test_binary, "build/vicad")) return 1;
+    }
+
     return 0;
 }

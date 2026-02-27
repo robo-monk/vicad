@@ -6,6 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "ipc_protocol.h"
@@ -97,6 +98,22 @@ std::vector<uint8_t> payload_cross_fillet(uint32_t out_id, uint32_t in_id,
   append_pod(&out, out_id);
   append_pod(&out, in_id);
   append_pod(&out, radius);
+  return out;
+}
+
+std::vector<uint8_t> payload_cross_fillet_corners(
+    uint32_t out_id, uint32_t in_id,
+    const std::vector<std::tuple<uint32_t, uint32_t, double>> &corners) {
+  std::vector<uint8_t> out;
+  append_pod(&out, out_id);
+  append_pod(&out, in_id);
+  const uint32_t count = (uint32_t)corners.size();
+  append_pod(&out, count);
+  for (const auto &corner : corners) {
+    append_pod(&out, std::get<0>(corner));
+    append_pod(&out, std::get<1>(corner));
+    append_pod(&out, std::get<2>(corner));
+  }
   return out;
 }
 
@@ -295,6 +312,29 @@ int main() {
                        "fillet export");
     ok = ok && require(d.NumTri() < m.NumTri() && m.NumTri() < e.NumTri(),
                        "fillet tri count Draft < Model < Export3MF");
+  }
+
+  {
+    // Per-corner 2D fillet should respond to profile quality.
+    std::vector<uint8_t> rec;
+    append_record(&rec, vicad::OpCode::CrossSquare,
+                  payload_cross_square(1, 40.0, 20.0, 1));
+    append_record(&rec, vicad::OpCode::CrossFilletCorners,
+                  payload_cross_fillet_corners(
+                      2, 1, {{0u, 0u, 4.0}, {0u, 2u, 2.0}}));
+    append_record(&rec, vicad::OpCode::Extrude,
+                  payload_extrude(3, 2, 8.0, 0, 0.0));
+
+    manifold::MeshGL d, m, e;
+    std::string err;
+    ok = ok && require(replay_to_mesh(rec, 3, 3, vicad::LodProfile::Draft, &d, &err),
+                       "fillet corners draft");
+    ok = ok && require(replay_to_mesh(rec, 3, 3, vicad::LodProfile::Model, &m, &err),
+                       "fillet corners model");
+    ok = ok && require(replay_to_mesh(rec, 3, 3, vicad::LodProfile::Export3MF, &e, &err),
+                       "fillet corners export");
+    ok = ok && require(d.NumTri() < m.NumTri() && m.NumTri() < e.NumTri(),
+                       "fillet corners tri count Draft < Model < Export3MF");
   }
 
   {

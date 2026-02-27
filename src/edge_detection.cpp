@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <numeric>
 #include <unordered_map>
+#include <vector>
 
 namespace vicad {
 
@@ -16,13 +18,11 @@ struct Vec3d {
     double z;
 };
 
-struct AdjTri {
-    int tri = -1;
-};
-
-struct ChainExtraction {
-    std::vector<std::vector<int>> chains;
-    std::vector<uint8_t> keptEdgeMask;
+struct EdgeAccum {
+    uint32_t renderV0 = 0;
+    uint32_t renderV1 = 0;
+    bool hasRenderVerts = false;
+    std::vector<int> tris;
 };
 
 static Vec3d add(const Vec3d &a, const Vec3d &b) {
@@ -68,6 +68,12 @@ static Vec3d mesh_pos(const manifold::MeshGL &mesh, uint32_t idx) {
     };
 }
 
+static double clamp01(double v) {
+    if (v < 0.0) return 0.0;
+    if (v > 1.0) return 1.0;
+    return v;
+}
+
 static uint64_t edge_key(uint32_t a, uint32_t b) {
     if (a > b) std::swap(a, b);
     return ((uint64_t)a << 32) | (uint64_t)b;
@@ -89,165 +95,137 @@ static bool point_ray_distance(const Vec3d &p,
     return true;
 }
 
-static uint32_t other_vertex(const EdgeRecord &e, uint32_t v) {
-    return (e.v0 == v) ? e.v1 : e.v0;
-}
-
-static Vec3d edge_dir_from_vertex(const manifold::MeshGL &mesh,
-                                  const EdgeRecord &e,
-                                  uint32_t fromV) {
-    const Vec3d p0 = mesh_pos(mesh, fromV);
-    const Vec3d p1 = mesh_pos(mesh, other_vertex(e, fromV));
-    return normalize(sub(p1, p0));
-}
-
-static ChainExtraction extract_chains(const manifold::MeshGL &mesh,
-                                      const std::vector<EdgeRecord> &edges,
-                                      const std::vector<uint8_t> &includeMask,
-                                      double maxTurnDeg,
-                                      const std::vector<double> &edgeLengths,
-                                      double minChainLength,
-                                      int minSegments,
-                                      const std::vector<uint8_t> *preserveMask) {
-    ChainExtraction out = {};
-    out.keptEdgeMask.assign(edges.size(), 0);
-    if (edges.empty() || includeMask.size() != edges.size()) return out;
-
-    const size_t numVerts = mesh.numProp >= 3 ? mesh.vertProperties.size() / (size_t)mesh.numProp : 0;
-    if (numVerts == 0) return out;
-
-    std::vector<std::vector<int>> incident(numVerts);
-    std::vector<int> degree(numVerts, 0);
-
-    for (size_t i = 0; i < edges.size(); ++i) {
-        if (includeMask[i] == 0) continue;
-        const EdgeRecord &e = edges[i];
-        if ((size_t)e.v0 >= numVerts || (size_t)e.v1 >= numVerts) continue;
-        incident[e.v0].push_back((int)i);
-        incident[e.v1].push_back((int)i);
-        degree[e.v0] += 1;
-        degree[e.v1] += 1;
+static bool segment_ray_distance(const Vec3d &a,
+                                 const Vec3d &b,
+                                 const Vec3d &rayOrig,
+                                 const Vec3d &rayDir,
+                                 double *outT,
+                                 double *outDist) {
+    const Vec3d seg = sub(b, a);
+    const double seg_len2 = dot(seg, seg);
+    if (!std::isfinite(seg_len2)) return false;
+    if (seg_len2 <= 1e-20) {
+        return point_ray_distance(a, rayOrig, rayDir, outT, outDist);
     }
 
-    std::vector<uint8_t> visited(edges.size(), 0);
+    bool have = false;
+    double best_t = std::numeric_limits<double>::infinity();
+    double best_d = std::numeric_limits<double>::infinity();
 
-    constexpr double kPi = 3.14159265358979323846;
-    const double minCos = std::cos(maxTurnDeg * kPi / 180.0);
-
-    auto choose_next = [&](int curEdge, uint32_t atVertex, const Vec3d &incoming) {
-        int best = -1;
-        double bestScore = -2.0;
-        if ((size_t)atVertex >= incident.size()) return -1;
-        for (int cand : incident[atVertex]) {
-            if (cand == curEdge) continue;
-            if (cand < 0 || (size_t)cand >= edges.size()) continue;
-            if (includeMask[(size_t)cand] == 0 || visited[(size_t)cand] != 0) continue;
-            const Vec3d outDir = edge_dir_from_vertex(mesh, edges[(size_t)cand], atVertex);
-            const double score = dot(incoming, outDir);
-            if (score > bestScore) {
-                bestScore = score;
-                best = cand;
-            }
+    auto consider = [&](double t, double u) {
+        if (!std::isfinite(t) || !std::isfinite(u)) return;
+        if (t < 0.0) return;
+        if (u < 0.0 || u > 1.0) return;
+        const Vec3d pr = add(rayOrig, mul(rayDir, t));
+        const Vec3d ps = add(a, mul(seg, u));
+        const double d = length(sub(pr, ps));
+        if (!std::isfinite(d)) return;
+        if (!have ||
+            d < best_d - 1e-9 ||
+            (std::fabs(d - best_d) <= 1e-9 && t < best_t)) {
+            have = true;
+            best_t = t;
+            best_d = d;
         }
-        if (best < 0) return -1;
-        if (bestScore < minCos) return -1;
-        return best;
     };
 
-    auto trace_chain = [&](int startEdge, uint32_t startVertex) {
-        std::vector<int> chain;
-        int cur = startEdge;
-        uint32_t fromV = startVertex;
-
-        while (cur >= 0 && (size_t)cur < edges.size()) {
-            if (visited[(size_t)cur] != 0) break;
-            visited[(size_t)cur] = 1;
-            chain.push_back(cur);
-
-            const EdgeRecord &e = edges[(size_t)cur];
-            const uint32_t toV = other_vertex(e, fromV);
-            const Vec3d incoming = edge_dir_from_vertex(mesh, e, fromV);
-            const int next = choose_next(cur, toV, incoming);
-
-            fromV = toV;
-            cur = next;
-        }
-
-        return chain;
-    };
-
-    for (size_t i = 0; i < edges.size(); ++i) {
-        if (includeMask[i] == 0 || visited[i] != 0) continue;
-        const EdgeRecord &e = edges[i];
-        const bool end0 = (size_t)e.v0 < degree.size() ? degree[e.v0] != 2 : true;
-        const bool end1 = (size_t)e.v1 < degree.size() ? degree[e.v1] != 2 : true;
-        if (!end0 && !end1) continue;
-        const uint32_t startV = end0 ? e.v0 : e.v1;
-        std::vector<int> chain = trace_chain((int)i, startV);
-        if (!chain.empty()) out.chains.push_back(std::move(chain));
+    // Unconstrained closest points between infinite line(ray) and line(segment),
+    // then accept only if it lands on ray and segment interior.
+    const double b_dot = dot(rayDir, seg);
+    const Vec3d w0 = sub(rayOrig, a);
+    const double d_dot = dot(rayDir, w0);
+    const double e_dot = dot(seg, w0);
+    const double denom = seg_len2 - b_dot * b_dot;
+    if (std::fabs(denom) > 1e-12) {
+        const double t = (b_dot * e_dot - seg_len2 * d_dot) / denom;
+        const double u = (e_dot - b_dot * d_dot) / denom;
+        consider(t, u);
     }
 
-    for (size_t i = 0; i < edges.size(); ++i) {
-        if (includeMask[i] == 0 || visited[i] != 0) continue;
-        std::vector<int> chain = trace_chain((int)i, edges[i].v0);
-        if (!chain.empty()) out.chains.push_back(std::move(chain));
+    double t0 = 0.0;
+    double d0 = 0.0;
+    if (point_ray_distance(a, rayOrig, rayDir, &t0, &d0)) {
+        consider(t0, 0.0);
+    }
+    double t1 = 0.0;
+    double d1 = 0.0;
+    if (point_ray_distance(b, rayOrig, rayDir, &t1, &d1)) {
+        consider(t1, 1.0);
     }
 
-    double longestLen = -1.0;
-    int longestIdx = -1;
+    // Ray origin projected onto segment (t = 0) handles the boundary case where
+    // the closest ray point lies before the ray start.
+    const double u_origin = clamp01(dot(sub(rayOrig, a), seg) / seg_len2);
+    consider(0.0, u_origin);
 
-    for (size_t ci = 0; ci < out.chains.size(); ++ci) {
-        const std::vector<int> &chain = out.chains[ci];
-        double chainLen = 0.0;
-        bool preserve = false;
-        for (const int ei : chain) {
-            if (ei < 0 || (size_t)ei >= edgeLengths.size()) continue;
-            chainLen += edgeLengths[(size_t)ei];
-            if (preserveMask && (size_t)ei < preserveMask->size() && (*preserveMask)[(size_t)ei] != 0) {
-                preserve = true;
-            }
-        }
-        if (chainLen > longestLen) {
-            longestLen = chainLen;
-            longestIdx = (int)ci;
-        }
+    if (!have) return false;
+    if (outT) *outT = best_t;
+    if (outDist) *outDist = best_d;
+    return true;
+}
 
-        if ((int)chain.size() < minSegments && !preserve) continue;
-        if (chainLen < minChainLength && !preserve) continue;
+struct DisjointSet {
+    std::vector<uint32_t> parent;
+    std::vector<uint8_t> rank;
 
-        for (const int ei : chain) {
-            if (ei >= 0 && (size_t)ei < out.keptEdgeMask.size()) out.keptEdgeMask[(size_t)ei] = 1;
-        }
+    explicit DisjointSet(size_t n) : parent(n), rank(n, 0) {
+        std::iota(parent.begin(), parent.end(), 0);
     }
 
-    bool anyKept = false;
-    for (const uint8_t v : out.keptEdgeMask) {
-        if (v != 0) {
-            anyKept = true;
-            break;
+    uint32_t find(uint32_t x) {
+        while (parent[(size_t)x] != x) {
+            parent[(size_t)x] = parent[(size_t)parent[(size_t)x]];
+            x = parent[(size_t)x];
         }
+        return x;
     }
 
-    if (!anyKept && longestIdx >= 0) {
-        for (const int ei : out.chains[(size_t)longestIdx]) {
-            if (ei >= 0 && (size_t)ei < out.keptEdgeMask.size()) out.keptEdgeMask[(size_t)ei] = 1;
+    void unite(uint32_t a, uint32_t b) {
+        uint32_t ra = find(a);
+        uint32_t rb = find(b);
+        if (ra == rb) return;
+        const uint8_t rankA = rank[(size_t)ra];
+        const uint8_t rankB = rank[(size_t)rb];
+        if (rankA < rankB) {
+            parent[(size_t)ra] = rb;
+            return;
         }
+        if (rankA > rankB) {
+            parent[(size_t)rb] = ra;
+            return;
+        }
+        parent[(size_t)rb] = ra;
+        rank[(size_t)ra] += 1;
     }
+};
 
-    return out;
+static void add_edge(std::unordered_map<uint64_t, EdgeAccum> &edgeMap,
+                     DisjointSet *dsu,
+                     uint32_t v0,
+                     uint32_t v1,
+                     int tri) {
+    const uint32_t c0 = dsu->find(v0);
+    const uint32_t c1 = dsu->find(v1);
+    if (c0 == c1) return;
+    const uint64_t key = edge_key(c0, c1);
+    EdgeAccum &acc = edgeMap[key];
+    if (!acc.hasRenderVerts) {
+        acc.renderV0 = v0;
+        acc.renderV1 = v1;
+        acc.hasRenderVerts = true;
+    }
+    acc.tris.push_back(tri);
 }
 
 }  // namespace
 
-EdgeDetectionResult BuildEdgeTopology(const manifold::MeshGL &mesh, float sharpAngleDeg) {
+EdgeDetectionResult BuildEdgeTopology(const manifold::MeshGL &mesh) {
     EdgeDetectionResult out = {};
     const uint32_t triCount = (uint32_t)mesh.NumTri();
     if (triCount == 0 || mesh.numProp < 3) return out;
+    if (mesh.faceID.size() != triCount) return out;
 
     std::vector<Vec3d> triNormal(triCount);
-    Vec3d mn = mesh_pos(mesh, mesh.triVerts[0]);
-    Vec3d mx = mn;
-
     for (uint32_t tri = 0; tri < triCount; ++tri) {
         const uint32_t i0 = mesh.triVerts[tri * 3 + 0];
         const uint32_t i1 = mesh.triVerts[tri * 3 + 1];
@@ -256,147 +234,104 @@ EdgeDetectionResult BuildEdgeTopology(const manifold::MeshGL &mesh, float sharpA
         const Vec3d p1 = mesh_pos(mesh, i1);
         const Vec3d p2 = mesh_pos(mesh, i2);
         triNormal[tri] = normalize(cross(sub(p1, p0), sub(p2, p0)));
-
-        mn.x = std::min({mn.x, p0.x, p1.x, p2.x});
-        mn.y = std::min({mn.y, p0.y, p1.y, p2.y});
-        mn.z = std::min({mn.z, p0.z, p1.z, p2.z});
-        mx.x = std::max({mx.x, p0.x, p1.x, p2.x});
-        mx.y = std::max({mx.y, p0.y, p1.y, p2.y});
-        mx.z = std::max({mx.z, p0.z, p1.z, p2.z});
     }
 
-    const double bboxDiag = std::max(length(sub(mx, mn)), 1e-6);
+    const uint32_t numVerts = (uint32_t)mesh.NumVert();
+    DisjointSet dsu(numVerts);
+    const size_t mergeCount = std::min(mesh.mergeFromVert.size(), mesh.mergeToVert.size());
+    for (size_t i = 0; i < mergeCount; ++i) {
+        const uint32_t from = mesh.mergeFromVert[i];
+        const uint32_t to = mesh.mergeToVert[i];
+        if (from >= numVerts || to >= numVerts) continue;
+        dsu.unite(from, to);
+    }
 
-    std::unordered_map<uint64_t, std::vector<AdjTri>> edgeToTris;
-    edgeToTris.reserve((size_t)triCount * 2);
+    std::vector<int> triRunSlot(triCount, 0);
+    if (mesh.runIndex.size() >= 2) {
+        for (size_t run = 0; run + 1 < mesh.runIndex.size(); ++run) {
+            const uint32_t begin = mesh.runIndex[run] / 3;
+            const uint32_t end = mesh.runIndex[run + 1] / 3;
+            if (begin >= triCount || end <= begin) continue;
+            const uint32_t triEnd = std::min(end, triCount);
+            for (uint32_t tri = begin; tri < triEnd; ++tri) {
+                triRunSlot[(size_t)tri] = (int)run;
+            }
+        }
+    }
 
+    std::unordered_map<uint64_t, EdgeAccum> edgeMap;
+    edgeMap.reserve((size_t)triCount * 2);
     for (uint32_t tri = 0; tri < triCount; ++tri) {
         const uint32_t i0 = mesh.triVerts[tri * 3 + 0];
         const uint32_t i1 = mesh.triVerts[tri * 3 + 1];
         const uint32_t i2 = mesh.triVerts[tri * 3 + 2];
-
-        edgeToTris[edge_key(i0, i1)].push_back({(int)tri});
-        edgeToTris[edge_key(i1, i2)].push_back({(int)tri});
-        edgeToTris[edge_key(i2, i0)].push_back({(int)tri});
+        add_edge(edgeMap, &dsu, i0, i1, (int)tri);
+        add_edge(edgeMap, &dsu, i1, i2, (int)tri);
+        add_edge(edgeMap, &dsu, i2, i0, (int)tri);
     }
 
-    out.edges.reserve(edgeToTris.size());
-    out.edgeFlags.reserve(edgeToTris.size());
+    std::vector<uint64_t> sortedKeys;
+    sortedKeys.reserve(edgeMap.size());
+    for (const auto &it : edgeMap) {
+        sortedKeys.push_back(it.first);
+    }
+    std::sort(sortedKeys.begin(), sortedKeys.end());
 
-    std::vector<double> edgeLengths;
-    edgeLengths.reserve(edgeToTris.size());
+    out.edges.reserve(sortedKeys.size());
+    out.edgeFlags.reserve(sortedKeys.size());
+    out.featureEdgeIndices.clear();
+    out.nonManifoldEdgeIndices.clear();
 
-    constexpr double kPi = 3.14159265358979323846;
-    const double sharpCos = std::cos((double)sharpAngleDeg * kPi / 180.0);
+    for (const uint64_t key : sortedKeys) {
+        const auto found = edgeMap.find(key);
+        if (found == edgeMap.end()) continue;
+        const EdgeAccum &acc = found->second;
+        if (!acc.hasRenderVerts) continue;
 
-    for (const auto &it : edgeToTris) {
-        const uint64_t key = it.first;
-        const uint32_t v0 = (uint32_t)(key >> 32);
-        const uint32_t v1 = (uint32_t)(key & 0xffffffffu);
-        const std::vector<AdjTri> &tris = it.second;
-
-        EdgeRecord rec = {};
-        rec.v0 = v0;
-        rec.v1 = v1;
-        if (!tris.empty()) {
-            rec.triA = tris[0].tri;
-            rec.nA = {(double)triNormal[(size_t)tris[0].tri].x,
-                      (double)triNormal[(size_t)tris[0].tri].y,
-                      (double)triNormal[(size_t)tris[0].tri].z};
-        }
-        if (tris.size() >= 2) {
-            rec.triB = tris[1].tri;
-            rec.nB = {(double)triNormal[(size_t)tris[1].tri].x,
-                      (double)triNormal[(size_t)tris[1].tri].y,
-                      (double)triNormal[(size_t)tris[1].tri].z};
-        }
+        std::vector<int> tris = acc.tris;
+        std::sort(tris.begin(), tris.end());
+        tris.erase(std::unique(tris.begin(), tris.end()), tris.end());
 
         uint8_t flags = EdgeClassNone;
+        bool keep = false;
         if (tris.size() == 1) {
-            flags |= EdgeClassBoundary;
-        } else if (tris.size() != 2) {
-            flags |= EdgeClassNonManifold;
-        } else {
-            const Vec3d nA = triNormal[(size_t)tris[0].tri];
-            const Vec3d nB = triNormal[(size_t)tris[1].tri];
-            const double d = dot(nA, nB);
-            if (std::isfinite(d) && d < sharpCos) {
-                flags |= EdgeClassSharp;
+            flags |= EdgeClassFeature;
+            keep = true;
+        } else if (tris.size() == 2) {
+            const int triA = tris[0];
+            const int triB = tris[1];
+            if (triRunSlot[(size_t)triA] != triRunSlot[(size_t)triB] ||
+                mesh.faceID[(size_t)triA] != mesh.faceID[(size_t)triB]) {
+                flags |= EdgeClassFeature;
+                keep = true;
             }
+        } else if (tris.size() > 2) {
+            flags |= EdgeClassNonManifold;
+            keep = true;
+        }
+        if (!keep) continue;
+
+        EdgeRecord rec = {};
+        rec.v0 = acc.renderV0;
+        rec.v1 = acc.renderV1;
+        if (!tris.empty()) {
+            rec.triA = tris[0];
+            rec.nA = {triNormal[(size_t)tris[0]].x,
+                      triNormal[(size_t)tris[0]].y,
+                      triNormal[(size_t)tris[0]].z};
+        }
+        if (tris.size() >= 2) {
+            rec.triB = tris[1];
+            rec.nB = {triNormal[(size_t)tris[1]].x,
+                      triNormal[(size_t)tris[1]].y,
+                      triNormal[(size_t)tris[1]].z};
         }
 
         out.edges.push_back(rec);
         out.edgeFlags.push_back(flags);
-
-        const Vec3d p0 = mesh_pos(mesh, v0);
-        const Vec3d p1 = mesh_pos(mesh, v1);
-        edgeLengths.push_back(length(sub(p1, p0)));
-    }
-
-    std::vector<double> sortedLengths = edgeLengths;
-    std::sort(sortedLengths.begin(), sortedLengths.end());
-    const double medianLen = sortedLengths.empty() ? 0.0 : sortedLengths[sortedLengths.size() / 2];
-    const double minSharpLen = std::max(1e-8, medianLen * 0.25);
-
-    std::vector<uint8_t> featureMask(out.edges.size(), 0);
-    std::vector<uint8_t> preserveMask(out.edges.size(), 0);
-    for (size_t i = 0; i < out.edges.size(); ++i) {
-        const uint8_t flags = out.edgeFlags[i];
-        const bool boundary = (flags & EdgeClassBoundary) != 0;
-        const bool nonManifold = (flags & EdgeClassNonManifold) != 0;
-        const bool sharp = (flags & EdgeClassSharp) != 0;
-
-        if (boundary || nonManifold) {
-            featureMask[i] = 1;
-            preserveMask[i] = 1;
-            continue;
-        }
-        if (sharp && edgeLengths[i] >= minSharpLen) {
-            featureMask[i] = 1;
-        }
-    }
-
-    const double minChainLen = std::max(1e-4, bboxDiag * 0.015);
-    ChainExtraction extraction = extract_chains(
-        mesh,
-        out.edges,
-        featureMask,
-        35.0,
-        edgeLengths,
-        minChainLen,
-        2,
-        &preserveMask);
-
-    out.sharpEdgeIndices.clear();
-    out.boundaryEdgeIndices.clear();
-    out.nonManifoldEdgeIndices.clear();
-    out.featureChains.clear();
-    out.edgeFeatureChain.assign(out.edges.size(), -1);
-
-    for (size_t i = 0; i < out.edges.size(); ++i) {
-        if (i >= extraction.keptEdgeMask.size() || extraction.keptEdgeMask[i] == 0) continue;
-        const uint8_t flags = out.edgeFlags[i];
-        if ((flags & EdgeClassSharp) != 0) out.sharpEdgeIndices.push_back((int)i);
-        if ((flags & EdgeClassBoundary) != 0) out.boundaryEdgeIndices.push_back((int)i);
-        if ((flags & EdgeClassNonManifold) != 0) out.nonManifoldEdgeIndices.push_back((int)i);
-    }
-
-    for (const std::vector<int> &chain : extraction.chains) {
-        std::vector<int> kept;
-        kept.reserve(chain.size());
-        for (const int ei : chain) {
-            if (ei < 0 || (size_t)ei >= extraction.keptEdgeMask.size()) continue;
-            if (extraction.keptEdgeMask[(size_t)ei] == 0) continue;
-            kept.push_back(ei);
-        }
-        if (kept.empty()) continue;
-        const int chainId = (int)out.featureChains.size();
-        for (const int ei : kept) {
-            if (ei >= 0 && (size_t)ei < out.edgeFeatureChain.size()) {
-                out.edgeFeatureChain[(size_t)ei] = chainId;
-            }
-        }
-        out.featureChains.push_back(std::move(kept));
+        const int idx = (int)out.edges.size() - 1;
+        if ((flags & EdgeClassFeature) != 0) out.featureEdgeIndices.push_back(idx);
+        if ((flags & EdgeClassNonManifold) != 0) out.nonManifoldEdgeIndices.push_back(idx);
     }
 
     return out;
@@ -411,31 +346,9 @@ SilhouetteResult ComputeSilhouetteEdges(const manifold::MeshGL &mesh,
 
     const Vec3d eye = {eyeX, eyeY, eyeZ};
 
-    Vec3d mn = mesh_pos(mesh, edges.edges[0].v0);
-    Vec3d mx = mn;
-    std::vector<double> edgeLengths(edges.edges.size(), 0.0);
-
-    for (size_t i = 0; i < edges.edges.size(); ++i) {
-        const EdgeRecord &edge = edges.edges[i];
-        const Vec3d p0 = mesh_pos(mesh, edge.v0);
-        const Vec3d p1 = mesh_pos(mesh, edge.v1);
-        edgeLengths[i] = length(sub(p1, p0));
-        mn.x = std::min({mn.x, p0.x, p1.x});
-        mn.y = std::min({mn.y, p0.y, p1.y});
-        mn.z = std::min({mn.z, p0.z, p1.z});
-        mx.x = std::max({mx.x, p0.x, p1.x});
-        mx.y = std::max({mx.y, p0.y, p1.y});
-        mx.z = std::max({mx.z, p0.z, p1.z});
-    }
-
-    const double bboxDiag = std::max(length(sub(mx, mn)), 1e-6);
-    std::vector<uint8_t> silhouetteMask(edges.edges.size(), 0);
-
-    for (size_t i = 0; i < edges.edges.size(); ++i) {
-        const uint8_t flags = (i < edges.edgeFlags.size()) ? edges.edgeFlags[i] : 0;
-        if ((flags & EdgeClassNonManifold) != 0) continue;
-
-        const EdgeRecord &e = edges.edges[i];
+    for (const int idx : edges.featureEdgeIndices) {
+        if (idx < 0 || (size_t)idx >= edges.edges.size()) continue;
+        const EdgeRecord &e = edges.edges[(size_t)idx];
         if (e.triA < 0 || e.triB < 0) continue;
 
         const Vec3d p0 = mesh_pos(mesh, e.v0);
@@ -450,24 +363,9 @@ SilhouetteResult ComputeSilhouetteEdges(const manifold::MeshGL &mesh,
         if (!std::isfinite(da) || !std::isfinite(db)) continue;
 
         if ((da > 0.0 && db <= 0.0) || (da <= 0.0 && db > 0.0)) {
-            silhouetteMask[i] = 1;
+            out.isSilhouette[(size_t)idx] = 1;
+            out.silhouetteEdgeIndices.push_back(idx);
         }
-    }
-
-    ChainExtraction extraction = extract_chains(
-        mesh,
-        edges.edges,
-        silhouetteMask,
-        42.0,
-        edgeLengths,
-        std::max(1e-4, bboxDiag * 0.02),
-        3,
-        nullptr);
-
-    for (size_t i = 0; i < extraction.keptEdgeMask.size(); ++i) {
-        if (extraction.keptEdgeMask[i] == 0) continue;
-        out.isSilhouette[i] = 1;
-        out.silhouetteEdgeIndices.push_back((int)i);
     }
 
     return out;
@@ -475,7 +373,7 @@ SilhouetteResult ComputeSilhouetteEdges(const manifold::MeshGL &mesh,
 
 int PickEdgeByRay(const manifold::MeshGL &mesh,
                   const EdgeDetectionResult &edges,
-                  const SilhouetteResult &silhouette,
+                  const SilhouetteResult & /*silhouette*/,
                   double rayOriginX, double rayOriginY, double rayOriginZ,
                   double rayDirX, double rayDirY, double rayDirZ,
                   double pickRadius,
@@ -487,21 +385,15 @@ int PickEdgeByRay(const manifold::MeshGL &mesh,
     if (length(rayDir) <= 1e-20) return -1;
 
     std::vector<uint8_t> candidate(edges.edges.size(), 0);
-    for (int idx : edges.sharpEdgeIndices) {
-        if (idx >= 0 && (size_t)idx < candidate.size()) candidate[(size_t)idx] = 1;
-    }
-    for (int idx : edges.boundaryEdgeIndices) {
+    for (int idx : edges.featureEdgeIndices) {
         if (idx >= 0 && (size_t)idx < candidate.size()) candidate[(size_t)idx] = 1;
     }
     for (int idx : edges.nonManifoldEdgeIndices) {
         if (idx >= 0 && (size_t)idx < candidate.size()) candidate[(size_t)idx] = 1;
     }
-    for (int idx : silhouette.silhouetteEdgeIndices) {
-        if (idx >= 0 && (size_t)idx < candidate.size()) candidate[(size_t)idx] = 1;
-    }
 
-    double bestT = std::numeric_limits<double>::infinity();
     double bestDist = std::numeric_limits<double>::infinity();
+    double bestT = std::numeric_limits<double>::infinity();
     int bestEdge = -1;
 
     for (size_t i = 0; i < edges.edges.size(); ++i) {
@@ -511,33 +403,15 @@ int PickEdgeByRay(const manifold::MeshGL &mesh,
         const Vec3d p0 = mesh_pos(mesh, e.v0);
         const Vec3d p1 = mesh_pos(mesh, e.v1);
 
-        double t0 = 0.0;
-        double d0 = 0.0;
-        double t1 = 0.0;
-        double d1 = 0.0;
-        const bool ok0 = point_ray_distance(p0, rayOrig, rayDir, &t0, &d0);
-        const bool ok1 = point_ray_distance(p1, rayOrig, rayDir, &t1, &d1);
-        if (!ok0 && !ok1) continue;
-
-        double t = ok0 ? t0 : t1;
-        double d = ok0 ? d0 : d1;
-        if (ok0 && ok1) {
-            t = std::min(t0, t1);
-            d = std::min(d0, d1);
-        }
-
-        const Vec3d mid = mul(add(p0, p1), 0.5);
-        double tm = 0.0;
-        double dm = 0.0;
-        if (point_ray_distance(mid, rayOrig, rayDir, &tm, &dm)) {
-            if (tm < t) t = tm;
-            if (dm < d) d = dm;
-        }
+        double t = 0.0;
+        double d = 0.0;
+        if (!segment_ray_distance(p0, p1, rayOrig, rayDir, &t, &d)) continue;
 
         if (d > pickRadius) continue;
-        if (t < bestT || (std::fabs(t - bestT) <= 1e-9 && d < bestDist)) {
-            bestT = t;
+        if (d < bestDist - 1e-9 ||
+            (std::fabs(d - bestDist) <= 1e-9 && t < bestT)) {
             bestDist = d;
+            bestT = t;
             bestEdge = (int)i;
         }
     }
